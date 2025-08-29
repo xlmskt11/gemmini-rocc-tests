@@ -8,10 +8,10 @@
 #ifndef BAREMETAL
 #include <sys/mman.h>
 #endif
-#include "include/gemmini_testutils.h"
-#define RAND rand()
+#include "include/gemmini_testutils_all.h"
+#define custom2 2
 
-int main() {
+int temp_op2() {
 #ifndef BAREMETAL
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
       perror("mlockall failed");
@@ -19,18 +19,11 @@ int main() {
     }
 #endif
 
-  printf("Flush Gemmini TLB of stale virtual addresses\n");
-  gemmini_flush(0);
+  printf("Flush Gemmini TLB of stale virtual addresses%d\n", custom2);
+  gemmini_flush(custom2, 0);
 
-  printf("Initialize our input and output matrices in main memory\n");
+  printf("Initialize our input and output matrices(%d dimension) in main memory\n", DIM);
   elem_t In[DIM][DIM];
-  for (size_t i = 0; i < DIM; ++i)
-  {
-    for (size_t j = 0; j < DIM; ++j)
-    {
-      In[i][j] = RAND % 2;
-    }
-  }
   elem_t Out[DIM][DIM];
 
   elem_t Identity[DIM][DIM];
@@ -45,21 +38,21 @@ int main() {
   size_t Identity_sp_addr = 2*DIM;
 
   printf("Move \"In\" matrix from main memory into Gemmini's scratchpad\n");
-  gemmini_config_ld(DIM * sizeof(elem_t));
-  gemmini_config_st(DIM * sizeof(elem_t));
-  gemmini_mvin(In, In_sp_addr);
+  gemmini_config_ld(custom2, DIM * sizeof(elem_t));
+  gemmini_config_st(custom2, DIM * sizeof(elem_t));
+  gemmini_mvin(custom2, In, In_sp_addr);
 
   printf("Move \"Identity\" matrix from main memory into Gemmini's scratchpad\n");
-  gemmini_mvin(Identity, Identity_sp_addr);
+  gemmini_mvin(custom2, Identity, Identity_sp_addr);
 
   printf("Multiply \"In\" matrix with \"Identity\" matrix with a bias of 0\n");
-  gemmini_config_ex(OUTPUT_STATIONARY, 0, 0);
-  gemmini_preload_zeros(Out_sp_addr);
-  gemmini_compute_preloaded(In_sp_addr, Identity_sp_addr);
+  gemmini_config_ex(custom2, OUTPUT_STATIONARY, 0, 0);
+  gemmini_preload_zeros(custom2, Out_sp_addr);
+  gemmini_compute_preloaded(custom2, In_sp_addr, Identity_sp_addr);
 
   printf("Move \"Out\" matrix from Gemmini's scratchpad into main memory\n");
-  gemmini_config_st(DIM * sizeof(elem_t));
-  gemmini_mvout(Out, Out_sp_addr);
+  gemmini_config_st(custom2, DIM * sizeof(elem_t));
+  gemmini_mvout(custom2, Out, Out_sp_addr);
 
   printf("Fence till Gemmini completes all memory operations\n");
   gemmini_fence();
@@ -77,6 +70,5 @@ int main() {
   }
 
   printf("Input and output matrices are identical, as expected\n");
-  exit(0);
 }
 

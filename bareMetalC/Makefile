@@ -52,6 +52,17 @@ tests = \
 	global_average \
 	gemmini_counter \
 	template \
+	template_all \
+	template_op0 \
+	template_all2_2 \
+	template_all2 \
+	template_32x32 \
+	template_32x32_2 \
+	template_all2_multi0 \
+	template_all2_multi1 \
+	template_all2_multi1_col \
+	template_all2_2_multi1 \
+	template_shared_all \
 
 tests_baremetal = $(tests:=-baremetal)
 
@@ -72,7 +83,7 @@ else
 endif
 
 BENCH_COMMON = $(abs_top_srcdir)/riscv-tests/benchmarks/common
-GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h
+GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h $(abs_top_srcdir)/include/gemmini_testutils_all.h $(abs_top_srcdir)/include/gemmini_all.h
 
 CFLAGS := $(CFLAGS) \
 	-DPREALLOCATE=1 \
