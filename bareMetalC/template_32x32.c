@@ -11,9 +11,9 @@
 #include "include/gemmini_testutils_all.h"
 //#include "include/gemmini_nn.h"
 
-#define MAT_DIM_I 16
-#define MAT_DIM_J 16
-#define MAT_DIM_K 16
+#define MAT_DIM_I 24
+#define MAT_DIM_J 24
+#define MAT_DIM_K 24
 
 #define profile_data_num 8192
 
@@ -21,9 +21,11 @@
 #define FULL_BIAS_WIDTH true
 #define REPEATING_BIAS true
 
+#define RAND rand()
 #define FAST true
 #define CHECK true
-#define RAND rand()
+#define FENCE true
+#define PROFILE false
 
 #define q_type(p) (p >> 62)
 #define start(p) ((p >> 31) & ((1 << 31) - 1))
@@ -85,9 +87,11 @@ int main() {
     }
 #endif
 
+#if PROFILE
     printf("Set profiler address\n");
     static uint64_t P[profile_data_num] row_align(1);
     gemmini_profiler(custom3, (uint64_t *)P);
+#endif
 
     printf("One Gemmini with DIM: %d\n", DIM);
     printf("MAT_DIM_I: %d\n", MAT_DIM_I);
@@ -103,8 +107,10 @@ int main() {
     static elem_t full_C[MAT_DIM_I][MAT_DIM_J] row_align(1);
     static ACC_T full_D[MAT_DIM_I][MAT_DIM_J] row_align_acc(1);
 
+#if !FAST && CHECK
     static full_t gold_full[MAT_DIM_I][MAT_DIM_J];
     static elem_t gold[MAT_DIM_I][MAT_DIM_J];
+#endif
 
     printf("Init A\n");
     for (size_t i = 0; i < MAT_DIM_I; ++i)
@@ -120,23 +126,26 @@ int main() {
       full_D[i][j] = NO_BIAS ? 0 : RAND % 2;
     }
   }
-#if FAST == 1
+#if FAST
   // identity matrix
   printf("Init B\n");
-  for (size_t i = 0; i < MAT_DIM_K; ++i) {
-    for (size_t j = 0; j < MAT_DIM_J; ++j) {
+  for (size_t i = 0; i < MAT_DIM_K; ++i)
+  {
+    for (size_t j = 0; j < MAT_DIM_J; ++j)
+    {
       full_B[i][j] = i == j;
     }
   }
 #else
   printf("Init B\n");
-  for (size_t i = 0; i < MAT_DIM_K; ++i) {
-    for (size_t j = 0; j < MAT_DIM_J; ++j) {
+  for (size_t i = 0; i < MAT_DIM_K; ++i)
+  {
+    for (size_t j = 0; j < MAT_DIM_J; ++j)
+    {
       full_B[i][j] = RAND % 2;
     }
   }
-
-#if CHECK == 1
+#if CHECK
   printf("Calculate Output\n");
   full_matmul(full_A, full_B, full_D, gold_full);
   full_matscale(gold_full, gold, ACC_SCALE_IDENTITY);
@@ -154,25 +163,18 @@ int main() {
             false, !FULL_BIAS_WIDTH,
 	          1,
             WS);
+#if FENCE
   gemmini_fence();
+#endif
   uint64_t matmul_end = read_cycles();
   printf("Matmul cycle: %d\n", matmul_end - matmul_start);
 
-#if CHECK == 1
+#if CHECK
   printf("Check \"Out\" matrix\n");
-  // if (!full_is_equal(full_C, gold)) {
-  //   printf("Incorrect output matrix!\n");
-  //   printf("C:\n");
-  //   full_printMatrix(full_C);
-  //   printf("Gold:\n");
-  //   full_printMatrix(gold);
-  //   printf("\n");
 
-  //   exit(1);
-  // }
-
-#if FAST == 1
-  if (!is_equal_dynamic(full_C, full_A, MAT_DIM_I, MAT_DIM_J)) {
+#if FAST
+  if (!is_equal_dynamic(full_C, full_A, MAT_DIM_I, MAT_DIM_J))
+  {
     printf("Incorrect output matrix!\n");
     printf("C:\n");
     printMatrix_dynamic(full_C, MAT_DIM_I, MAT_DIM_J);
@@ -183,7 +185,8 @@ int main() {
     exit(1);
   }
 #else
-  if (!is_equal_dynamic(full_C, gold, MAT_DIM_I, MAT_DIM_J)) {
+  if (!is_equal_dynamic(full_C, gold, MAT_DIM_I, MAT_DIM_J))
+  {
     printf("Incorrect output matrix!\n");
     printf("C:\n");
     printMatrix_dynamic(full_C, MAT_DIM_I, MAT_DIM_J);
@@ -197,6 +200,7 @@ int main() {
   printf("Output matrix came out as expected\n");
 #endif
 
+#if PROFILE
   for (int j = 0; j < profile_data_num; j++)
   {
     if (P[j] == 0)
@@ -205,6 +209,7 @@ int main() {
     }
     printf("%d, %d, %d, %d\n", 0, q_type(P[j]), start(P[j]), end(P[j]));
   }
+#endif
 
   exit(0);
 }

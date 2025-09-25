@@ -12,11 +12,11 @@
 // #include "include/gemmini_nn.h"
 
 #define gemmini_num 4
-#define MAT_DIM_I 48
-#define MAT_DIM_J 48
-#define MAT_DIM_K 48
+#define MAT_DIM_I 64
+#define MAT_DIM_J 64
+#define MAT_DIM_K 64
 
-#define profile_data_num 16384
+#define profile_data_num 30
 
 #define NO_BIAS true
 #define FULL_BIAS_WIDTH true

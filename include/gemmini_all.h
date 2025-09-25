@@ -356,7 +356,7 @@ static void counter_reset(int custom_num) {
 // weight-stationary matmul loop
 #define gemmini_loop_ws(custom_num, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
   { \
-    ROCC_INSTRUCTION_RS1_RS2(custom_num, (uint64_t)(0), ((uint64_t)(K) << 32) | ((uint64_t)(pad_K) << 16) | (uint64_t)(0), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, (0 << 21) | ((uint64_t)(0) << 16) | (uint64_t)(0), ((uint64_t)(K) << 32) | ((uint64_t)(pad_K) << 16) | (uint64_t)(0), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
@@ -366,9 +366,9 @@ static void counter_reset(int custom_num) {
   }
 
 // made
-#define shared_gemmini_loop_ws(custom_num, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
+#define shared_gemmini_loop_ws(custom_num, group_list, group_id, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
   { \
-      ROCC_INSTRUCTION_RS1_RS2(custom_num, (uint64_t)(laddrI_offset), ((uint64_t)(mv_K) << 32) | ((uint64_t)(mv_pad_K) << 16) | (uint64_t)(laddrK_offset), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
+      ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 21) | ((uint64_t)(group_id) << 16) | (uint64_t)(laddrI_offset), ((uint64_t)(mv_K) << 32) | ((uint64_t)(mv_pad_K) << 16) | (uint64_t)(laddrK_offset), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
@@ -928,7 +928,7 @@ static void multi_sp_tiled_matmul_os(int custom_num, const size_t added_gemmini_
 }
 
 // made
-static void shared_multi_sp_tiled_matmul_os(int custom_num, const elem_t *A, const elem_t *B, const void *D, void *C,
+static void shared_multi_sp_tiled_matmul_os(int custom_num, int group_list, int group_id, const elem_t *A, const elem_t *B, const void *D, void *C,
                                             scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
                                             size_t mv_K, size_t mv_pad_K, size_t laddrI_offset, size_t laddrK_offset,
                                             size_t I, size_t J, size_t K, size_t pad_I, size_t pad_J, size_t pad_K,
@@ -1419,386 +1419,6 @@ static void sp_tiled_matmul_ws(int custom_num, const elem_t * A, const elem_t * 
   }
 }
 
-
-// made
-static void multi_sp_tiled_matmul_ws_col(int gemmini_num, const size_t added_gemmini_num,
-                                     size_t j0, const size_t J0, const size_t divided_dim_J, const size_t added_divided_dim_J,
-                                     const elem_t *A, const elem_t *B,
-                                     const void *D, void *C,
-                                     scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
-                                     size_t I, size_t added_J, size_t J, size_t K, size_t pad_I, size_t added_pad_J, size_t pad_J, size_t pad_K,
-                                     size_t A_row_stride, size_t B_row_stride, size_t D_row_stride, size_t C_row_stride,
-                                     bool a_transpose, bool b_transpose,
-                                     bool full_C, bool low_D,
-                                     bool no_bias, bool repeating_bias,
-                                     int act)
-{
-  /*
-    const uint32_t A_sp_addr_start = 0;
-    const uint32_t B_sp_addr_start = BANK_NUM * BANK_ROWS - K * J * DIM;
-    const uint32_t D_sp_addr_start = 1 << (ADDR_LEN-1);
-    const uint32_t C_sp_addr_start = 3 << (ADDR_LEN-2) | (full_C << (ADDR_LEN-3));
-    const int A_blocks = a_transpose ? (I <= MAX_BLOCK_LEN ? I : MAX_BLOCK_LEN) :
-      (K <= MAX_BLOCK_LEN ? K : MAX_BLOCK_LEN);
-    const int B_blocks = b_transpose ? (K <= MAX_BLOCK_LEN ? K : MAX_BLOCK_LEN) :
-      (J <= MAX_BLOCK_LEN ? J : MAX_BLOCK_LEN);
-    const int D_blocks = low_D ? (J <= MAX_BLOCK_LEN ? J : MAX_BLOCK_LEN) :
-      (J <= MAX_BLOCK_LEN_ACC ? J : MAX_BLOCK_LEN_ACC);
-    const int C_blocks = full_C ? 1 : (J <= MAX_BLOCK_LEN ? J : MAX_BLOCK_LEN);
-    const size_t sizeof_D = low_D ? sizeof(elem_t) : sizeof(acc_t);
-    const size_t sizeof_C = full_C ? sizeof(acc_t) : sizeof(elem_t);
-    // Move-in D
-    if (D != NULL && !no_bias) {
-      for (size_t i = 0; i < I; i++) {
-        const size_t rows = DIM - (i == I-1 ? pad_I : 0);
-        for (size_t j = 0; j < J; j += D_blocks) {
-          const size_t bias_row = repeating_bias ? 0 : i;
-          const void * const D_dram_addr = (int8_t *)D + (bias_row * D_row_stride + j)*DIM*sizeof_D;
-          const uint32_t D_sp_addr_acc = D_sp_addr_start + (i*J + j)*DIM;
-          size_t blocks = j + D_blocks <= J ? D_blocks : J-j;
-          const size_t cols = blocks * DIM - (j + blocks >= J ? pad_J : 0);
-          gemmini_extended_mvin3(D_dram_addr, D_sp_addr_acc, cols, rows);
-        }
-      }
-    }
-    for (size_t k = 0; k < K; k++) {
-      for (size_t j = 0; j < J; j++) {
-        for (size_t i = 0; i < I; i++) {
-          const uint32_t A_sp_addr = a_transpose ? (A_sp_addr_start + (k*I + i)*DIM) :
-            (A_sp_addr_start + (i*K + k)*DIM);
-          const uint32_t B_sp_addr = b_transpose ? (B_sp_addr_start + (j*K + k)*DIM) :
-            (B_sp_addr_start + (k*J + j)*DIM);
-          const uint32_t C_sp_addr = C_sp_addr_start + (i*J + j)*DIM;
-          // Mvin A
-          if (a_transpose) {
-            if (j == 0 && i % A_blocks == 0) {
-              const elem_t * const A_dram_addr = A + (k*A_row_stride + i)*DIM;
-              const size_t blocks = i + A_blocks <= I ? A_blocks : I-i;
-              const size_t cols = blocks * DIM - (i + blocks >= I ? pad_I : 0);
-              const size_t rows = DIM - (k == K-1 ? pad_K : 0);
-              gemmini_extended_mvin(A_dram_addr, A_sp_addr, cols, rows);
-            }
-          } else {
-            if (j == 0 && k % A_blocks == 0) {
-              const elem_t * const A_dram_addr = A + (i*A_row_stride + k)*DIM;
-              const size_t blocks = k + A_blocks <= K ? A_blocks : K-k;
-              const size_t cols = blocks * DIM - (k + blocks >= K ? pad_K : 0);
-              const size_t rows = DIM - (i == I-1 ? pad_I : 0);
-              gemmini_extended_mvin(A_dram_addr, A_sp_addr, cols, rows);
-            }
-          }
-          // Mvin B
-          if (b_transpose) {
-            if (i == 0 && k % B_blocks == 0) {
-              const elem_t * const B_dram_addr = B + (j*B_row_stride + k)*DIM;
-              const size_t blocks = k + B_blocks <= K ? B_blocks : K-k;
-              const size_t cols = blocks * DIM - (k + blocks >= K ? pad_K : 0);
-              const size_t rows = DIM - (j == J-1 ? pad_J : 0);
-              gemmini_extended_mvin2(B_dram_addr, B_sp_addr, cols, rows);
-            }
-          } else {
-            if (i == 0 && j % B_blocks == 0) {
-              const elem_t * const B_dram_addr = B + (k*B_row_stride + j)*DIM;
-              const size_t blocks = j + B_blocks <= J ? B_blocks : J-j;
-              const size_t cols = blocks * DIM - (j + blocks >= J ? pad_J : 0);
-              const size_t rows = DIM - (k == K-1 ? pad_K : 0);
-              gemmini_extended_mvin2(B_dram_addr, B_sp_addr, cols, rows);
-            }
-          }
-          // Compute
-          {
-            uint32_t pre_sp_addr = i == 0 ? B_sp_addr : GARBAGE_ADDR;
-            uint32_t out_sp_addr = C_sp_addr;
-            // If we're not using a bias, then we want to overwrite what's in the
-            // accumulator, rather than writing over it
-            int no_bias_new_matrix = no_bias && D != NULL && k == 0;
-            if (no_bias_new_matrix) {
-              out_sp_addr &= ~(1 << (ADDR_LEN-2));
-            }
-            const size_t A_cols = DIM - (k == K - 1 ? pad_K : 0);
-            const size_t A_rows = DIM - (i == I - 1 ? pad_I : 0);
-            const size_t B_cols = DIM - (j == J - 1 ? pad_J : 0);
-            const size_t B_rows = DIM - (k == K - 1 ? pad_K : 0);
-            const size_t C_cols = DIM - (j == J - 1 ? pad_J : 0);
-            const size_t C_rows = DIM - (i == I - 1 ? pad_I : 0);
-            gemmini_extended_preload(pre_sp_addr, out_sp_addr, B_cols, B_rows, C_cols, C_rows);
-            if (i == 0) { // First iteration
-              gemmini_extended_compute_preloaded(A_sp_addr, GARBAGE_ADDR, A_cols, A_rows, DIM, DIM);
-            } else { // All other iterations
-              gemmini_extended_compute_accumulated(A_sp_addr, GARBAGE_ADDR, A_cols, A_rows, DIM, DIM);
-            }
-          }
-          if (C != NULL && k == K-1) {
-            // Move-out C (if not normalizing)
-            if (((act != LAYERNORM) && (act != SOFTMAX)) && (j == J-1 || j % C_blocks == C_blocks-1)) {
-              const size_t rounded_j = (j / C_blocks) * C_blocks;
-              const uint32_t rounded_C_sp_addr = C_sp_addr_start + (i*J + rounded_j)*DIM;
-              void * const C_dram_addr = (int8_t*)C + (i*C_row_stride + rounded_j)*DIM*sizeof_C;
-              const size_t blocks = rounded_j + C_blocks <= J ? C_blocks : J-rounded_j;
-              const size_t cols = blocks * DIM - (rounded_j + blocks >= J ? pad_J : 0);
-              const size_t rows = DIM - (i == I - 1 ? pad_I : 0);
-              gemmini_extended_mvout(C_dram_addr, rounded_C_sp_addr, cols, rows);
-            }
-            // Move-out C (if normalizing)
-            if (act == LAYERNORM && j == J - 1) {
-              uint32_t norm_cmds[][2] = {{1,2},{3,4},{0,0}};
-              const int norm_cmds_size = sizeof(norm_cmds) / sizeof(norm_cmds[0]);
-              const size_t rows = DIM - (i == I-1 ? pad_I : 0);
-              for (size_t row = 0; row < rows; row += NORM_STAT_IDS) {
-                const size_t stat_ids = rows - row > NORM_STAT_IDS ?
-                  NORM_STAT_IDS : rows - row;
-                for (int cmd = 0; cmd < norm_cmds_size; cmd++) {
-                  for (size_t stat_id = 0; stat_id < stat_ids; stat_id++) {
-                    gemmini_config_norm(0, 0, 0, 0, stat_id, 0, 0);
-                    const size_t r = row + stat_id;
-                    for (size_t jj = 0; jj < J; jj += C_blocks) {
-                      uint32_t norm_C_sp_addr = C_sp_addr_start + (i*J + jj)*DIM + r;
-                      if (jj + C_blocks >= J) {
-                        norm_C_sp_addr |= (norm_cmds[cmd][1] << 26); // Final mean/inv-std-dev calculation
-                      } else {
-                        norm_C_sp_addr |= (norm_cmds[cmd][0] << 26); // Accumulate sum/variance
-                      }
-                      void * const C_dram_addr = (int8_t*)C +
-                        (i*C_row_stride + jj) * DIM * sizeof_C +
-                        r * C_row_stride * sizeof_C;
-                      const size_t blocks = jj + C_blocks <= J ? C_blocks : J-jj;
-                      const size_t cols = blocks * DIM - (jj + blocks >= J ? pad_J : 0);
-                      gemmini_extended_mvout(C_dram_addr, norm_C_sp_addr, cols, 1);
-                    }
-                  }
-                }
-              }
-            } else if (act == SOFTMAX && j == J - 1) {
-              uint32_t norm_cmds[][2] = {{5,5},{6,7},{0,0}};
-              const int norm_cmds_size = sizeof(norm_cmds) / sizeof(norm_cmds[0]);
-              const size_t rows = DIM - (i == I-1 ? pad_I : 0);
-              for (size_t row = 0; row < rows; row += NORM_STAT_IDS) {
-                const size_t stat_ids = rows - row > NORM_STAT_IDS ?
-                  NORM_STAT_IDS : rows - row;
-                for (int cmd = 0; cmd < norm_cmds_size; cmd++) {
-                  for (size_t stat_id = 0; stat_id < stat_ids; stat_id++) {
-                    // set stat id only
-                    gemmini_config_norm(0, 0, 1, 0, stat_id, 0, 0);
-                    const size_t r = row + stat_id;
-                    for (size_t jj = 0; jj < J; jj += C_blocks) {
-                      uint32_t norm_C_sp_addr = C_sp_addr_start + (i*J + jj)*DIM + r;
-                      if (jj + C_blocks >= J) {
-                        norm_C_sp_addr |= (norm_cmds[cmd][1] << 26); // Final mean/inv-std-dev calculation
-                      } else {
-                        norm_C_sp_addr |= (norm_cmds[cmd][0] << 26); // Accumulate sum/variance
-                      }
-                      void * const C_dram_addr = (int8_t*)C +
-                        (i*C_row_stride + jj) * DIM * sizeof_C +
-                        r * C_row_stride * sizeof_C;
-                      const size_t blocks = jj + C_blocks <= J ? C_blocks : J-jj;
-                      const size_t cols = blocks * DIM - (jj + blocks >= J ? pad_J : 0);
-                      gemmini_extended_mvout(C_dram_addr, norm_C_sp_addr, cols, 1);
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  */
-
-  // Combined loop
-  size_t custom0_J = (added_gemmini_num > 0) ? added_J : J;
-  size_t custom0_pad_J = (added_gemmini_num > 0) ? added_pad_J : pad_J;
-  size_t custom1_J = (added_gemmini_num > 1) ? added_J : J;
-  size_t custom1_pad_J = (added_gemmini_num > 1) ? added_pad_J : pad_J;
-  size_t custom2_J = (added_gemmini_num > 2) ? added_J : J;
-  size_t custom2_pad_J = (added_gemmini_num > 2) ? added_pad_J : pad_J;
-  size_t custom3_J = (added_gemmini_num > 3) ? added_J : J;
-  size_t custom3_pad_J = (added_gemmini_num > 3) ? added_pad_J : pad_J;
-  const elem_t *custom0_B_local = B;
-  const elem_t *custom1_B_local = custom0_B_local + ((added_gemmini_num > 0) ? added_divided_dim_J : divided_dim_J);
-  const elem_t *custom2_B_local = custom1_B_local + ((added_gemmini_num > 1) ? added_divided_dim_J : divided_dim_J);
-  const elem_t *custom3_B_local = custom2_B_local + ((added_gemmini_num > 2) ? added_divided_dim_J : divided_dim_J);
-  void *custom0_C_local = C;
-  void *custom1_C_local = C;
-  void *custom2_C_local = C;
-  void *custom3_C_local = C;
-  if (C != NULL)
-  {
-    custom1_C_local = (void *)((int8_t *)custom0_C_local + ((added_gemmini_num > 0) ? added_divided_dim_J : divided_dim_J));
-    custom2_C_local = (void *)((int8_t *)custom1_C_local + ((added_gemmini_num > 1) ? added_divided_dim_J : divided_dim_J));
-    custom3_C_local = (void *)((int8_t *)custom2_C_local + ((added_gemmini_num > 2) ? added_divided_dim_J : divided_dim_J));
-  }
-
-  switch (gemmini_num)
-  {
-  case 1:
-    if (j0 < J0)
-    {
-      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom0_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom0_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, A, custom0_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-    }
-    break;
-  case 2:
-    if (j0 < J0)
-    {
-      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom0_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom0_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom1_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom1_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, A, custom0_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, A, custom1_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-    }
-    else if (added_gemmini_num > 0)
-    {
-      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom0_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom0_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, A, custom0_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-    }
-    break;
-  case 3:
-    if (j0 < J0)
-    {
-      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom0_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom0_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom1_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom1_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom2_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom2_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, A, custom0_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, A, custom1_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, A, custom2_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, no_bias ? NULL : D, custom2_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-    }
-    else
-    {
-      switch (added_gemmini_num)
-      {
-      case 1:
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom0_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom0_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, A, custom0_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        break;
-      case 2:
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom0_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom0_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom1_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom1_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, A, custom0_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, A, custom1_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        break;
-      }
-    }
-    break;
-  case 4:
-    if (j0 < J0)
-    {
-      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom0_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom0_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom1_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom1_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom2_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom2_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-      ROCC_INSTRUCTION_RS1_RS2(custom3, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom3_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom3_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, A, custom0_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, A, custom1_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, A, custom2_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom3, A, custom3_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, no_bias ? NULL : D, custom2_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom3, no_bias ? NULL : D, custom3_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom3, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom3, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-      ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-      ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-      ROCC_INSTRUCTION_RS1_RS2(custom3, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-    }
-    else
-    {
-      switch (added_gemmini_num)
-      {
-      case 1:
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom0_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom0_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, A, custom0_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        break;
-      case 2:
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom0_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom0_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom1_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom1_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, A, custom0_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, A, custom1_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        break;
-      case 3:
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom0_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom0_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom1_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom1_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(pad_K) << 32) | ((uint64_t)(custom2_pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(custom2_J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, A, custom0_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, A, custom1_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, A, custom2_B_local, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, no_bias ? NULL : D, custom2_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        break;
-      }
-    }
-    break;
-  }
-}
-
-
 // made
 static void multi_sp_tiled_matmul_ws(int gemmini_num, const size_t added_gemmini_num,
                                      size_t i0, const size_t I0, const size_t divided_dim_I, const size_t added_divided_dim_I,
@@ -2174,7 +1794,7 @@ static void multi_sp_tiled_matmul_ws(int gemmini_num, const size_t added_gemmini
 }
 
 // made
-static void shared_multi_sp_tiled_matmul_ws(int custom_num, const elem_t *A, const elem_t *B, const void *D, void *C,
+static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int group_id, const elem_t *A, const elem_t *B, const void *D, void *C,
                                             scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
                                             size_t mv_K, size_t mv_pad_K, size_t laddrI_offset, size_t laddrK_offset,
                                             size_t I, size_t J, size_t K, size_t pad_I, size_t pad_J, size_t pad_K,
@@ -2359,7 +1979,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, const elem_t *A, con
   switch (custom_num)
   {
   case 0:
-    shared_gemmini_loop_ws(custom0, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom0, group_list, group_id, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -2367,7 +1987,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, const elem_t *A, con
                            act);
     break;
   case 1:
-    shared_gemmini_loop_ws(custom1, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom1, group_list, group_id, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -2375,7 +1995,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, const elem_t *A, con
                            act);
     break;
   case 2:
-    shared_gemmini_loop_ws(custom2, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom2, group_list, group_id, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -2383,7 +2003,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, const elem_t *A, con
                            act);
     break;
   case 3:
-    shared_gemmini_loop_ws(custom3, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom3, group_list, group_id, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -2576,211 +2196,6 @@ static void tiled_matmul_outer(int custom_num, size_t dim_I, size_t dim_J, size_
 
   //gemmini_fence();
 }
-
-
-// made
-static void multi_tiled_matmul_outer1_col(int gemmini_num,
-                                      size_t dim_I, size_t dim_J, size_t dim_K,
-                                      const elem_t *A, const elem_t *B,
-                                      const void *D, void *C,
-                                      size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
-                                      scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
-                                      size_t tile_I, size_t tile_J, size_t tile_K,
-                                      int act, acc_scale_t scale, acc_scale_t bert_scale,
-                                      bool repeating_bias,
-                                      bool a_transpose, bool b_transpose,
-                                      bool full_C, bool low_D,
-                                      uint8_t weightA,
-                                      int dataflow)
-{
-
-  const size_t divided_dim_J = dim_J / gemmini_num;
-  const size_t added_divided_dim_J = divided_dim_J + 1;
-  const size_t added_gemmini_num = dim_J % gemmini_num;
-
-  const size_t dim_I_padded = (dim_I / DIM + (dim_I % DIM != 0)) * DIM;
-  const size_t dim_J_padded = (divided_dim_J / DIM + (divided_dim_J % DIM != 0)) * DIM;
-  const size_t added_dim_J_padded = (added_divided_dim_J / DIM + (added_divided_dim_J % DIM != 0)) * DIM;
-  const size_t dim_K_padded = (dim_K / DIM + (dim_K % DIM != 0)) * DIM;
-
-  const size_t I0 = dim_I_padded / (tile_I * DIM) + (dim_I_padded % (tile_I * DIM) != 0);
-  const size_t J0 = dim_J_padded / (tile_J * DIM) + (dim_J_padded % (tile_J * DIM) != 0);
-  const size_t added_J0 = added_dim_J_padded / (tile_J * DIM) + (added_dim_J_padded % (tile_J * DIM) != 0);
-  const size_t K0 = dim_K_padded / (tile_K * DIM) + (dim_K_padded % (tile_K * DIM) != 0);
-
-  // These lines here are supposed to help us deal with when the dimensions of
-  // the systolic array aren't divisible by the tiling factors
-  const size_t last_I = dim_I_padded % (tile_I * DIM) == 0 ? tile_I : (dim_I_padded / DIM) % tile_I;
-  const size_t last_J = dim_J_padded % (tile_J * DIM) == 0 ? tile_J : (dim_J_padded / DIM) % tile_J;
-  const size_t added_last_J = added_dim_J_padded % (tile_J * DIM) == 0 ? tile_J : (added_dim_J_padded / DIM) % tile_J;
-  const size_t last_K = dim_K_padded % (tile_K * DIM) == 0 ? tile_K : (dim_K_padded / DIM) % tile_K;
-
-  // These lines are supposed to figure out how much padding the hardware is
-  // supposed to add for the final tile
-  const size_t padding_I = dim_I_padded - dim_I;
-  const size_t padding_J = dim_J_padded - divided_dim_J;
-  const size_t added_padding_J = added_dim_J_padded - added_divided_dim_J;
-  const size_t padding_K = dim_K_padded - dim_K;
-
-  const bool no_bias = D == NULL;
-
-  if (no_bias)
-  {
-    D = (void *)1; // Dummy address which isn't NULL
-  }
-
-  const size_t sizeof_D = low_D ? sizeof(elem_t) : sizeof(acc_t);
-  const size_t sizeof_C = full_C ? sizeof(acc_t) : sizeof(elem_t);
-
-  switch (gemmini_num)
-  {
-  case 4:
-    gemmini_extended_config_ex(custom3, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom3, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom3, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom3, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom3, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-  case 3:
-    gemmini_extended_config_ex(custom2, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom2, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom2, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom2, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom2, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-  case 2:
-    gemmini_extended_config_ex(custom1, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom1, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom1, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom1, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom1, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-  case 1:
-    gemmini_extended_config_ex(custom0, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom0, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom0, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom0, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom0, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-    break;
-  }
-
-  if (act == IGELU)
-  {
-    const acc_scale_t sqrt_2 = 1.41421356237;
-    const acc_scale_t S = bert_scale;
-    const acc_scale_t S_erf = (-0.2888 * ((S * S) / 2));
-
-    const acc_t qb = -1.769 / (S / sqrt_2);
-    const acc_t qc = 1.0 / S_erf;
-    switch (gemmini_num)
-    {
-    case 4:
-      gemmini_config_norm(custom3, 0, 0, 0, 0, 0, qb, qc);
-    case 3:
-      gemmini_config_norm(custom2, 0, 0, 0, 0, 0, qb, qc);
-    case 2:
-      gemmini_config_norm(custom1, 0, 0, 0, 0, 0, qb, qc);
-    case 1:
-      gemmini_config_norm(custom0, 0, 0, 0, 0, 0, qb, qc);
-      break;
-    }
-  }
-
-  if (act == SOFTMAX)
-  {
-    const scale_t a = 0.3585;
-    const scale_t b = 1.353;
-    const scale_t c = 0.344;
-
-    const acc_t qln2 = (int)(0.693147 / bert_scale);
-    const acc_t qln2_inv = 65536 / qln2;
-    const acc_t qb = b / bert_scale;
-    const acc_t qc = c / (a * bert_scale * bert_scale);
-
-    switch (gemmini_num)
-    {
-    case 4:
-      gemmini_config_norm(custom3, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom3, qln2_inv, 1, 0, 1, 0, qb, qc);
-    case 3:
-      gemmini_config_norm(custom2, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom2, qln2_inv, 1, 0, 1, 0, qb, qc);
-    case 2:
-      gemmini_config_norm(custom1, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom1, qln2_inv, 1, 0, 1, 0, qb, qc);
-    case 1:
-      gemmini_config_norm(custom0, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom0, qln2_inv, 1, 0, 1, 0, qb, qc);
-      break;
-    }
-  }
-
-  void (*inner)(int, const size_t, size_t, const size_t, const size_t, const size_t, const elem_t *, const elem_t *, const void *, void *,
-                scale_t, scale_t, scale_acc_t,
-                size_t, size_t, size_t, size_t, size_t, size_t, size_t, size_t,
-                size_t, size_t, size_t, size_t,
-                bool, bool,
-                bool, bool,
-                bool, bool,
-                int);
-
-  if (dataflow == OUTPUT_STATIONARY)
-  {
-    inner = &multi_sp_tiled_matmul_os;
-  }
-  else /* if (dataflow == WEIGHT_STATIONARY) */
-  {
-    inner = &multi_sp_tiled_matmul_ws_col;
-  }
-
-  for (size_t i0 = 0; i0 < I0; i0++)
-    for (size_t j0 = 0; j0 < added_J0; j0++)
-      for (size_t k0 = 0; k0 < K0; k0++)
-      {
-
-        const void *pre;
-        if (k0 != 0)
-        {
-          pre = NULL;
-        }
-        else
-        {
-          size_t bias_row = repeating_bias ? 0 : i0 * tile_I * DIM;
-          // pre = &(((acc_t*)D)[bias_row * stride_D + j0 * tile_J * DIM]);
-          pre = (int8_t *)D + (bias_row * stride_D + j0 * tile_J * DIM) * sizeof_D;
-        }
-
-        void *out = k0 == K0 - 1 ? (int8_t *)C + (i0 * tile_I * DIM * stride_C + j0 * tile_J * DIM) * sizeof_C : NULL;
-
-        const size_t I = i0 < I0 - 1 ? tile_I : last_I;
-        const size_t J = j0 < J0 - 1 ? tile_J : last_J;
-        const size_t added_J = j0 < added_J0 - 1 ? tile_J : added_last_J;
-        const size_t K = k0 < K0 - 1 ? tile_K : last_K;
-
-        const size_t pad_I = i0 == I0 - 1 ? padding_I : 0;
-        const size_t pad_J = j0 == J0 - 1 ? padding_J : 0;
-        const size_t added_pad_J = j0 == added_J0 - 1 ? added_padding_J : 0;
-        const size_t pad_K = k0 == K0 - 1 ? padding_K : 0;
-
-        const elem_t *a = a_transpose ? (A + k0 * tile_K * DIM * stride_A + i0 * tile_I * DIM)
-                                      : (A + i0 * tile_I * DIM * stride_A + k0 * tile_K * DIM);
-
-        const elem_t *b = b_transpose ? (B + j0 * tile_J * DIM * stride_B + k0 * tile_K * DIM)
-                                      : (B + k0 * tile_K * DIM * stride_B + j0 * tile_J * DIM);
-
-        (*inner)(gemmini_num, added_gemmini_num,
-                 j0, J0, divided_dim_J, added_divided_dim_J,
-                 a, b, pre, out,
-                 A_scale_factor, B_scale_factor, D_scale_factor,
-                 I, added_J, J, K,
-                 pad_I, added_pad_J, pad_J, pad_K,
-                 stride_A, stride_B, stride_D, stride_C,
-                 a_transpose, b_transpose,
-                 full_C, low_D,
-                 no_bias, repeating_bias,
-                 act);
-      }
-
-  // gemmini_fence();
-}
-
 
 // made
 static void multi_tiled_matmul_outer1(int gemmini_num,
@@ -3115,7 +2530,7 @@ static void shared_multi_tiled_matmul_outer(int gemmini_num,
     }
   }
 
-  void (*inner)(int, const elem_t *, const elem_t *, const void *, void *,
+  void (*inner)(int, int, int, const elem_t *, const elem_t *, const void *, void *,
                 scale_t, scale_t, scale_acc_t,
                 size_t, size_t, size_t, size_t,
                 size_t, size_t, size_t, size_t, size_t, size_t,
@@ -3134,10 +2549,14 @@ static void shared_multi_tiled_matmul_outer(int gemmini_num,
     inner = &shared_multi_sp_tiled_matmul_ws;
   }
 
+  int group_id = 0;
+  // printf("tile_I = %d, tile_J = %d, tile_K = %d\n", tile_I, tile_J, tile_K);
+  // printf("I0 = %d, J0 = %d, K0 = %d\n", I0, J0, K0);
   for (size_t i0 = 0; i0 < I0; i0++)
     for (size_t j0 = 0; j0 < J0; j0++)
       for (size_t k0 = 0; k0 < K0; k0++)
       {
+        group_id++;
 
         const void *pre;
         if (k0 != 0)
@@ -3198,11 +2617,12 @@ static void shared_multi_tiled_matmul_outer(int gemmini_num,
           size_t this_I = (gem_num < I_added_gemmini_num) ? I_div_added : I_div;
           size_t this_pad_I = (gem_num == using_gemmini_num - 1) ? pad_I : 0;
 
-          // size_t this_K = (gem_num < K_added_gemmini_num) ? K_div_added : K_div;
-          size_t this_K = (gem_num < using_gemmini_num - K_added_gemmini_num) ? K_div : K_div_added;
+          size_t this_K = (gem_num < K_added_gemmini_num) ? K_div_added : K_div;
           size_t this_pad_K = (gem_num == using_gemmini_num - 1) ? pad_K : 0;
-          
-          (*inner)(gem_num, a_local, b_local, (k0 != 0) ? NULL : (void *)d_local, (k0 == K0 - 1) ? (void *)c_local : NULL,
+
+          int group_list = (1 << using_gemmini_num) - 1;
+
+          (*inner)(gem_num, group_list, group_id, a_local, b_local, (k0 != 0) ? NULL : (void *)d_local, (k0 == K0 - 1) ? (void *)c_local : NULL,
                    A_scale_factor, B_scale_factor, D_scale_factor,
                    this_K, this_pad_K, laddrI_offset, laddrK_offset, // mv_K, mv_pad_K, laddrI_offset, laddrK_offset
                    this_I, J, K,
@@ -3225,236 +2645,28 @@ static void shared_multi_tiled_matmul_outer(int gemmini_num,
         switch (using_gemmini_num)
         {
         case 4:
-          ROCC_INSTRUCTION_RS1_RS2(custom3, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          ROCC_INSTRUCTION_RS1_RS2(custom3, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          break;
         case 3:
-          ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          break;
         case 2:
-          ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          break;
         case 1:
-          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
           break;
         }
       }
 
   // gemmini_fence();
 }
-
-// made
-static void multi_tiled_matmul_outer0(int gemmini_num,
-                                     size_t dim_I, size_t dim_J, size_t dim_K,
-                                     const elem_t *A, const elem_t *B,
-                                     const void *D, void *C,
-                                     size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
-                                     scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
-                                     size_t tile_I, size_t tile_J, size_t tile_K,
-                                     int act, acc_scale_t scale, acc_scale_t bert_scale,
-                                     bool repeating_bias,
-                                     bool a_transpose, bool b_transpose,
-                                     bool full_C, bool low_D,
-                                     uint8_t weightA,
-                                     int dataflow)
-{
-
-  const size_t divided_dim_I = dim_I / gemmini_num;
-  const size_t added_divided_dim_I = divided_dim_I + 1;
-  const size_t added_gemmini_num = dim_I % gemmini_num;
-
-  const size_t dim_I_padded = (divided_dim_I / DIM + (divided_dim_I % DIM != 0)) * DIM;
-  const size_t added_dim_I_padded = (added_divided_dim_I / DIM + (added_divided_dim_I % DIM != 0)) * DIM;
-  const size_t dim_J_padded = (dim_J / DIM + (dim_J % DIM != 0)) * DIM;
-  const size_t dim_K_padded = (dim_K / DIM + (dim_K % DIM != 0)) * DIM;
-
-  const size_t I0 = dim_I_padded / (tile_I * DIM) + (dim_I_padded % (tile_I * DIM) != 0);
-  const size_t added_I0 = added_dim_I_padded / (tile_I * DIM) + (added_dim_I_padded % (tile_I * DIM) != 0);
-  const size_t J0 = dim_J_padded / (tile_J * DIM) + (dim_J_padded % (tile_J * DIM) != 0);
-  const size_t K0 = dim_K_padded / (tile_K * DIM) + (dim_K_padded % (tile_K * DIM) != 0);
-
-  // These lines here are supposed to help us deal with when the dimensions of
-  // the systolic array aren't divisible by the tiling factors
-  const size_t last_I = dim_I_padded % (tile_I * DIM) == 0 ? tile_I : (dim_I_padded / DIM) % tile_I;
-  const size_t added_last_I = added_dim_I_padded % (tile_I * DIM) == 0 ? tile_I : (added_dim_I_padded / DIM) % tile_I;
-  const size_t last_J = dim_J_padded % (tile_J * DIM) == 0 ? tile_J : (dim_J_padded / DIM) % tile_J;
-  const size_t last_K = dim_K_padded % (tile_K * DIM) == 0 ? tile_K : (dim_K_padded / DIM) % tile_K;
-
-  // These lines are supposed to figure out how much padding the hardware is
-  // supposed to add for the final tile
-  const size_t padding_I = dim_I_padded - divided_dim_I;
-  const size_t added_padding_I = added_dim_I_padded - added_divided_dim_I;
-  const size_t padding_J = dim_J_padded - dim_J;
-  const size_t padding_K = dim_K_padded - dim_K;
-
-  const bool no_bias = D == NULL;
-
-  if (no_bias)
-  {
-    D = (void *)1; // Dummy address which isn't NULL
-  }
-
-  const size_t sizeof_D = low_D ? sizeof(elem_t) : sizeof(acc_t);
-  const size_t sizeof_C = full_C ? sizeof(acc_t) : sizeof(elem_t);
-
-  switch (gemmini_num)
-  {
-  case 4:
-    gemmini_extended_config_ex(custom3, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom3, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom3, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom3, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom3, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-  case 3:
-    gemmini_extended_config_ex(custom2, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom2, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom2, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom2, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom2, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-  case 2:
-    gemmini_extended_config_ex(custom1, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom1, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom1, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom1, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom1, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-  case 1:
-    gemmini_extended_config_ex(custom0, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom0, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom0, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom0, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom0, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-    break;
-  }
-
-  if (act == IGELU)
-  {
-    const acc_scale_t sqrt_2 = 1.41421356237;
-    const acc_scale_t S = bert_scale;
-    const acc_scale_t S_erf = (-0.2888 * ((S * S) / 2));
-
-    const acc_t qb = -1.769 / (S / sqrt_2);
-    const acc_t qc = 1.0 / S_erf;
-    switch (gemmini_num)
-    {
-    case 4:
-      gemmini_config_norm(custom3, 0, 0, 0, 0, 0, qb, qc);
-    case 3:
-      gemmini_config_norm(custom2, 0, 0, 0, 0, 0, qb, qc);
-    case 2:
-      gemmini_config_norm(custom1, 0, 0, 0, 0, 0, qb, qc);
-    case 1:
-      gemmini_config_norm(custom0, 0, 0, 0, 0, 0, qb, qc);
-      break;
-    }
-  }
-
-  if (act == SOFTMAX)
-  {
-    const scale_t a = 0.3585;
-    const scale_t b = 1.353;
-    const scale_t c = 0.344;
-
-    const acc_t qln2 = (int)(0.693147 / bert_scale);
-    const acc_t qln2_inv = 65536 / qln2;
-    const acc_t qb = b / bert_scale;
-    const acc_t qc = c / (a * bert_scale * bert_scale);
-
-    switch (gemmini_num)
-    {
-    case 4:
-      gemmini_config_norm(custom3, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom3, qln2_inv, 1, 0, 1, 0, qb, qc);
-    case 3:
-      gemmini_config_norm(custom2, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom2, qln2_inv, 1, 0, 1, 0, qb, qc);
-    case 2:
-      gemmini_config_norm(custom1, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom1, qln2_inv, 1, 0, 1, 0, qb, qc);
-    case 1:
-      gemmini_config_norm(custom0, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom0, qln2_inv, 1, 0, 1, 0, qb, qc);
-      break;
-    }
-  }
-
-  void (*inner)(int, const elem_t *, const elem_t *, const void *, void *,
-                scale_t, scale_t, scale_acc_t,
-                size_t, size_t, size_t, size_t, size_t, size_t,
-                size_t, size_t, size_t, size_t,
-                bool, bool,
-                bool, bool,
-                bool, bool,
-                int);
-
-  if (dataflow == OUTPUT_STATIONARY)
-  {
-    inner = &sp_tiled_matmul_os;
-  }
-  else /* if (dataflow == WEIGHT_STATIONARY) */
-  {
-    inner = &sp_tiled_matmul_ws;
-  }
-
-  for (size_t i0 = 0; i0 < added_I0; i0++)
-    for (size_t j0 = 0; j0 < J0; j0++)
-      for (size_t k0 = 0; k0 < K0; k0++)
-      {
-
-        const void *pre;
-        if (k0 != 0)
-        {
-          pre = NULL;
-        }
-        else
-        {
-          size_t bias_row = repeating_bias ? 0 : i0 * tile_I * DIM;
-          // pre = &(((acc_t*)D)[bias_row * stride_D + j0 * tile_J * DIM]);
-          pre = (int8_t *)D + (bias_row * stride_D + j0 * tile_J * DIM) * sizeof_D;
-        }
-
-        void *out = k0 == K0 - 1 ? (int8_t *)C + (i0 * tile_I * DIM * stride_C + j0 * tile_J * DIM) * sizeof_C : NULL;
-
-        const size_t I = i0 < I0 - 1 ? tile_I : last_I;
-        const size_t added_I = i0 < added_I0 - 1 ? tile_I : added_last_I;
-        const size_t J = j0 < J0 - 1 ? tile_J : last_J;
-        const size_t K = k0 < K0 - 1 ? tile_K : last_K;
-
-        const size_t pad_I = i0 == I0 - 1 ? padding_I : 0;
-        const size_t added_pad_I = i0 == added_I0 - 1 ? added_padding_I : 0;
-        const size_t pad_J = j0 == J0 - 1 ? padding_J : 0;
-        const size_t pad_K = k0 == K0 - 1 ? padding_K : 0;
-
-        const elem_t *a = a_transpose ? (A + k0 * tile_K * DIM * stride_A + i0 * tile_I * DIM)
-                                      : (A + i0 * tile_I * DIM * stride_A + k0 * tile_K * DIM);
-
-        const elem_t *b = b_transpose ? (B + j0 * tile_J * DIM * stride_B + k0 * tile_K * DIM)
-                                      : (B + k0 * tile_K * DIM * stride_B + j0 * tile_J * DIM);
-
-        const elem_t *a_local = a;
-        const int8_t *out_local = (int8_t *)out;
-
-        for (size_t gem_num = 0; gem_num < gemmini_num; ++gem_num)
-        {
-          size_t this_I = (gem_num < added_gemmini_num) ? added_I : I;
-          size_t this_pad_I = (gem_num < added_gemmini_num) ? added_pad_I : pad_I;
-
-          if (gem_num < added_gemmini_num || i0 < I0)
-          {
-            (*inner)(gem_num, a_local, b, pre, (k0 == K0 - 1) ? (void *)out_local : NULL,
-                     A_scale_factor, B_scale_factor, D_scale_factor,
-                     this_I, J, K,
-                     this_pad_I, pad_J, pad_K,
-                     stride_A, stride_B, stride_D, stride_C,
-                     a_transpose, b_transpose,
-                     full_C, low_D,
-                     no_bias, repeating_bias,
-                     act);
-          }
-
-          a_local += stride_A * ((gem_num < added_gemmini_num) ? added_divided_dim_I : divided_dim_I);
-          out_local += stride_C * ((gem_num < added_gemmini_num) ? added_divided_dim_I : divided_dim_I);
-        }
-      }
-
-  // gemmini_fence();
-}
-
 
 static acc_t int_sqrt(acc_t n) {
   if (n == 0) return 0;
@@ -3837,149 +3049,6 @@ static void tiled_matmul (int custom_num, size_t dim_I, size_t dim_J, size_t dim
   }
 }
 
-
-// made
-static void multi_tiled_matmul1_col(int gemmini_num,
-                                size_t dim_I, size_t dim_J, size_t dim_K,
-                                const elem_t *A, const elem_t *B,
-                                const void *D, void *C,
-                                size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
-                                scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
-                                int act, acc_scale_t scale, acc_scale_t bert_scale,
-                                bool repeating_bias,
-                                size_t tile_I, size_t tile_J, size_t tile_K,
-                                bool transpose_A, bool transpose_B,
-                                bool full_C, bool low_D,
-                                uint8_t weightA,
-                                enum tiled_matmul_type_t tiled_matmul_type)
-{
-
-#ifdef GEMMINI_ASSERTIONS
-  // Make sure that the tiling factors make sense
-  if (tile_I <= 0)
-  {
-    printf("tile_I is non-positive\n");
-    exit(1);
-  }
-  else if (tile_J <= 0)
-  {
-    printf("tile_J is non-positive\n");
-    exit(1);
-  }
-  else if (tile_K <= 0)
-  {
-    printf("tile_K is non-positive\n");
-    exit(1);
-  }
-
-  const size_t divided_dim_J = dim_J / gemmini_num + 1;
-
-  const size_t dim_I_padded = (dim_I / DIM + (dim_I % DIM != 0)) * DIM;
-  const size_t dim_J_padded = (divided_dim_J / DIM + (divided_dim_J % DIM != 0)) * DIM;
-  const size_t dim_K_padded = (dim_K / DIM + (dim_K % DIM != 0)) * DIM;
-
-  if (tile_I * DIM > dim_I_padded)
-  {
-    printf("tile_I is too large (tile_I * DIM > dim_I_padded)\n");
-    exit(1);
-  }
-  else if (tile_J * DIM > dim_J_padded)
-  {
-    printf("tile_J is too large (tile_J * DIM > dim_J_padded)\n");
-    exit(1);
-  }
-  else if (tile_K * DIM > dim_K_padded)
-  {
-    printf("tile_K is too large (tile_K * DIM > dim_K_padded)\n");
-    exit(1);
-  }
-
-  const bool double_buffered = tiled_matmul_type == WS;
-
-  const size_t total_spad_size = double_buffered ? BANK_NUM * BANK_ROWS / 2 : BANK_NUM * BANK_ROWS;
-  const size_t total_acc_size = double_buffered ? ACC_ROWS / 2 : ACC_ROWS;
-
-  const size_t total_spad_rows =
-      (tile_I * tile_K * DIM) + // Rows to store A
-      (tile_K * tile_J * DIM);  // Rows to store B
-
-  if (total_spad_rows > total_spad_size)
-  {
-    printf("Not enough space in scratchpad to store A and B matrices\n");
-    exit(1);
-  }
-
-  const size_t total_acc_rows =
-      tile_I * tile_J * DIM; // Rows to store C
-
-  if (total_acc_rows > total_acc_size)
-  {
-    printf("Not enough space in accumulator to store C\n");
-    exit(1);
-  }
-
-  if (tile_I > 65535 || tile_J > 65535 || tile_K > 65535)
-  {
-    printf("I, J, and K tiling factors must be less than 65535, to fit within the bounds of the LOOP_WS function");
-    exit(1);
-  }
-
-  char matmul_type_str[][4] = {"OS", "WS", "CPU"};
-
-  // Check if transpose options are correct
-  if (((tiled_matmul_type == OS) && (transpose_A || transpose_B)) ||
-      (tiled_matmul_type == WS && transpose_A && transpose_B))
-  {
-    printf("Not implemented: %s matmul, a_transpose=%d, b_transpose=%d\n", matmul_type_str[tiled_matmul_type], transpose_A, transpose_B);
-    exit(1);
-  }
-
-  // Check if full_C options are correct
-  if ((tiled_matmul_type == CPU && (full_C || low_D)) ||
-      (tiled_matmul_type == OS && low_D))
-  {
-    printf("Not implemented: %s matmul, full_C=%d, low_D=%d\n", matmul_type_str[tiled_matmul_type], full_C, low_D);
-  }
-
-  if (act == LAYERNORM || act == SOFTMAX)
-  {
-    if (tiled_matmul_type == OS)
-    {
-      printf("Not implemented: %s matmul, act=%d\n", matmul_type_str[tiled_matmul_type], act);
-    }
-    if (tile_J * DIM < dim_J)
-    {
-      printf("When doing layernorm or softmax, the full J dimension of the matrix must fit in the accumulator\n");
-    }
-  }
-#endif
-
-  // Run a tiled matrix multiplication on either Gemmini or the CPU
-  if (tiled_matmul_type == OS || tiled_matmul_type == WS)
-  {
-    multi_tiled_matmul_outer1_col(gemmini_num,
-                              dim_I, dim_J, dim_K,
-                              A, B, D, C,
-                              stride_A, stride_B, stride_D, stride_C,
-                              A_scale_factor, B_scale_factor, D_scale_factor,
-                              tile_I, tile_J, tile_K,
-                              act, scale, bert_scale, repeating_bias,
-                              transpose_A, transpose_B,
-                              full_C, low_D,
-                              weightA,
-                              (int)tiled_matmul_type);
-  }
-  else /*if (tiled_matmul_type == CPU)*/
-  {
-    matmul_cpu(transpose_A, transpose_B, dim_I, dim_J, dim_K,
-               A, B, (const acc_t *)D, (elem_t *)C,
-               stride_A, stride_B, stride_D, stride_C,
-               A_scale_factor, B_scale_factor, D_scale_factor,
-               act, scale, bert_scale, repeating_bias);
-  }
-}
-
-
 // made
 static void multi_tiled_matmul1(int gemmini_num,
                          size_t dim_I, size_t dim_J, size_t dim_K,
@@ -4260,148 +3329,6 @@ static void shared_multi_tiled_matmul(int gemmini_num,
   }
 }
 
-// made
-static void multi_tiled_matmul0(int gemmini_num,
-                               size_t dim_I, size_t dim_J, size_t dim_K,
-                               const elem_t *A, const elem_t *B,
-                               const void *D, void *C,
-                               size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
-                               scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
-                               int act, acc_scale_t scale, acc_scale_t bert_scale,
-                               bool repeating_bias,
-                               size_t tile_I, size_t tile_J, size_t tile_K,
-                               bool transpose_A, bool transpose_B,
-                               bool full_C, bool low_D,
-                               uint8_t weightA,
-                               enum tiled_matmul_type_t tiled_matmul_type)
-{
-
-#ifdef GEMMINI_ASSERTIONS
-  // Make sure that the tiling factors make sense
-  if (tile_I <= 0)
-  {
-    printf("tile_I is non-positive\n");
-    exit(1);
-  }
-  else if (tile_J <= 0)
-  {
-    printf("tile_J is non-positive\n");
-    exit(1);
-  }
-  else if (tile_K <= 0)
-  {
-    printf("tile_K is non-positive\n");
-    exit(1);
-  }
-
-  const size_t divided_dim_I = dim_I / gemmini_num + 1;
-
-  const size_t dim_I_padded = (divided_dim_I / DIM + (divided_dim_I % DIM != 0)) * DIM;
-  const size_t dim_J_padded = (dim_J / DIM + (dim_J % DIM != 0)) * DIM;
-  const size_t dim_K_padded = (dim_K / DIM + (dim_K % DIM != 0)) * DIM;
-
-  if (tile_I * DIM > dim_I_padded)
-  {
-    printf("tile_I is too large (tile_I * DIM > dim_I_padded)\n");
-    exit(1);
-  }
-  else if (tile_J * DIM > dim_J_padded)
-  {
-    printf("tile_J is too large (tile_J * DIM > dim_J_padded)\n");
-    exit(1);
-  }
-  else if (tile_K * DIM > dim_K_padded)
-  {
-    printf("tile_K is too large (tile_K * DIM > dim_K_padded)\n");
-    exit(1);
-  }
-
-  const bool double_buffered = tiled_matmul_type == WS;
-
-  const size_t total_spad_size = double_buffered ? BANK_NUM * BANK_ROWS / 2 : BANK_NUM * BANK_ROWS;
-  const size_t total_acc_size = double_buffered ? ACC_ROWS / 2 : ACC_ROWS;
-
-  const size_t total_spad_rows =
-      (tile_I * tile_K * DIM) + // Rows to store A
-      (tile_K * tile_J * DIM);  // Rows to store B
-
-  if (total_spad_rows > total_spad_size)
-  {
-    printf("Not enough space in scratchpad to store A and B matrices\n");
-    exit(1);
-  }
-
-  const size_t total_acc_rows =
-      tile_I * tile_J * DIM; // Rows to store C
-
-  if (total_acc_rows > total_acc_size)
-  {
-    printf("Not enough space in accumulator to store C\n");
-    exit(1);
-  }
-
-  if (tile_I > 65535 || tile_J > 65535 || tile_K > 65535)
-  {
-    printf("I, J, and K tiling factors must be less than 65535, to fit within the bounds of the LOOP_WS function");
-    exit(1);
-  }
-
-  char matmul_type_str[][4] = {"OS", "WS", "CPU"};
-
-  // Check if transpose options are correct
-  if (((tiled_matmul_type == OS) && (transpose_A || transpose_B)) ||
-      (tiled_matmul_type == WS && transpose_A && transpose_B))
-  {
-    printf("Not implemented: %s matmul, a_transpose=%d, b_transpose=%d\n", matmul_type_str[tiled_matmul_type], transpose_A, transpose_B);
-    exit(1);
-  }
-
-  // Check if full_C options are correct
-  if ((tiled_matmul_type == CPU && (full_C || low_D)) ||
-      (tiled_matmul_type == OS && low_D))
-  {
-    printf("Not implemented: %s matmul, full_C=%d, low_D=%d\n", matmul_type_str[tiled_matmul_type], full_C, low_D);
-  }
-
-  if (act == LAYERNORM || act == SOFTMAX)
-  {
-    if (tiled_matmul_type == OS)
-    {
-      printf("Not implemented: %s matmul, act=%d\n", matmul_type_str[tiled_matmul_type], act);
-    }
-    if (tile_J * DIM < dim_J)
-    {
-      printf("When doing layernorm or softmax, the full J dimension of the matrix must fit in the accumulator\n");
-    }
-  }
-#endif
-
-  // Run a tiled matrix multiplication on either Gemmini or the CPU
-  if (tiled_matmul_type == OS || tiled_matmul_type == WS)
-  {
-    multi_tiled_matmul_outer0(gemmini_num,
-                             dim_I, dim_J, dim_K,
-                             A, B, D, C,
-                             stride_A, stride_B, stride_D, stride_C,
-                             A_scale_factor, B_scale_factor, D_scale_factor,
-                             tile_I, tile_J, tile_K,
-                             act, scale, bert_scale, repeating_bias,
-                             transpose_A, transpose_B,
-                             full_C, low_D,
-                             weightA,
-                             (int)tiled_matmul_type);
-  }
-  else /*if (tiled_matmul_type == CPU)*/
-  {
-    matmul_cpu(transpose_A, transpose_B, dim_I, dim_J, dim_K,
-               A, B, (const acc_t *)D, (elem_t *)C,
-               stride_A, stride_B, stride_D, stride_C,
-               A_scale_factor, B_scale_factor, D_scale_factor,
-               act, scale, bert_scale, repeating_bias);
-  }
-}
-
-
 static size_t tiled_matmul_total_spad_rows(size_t I, size_t J, size_t K) {
   return (I * K + K * J) * DIM;
 }
@@ -4528,291 +3455,6 @@ static void tiled_matmul_auto(int custom_num, size_t dim_I, size_t dim_J, size_t
 #undef max_tile_i_j
 #undef max_tile_k
 }
-
-
-// made
-static void multi_tiled_matmul_auto1_dynamic(int gemmini_num,
-                                         size_t dim_I, size_t dim_J, size_t dim_K,
-                                         const elem_t *A, const elem_t *B,
-                                         const void *D, void *C,
-                                         size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
-                                         scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
-                                         int act, acc_scale_t scale, acc_scale_t bert_scale,
-                                         bool repeating_bias,
-                                         bool transpose_A, bool transpose_B,
-                                         bool full_C, bool low_D,
-                                         uint8_t weightA,
-                                         enum tiled_matmul_type_t tiled_matmul_type)
-{
-
-#define partition_rows (BANK_NUM * BANK_ROWS / 2)
-#define mats_in_partition (partition_rows / DIM)
-#define mats_in_acc (ACC_ROWS / DIM)
-#define max_tile_i_j ((size_t)sqrt(mats_in_acc))
-#define max_tile_k (mats_in_partition / max_tile_i_j)
-
-  // "db_" means "double-buffered"
-#define db_partition_rows ((BANK_NUM * BANK_ROWS / 2) / 2)
-#define db_mats_in_partition (db_partition_rows / DIM)
-#define db_mats_in_acc ((ACC_ROWS / 2) / DIM)
-#define db_max_tile_i_j ((size_t)sqrt(db_mats_in_acc))
-#define db_max_tile_k (db_mats_in_partition / db_max_tile_i_j)
-
-  if (gemmini_num == 0)
-  {
-    printf("We need at least one gemmini!\n");
-    exit(1);
-  }
-  else if (gemmini_num > 4)
-  {
-    printf("We can have maximum four gemminis!\n");
-    exit(1);
-  }
-
-  const size_t divided_dim_J = dim_J / gemmini_num + 1;
-
-  const size_t dim_I_padded = (dim_I / DIM + (dim_I % DIM != 0)) * DIM;
-  const size_t dim_J_padded = (divided_dim_J / DIM + (divided_dim_J % DIM != 0)) * DIM;
-  const size_t dim_K_padded = (dim_K / DIM + (dim_K % DIM != 0)) * DIM;
-
-  const bool double_buffered = tiled_matmul_type == WS;
-
-  const size_t max_spad_rows = double_buffered ? BANK_NUM * BANK_ROWS / 2 : BANK_NUM * BANK_ROWS;
-  const size_t max_acc_rows = double_buffered ? ACC_ROWS / 2 : ACC_ROWS;
-
-  size_t tile_I, tile_J, tile_K;
-
-  if (act == LAYERNORM || act == SOFTMAX)
-  {
-    tile_I = 1;
-    tile_J = dim_J_padded / DIM;
-    tile_K = 1;
-  }
-  else if (double_buffered)
-  {
-    tile_I = dim_I_padded / DIM < db_max_tile_i_j ? dim_I_padded / DIM : db_max_tile_i_j;
-    tile_J = dim_J_padded / DIM < db_max_tile_i_j ? dim_J_padded / DIM : db_max_tile_i_j;
-    tile_K = dim_K_padded / DIM < db_max_tile_k ? dim_K_padded / DIM : db_max_tile_k;
-  }
-  else
-  {
-    tile_I = dim_I_padded / DIM < max_tile_i_j ? dim_I_padded / DIM : max_tile_i_j;
-    tile_J = dim_J_padded / DIM < max_tile_i_j ? dim_J_padded / DIM : max_tile_i_j;
-    tile_K = dim_K_padded / DIM < max_tile_k ? dim_K_padded / DIM : max_tile_k;
-  }
-
-  // Fill scratchpad as much as possible
-  while (true)
-  {
-    bool increased = false;
-
-    if (tiled_matmul_total_spad_rows(tile_I, tile_J + 1, tile_K) <= max_spad_rows &&
-        tiled_matmul_total_acc_rows(tile_I, tile_J + 1) <= max_acc_rows &&
-        (tile_J + 1) * DIM <= dim_J_padded)
-    {
-      tile_J++;
-      increased = true;
-    }
-
-    if (tiled_matmul_total_spad_rows(tile_I + 1, tile_J, tile_K) <= max_spad_rows &&
-        tiled_matmul_total_acc_rows(tile_I + 1, tile_J) <= max_acc_rows &&
-        (tile_I + 1) * DIM <= dim_I_padded)
-    {
-      tile_I++;
-      increased = true;
-    }
-
-    if (tiled_matmul_total_spad_rows(tile_I, tile_J, tile_K + 1) <= max_spad_rows &&
-        (tile_K + 1) * DIM <= dim_K_padded)
-    {
-      tile_K++;
-      increased = true;
-    }
-
-    if (!increased)
-      break;
-  }
-
-#ifdef PRINT_TILE
-#if PRINT_TILE
-  const int spad_rows = tiled_matmul_total_spad_rows(tile_I, tile_J, tile_K);
-  const int acc_rows = tiled_matmul_total_acc_rows(tile_I, tile_J);
-
-  printf("tile_I: %d\n", tile_I);
-  printf("tile_J: %d\n", tile_J);
-  printf("tile_K: %d\n\n", tile_K);
-
-  printf("spad_rows: %d\n", spad_rows);
-  printf("acc_rows: %d\n\n", acc_rows);
-
-  printf("spad_row utilization: %d%%\n", (spad_rows * 100) / max_spad_rows);
-  printf("acc_row utilization: %d%%\n\n", (acc_rows * 100) / max_acc_rows);
-
-  exit(EXIT_SUCCESS);
-#endif
-#endif
-
-  multi_tiled_matmul1_col(gemmini_num,
-                          dim_I, dim_J, dim_K,
-                          A, B, D, C,
-                          stride_A, stride_B, stride_D, stride_C,
-                          A_scale_factor, B_scale_factor, D_scale_factor,
-                          act, scale, bert_scale, repeating_bias,
-                          tile_I, tile_J, tile_K,
-                          transpose_A, transpose_B,
-                          full_C, low_D,
-                          weightA,
-                          tiled_matmul_type);
-
-#undef partition_rows
-#undef mats_in_partition
-#undef mats_in_acc
-#undef max_tile_i_j
-#undef max_tile_k
-}
-
-
-// made
-static void multi_tiled_matmul_auto1_col(int gemmini_num,
-                                     size_t dim_I, size_t dim_J, size_t dim_K,
-                                     const elem_t *A, const elem_t *B,
-                                     const void *D, void *C,
-                                     size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
-                                     scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
-                                     int act, acc_scale_t scale, acc_scale_t bert_scale,
-                                     bool repeating_bias,
-                                     bool transpose_A, bool transpose_B,
-                                     bool full_C, bool low_D,
-                                     uint8_t weightA,
-                                     enum tiled_matmul_type_t tiled_matmul_type)
-{
-
-#define partition_rows (BANK_NUM * BANK_ROWS / 2)
-#define mats_in_partition (partition_rows / DIM)
-#define mats_in_acc (ACC_ROWS / DIM)
-#define max_tile_i_j ((size_t)sqrt(mats_in_acc))
-#define max_tile_k (mats_in_partition / max_tile_i_j)
-
-  // "db_" means "double-buffered"
-#define db_partition_rows ((BANK_NUM * BANK_ROWS / 2) / 2)
-#define db_mats_in_partition (db_partition_rows / DIM)
-#define db_mats_in_acc ((ACC_ROWS / 2) / DIM)
-#define db_max_tile_i_j ((size_t)sqrt(db_mats_in_acc))
-#define db_max_tile_k (db_mats_in_partition / db_max_tile_i_j)
-
-  if (gemmini_num == 0)
-  {
-    printf("We need at least one gemmini!\n");
-    exit(1);
-  }
-  else if (gemmini_num > 4)
-  {
-    printf("We can have maximum four gemminis!\n");
-    exit(1);
-  }
-
-  const size_t divided_dim_J = dim_J / gemmini_num + 1;
-
-  const size_t dim_I_padded = (dim_I / DIM + (dim_I % DIM != 0)) * DIM;
-  const size_t dim_J_padded = (divided_dim_J / DIM + (divided_dim_J % DIM != 0)) * DIM;
-  const size_t dim_K_padded = (dim_K / DIM + (dim_K % DIM != 0)) * DIM;
-
-  const bool double_buffered = tiled_matmul_type == WS;
-
-  const size_t max_spad_rows = double_buffered ? BANK_NUM * BANK_ROWS / 2 : BANK_NUM * BANK_ROWS;
-  const size_t max_acc_rows = double_buffered ? ACC_ROWS / 2 : ACC_ROWS;
-
-  size_t tile_I, tile_J, tile_K;
-
-  if (act == LAYERNORM || act == SOFTMAX)
-  {
-    tile_I = 1;
-    tile_J = dim_J_padded / DIM;
-    tile_K = 1;
-  }
-  else if (double_buffered)
-  {
-    tile_I = dim_I_padded / DIM < db_max_tile_i_j ? dim_I_padded / DIM : db_max_tile_i_j;
-    tile_J = dim_J_padded / DIM < db_max_tile_i_j ? dim_J_padded / DIM : db_max_tile_i_j;
-    tile_K = dim_K_padded / DIM < db_max_tile_k ? dim_K_padded / DIM : db_max_tile_k;
-  }
-  else
-  {
-    tile_I = dim_I_padded / DIM < max_tile_i_j ? dim_I_padded / DIM : max_tile_i_j;
-    tile_J = dim_J_padded / DIM < max_tile_i_j ? dim_J_padded / DIM : max_tile_i_j;
-    tile_K = dim_K_padded / DIM < max_tile_k ? dim_K_padded / DIM : max_tile_k;
-  }
-
-  // Fill scratchpad as much as possible
-  while (true)
-  {
-    bool increased = false;
-
-    if (tiled_matmul_total_spad_rows(tile_I, tile_J + 1, tile_K) <= max_spad_rows &&
-        tiled_matmul_total_acc_rows(tile_I, tile_J + 1) <= max_acc_rows &&
-        (tile_J + 1) * DIM <= dim_J_padded)
-    {
-      tile_J++;
-      increased = true;
-    }
-
-    if (tiled_matmul_total_spad_rows(tile_I + 1, tile_J, tile_K) <= max_spad_rows &&
-        tiled_matmul_total_acc_rows(tile_I + 1, tile_J) <= max_acc_rows &&
-        (tile_I + 1) * DIM <= dim_I_padded)
-    {
-      tile_I++;
-      increased = true;
-    }
-
-    if (tiled_matmul_total_spad_rows(tile_I, tile_J, tile_K + 1) <= max_spad_rows &&
-        (tile_K + 1) * DIM <= dim_K_padded)
-    {
-      tile_K++;
-      increased = true;
-    }
-
-    if (!increased)
-      break;
-  }
-
-#ifdef PRINT_TILE
-#if PRINT_TILE
-  const int spad_rows = tiled_matmul_total_spad_rows(tile_I, tile_J, tile_K);
-  const int acc_rows = tiled_matmul_total_acc_rows(tile_I, tile_J);
-
-  printf("tile_I: %d\n", tile_I);
-  printf("tile_J: %d\n", tile_J);
-  printf("tile_K: %d\n\n", tile_K);
-
-  printf("spad_rows: %d\n", spad_rows);
-  printf("acc_rows: %d\n\n", acc_rows);
-
-  printf("spad_row utilization: %d%%\n", (spad_rows * 100) / max_spad_rows);
-  printf("acc_row utilization: %d%%\n\n", (acc_rows * 100) / max_acc_rows);
-
-  exit(EXIT_SUCCESS);
-#endif
-#endif
-
-  multi_tiled_matmul1_col(gemmini_num,
-                      dim_I, dim_J, dim_K,
-                      A, B, D, C,
-                      stride_A, stride_B, stride_D, stride_C,
-                      A_scale_factor, B_scale_factor, D_scale_factor,
-                      act, scale, bert_scale, repeating_bias,
-                      tile_I, tile_J, tile_K,
-                      transpose_A, transpose_B,
-                      full_C, low_D,
-                      weightA,
-                      tiled_matmul_type);
-
-#undef partition_rows
-#undef mats_in_partition
-#undef mats_in_acc
-#undef max_tile_i_j
-#undef max_tile_k
-}
-
 
 // made
 static void multi_tiled_matmul_auto1(int gemmini_num,
@@ -5091,148 +3733,6 @@ static void shared_multi_tiled_matmul_auto(int gemmini_num,
 #undef max_tile_i_j
 #undef max_tile_k
 }
-
-// made
-static void multi_tiled_matmul_auto0(int gemmini_num,
-                                    size_t dim_I, size_t dim_J, size_t dim_K,
-                                    const elem_t *A, const elem_t *B,
-                                    const void *D, void *C,
-                                    size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
-                                    scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
-                                    int act, acc_scale_t scale, acc_scale_t bert_scale,
-                                    bool repeating_bias,
-                                    bool transpose_A, bool transpose_B,
-                                    bool full_C, bool low_D,
-                                    uint8_t weightA,
-                                    enum tiled_matmul_type_t tiled_matmul_type)
-{
-
-#define partition_rows (BANK_NUM * BANK_ROWS / 2)
-#define mats_in_partition (partition_rows / DIM)
-#define mats_in_acc (ACC_ROWS / DIM)
-#define max_tile_i_j ((size_t)sqrt(mats_in_acc))
-#define max_tile_k (mats_in_partition / max_tile_i_j)
-
-  // "db_" means "double-buffered"
-#define db_partition_rows ((BANK_NUM * BANK_ROWS / 2) / 2)
-#define db_mats_in_partition (db_partition_rows / DIM)
-#define db_mats_in_acc ((ACC_ROWS / 2) / DIM)
-#define db_max_tile_i_j ((size_t)sqrt(db_mats_in_acc))
-#define db_max_tile_k (db_mats_in_partition / db_max_tile_i_j)
-
-  if (gemmini_num == 0)
-  {
-    printf("We need at least one gemmini!\n");
-    exit(1);
-  }
-  else if (gemmini_num > 4)
-  {
-    printf("We can have maximum four gemminis!\n");
-    exit(1);
-  }
-
-  const size_t divided_dim_I = dim_I / gemmini_num + 1;
-
-  const size_t dim_I_padded = (divided_dim_I / DIM + (divided_dim_I % DIM != 0)) * DIM;
-  const size_t dim_J_padded = (dim_J / DIM + (dim_J % DIM != 0)) * DIM;
-  const size_t dim_K_padded = (dim_K / DIM + (dim_K % DIM != 0)) * DIM;
-
-  const bool double_buffered = tiled_matmul_type == WS;
-
-  const size_t max_spad_rows = double_buffered ? BANK_NUM * BANK_ROWS / 2 : BANK_NUM * BANK_ROWS;
-  const size_t max_acc_rows = double_buffered ? ACC_ROWS / 2 : ACC_ROWS;
-
-  size_t tile_I, tile_J, tile_K;
-
-  if (act == LAYERNORM || act == SOFTMAX)
-  {
-    tile_I = 1;
-    tile_J = dim_J_padded / DIM;
-    tile_K = 1;
-  }
-  else if (double_buffered)
-  {
-    tile_I = dim_I_padded / DIM < db_max_tile_i_j ? dim_I_padded / DIM : db_max_tile_i_j;
-    tile_J = dim_J_padded / DIM < db_max_tile_i_j ? dim_J_padded / DIM : db_max_tile_i_j;
-    tile_K = dim_K_padded / DIM < db_max_tile_k ? dim_K_padded / DIM : db_max_tile_k;
-  }
-  else
-  {
-    tile_I = dim_I_padded / DIM < max_tile_i_j ? dim_I_padded / DIM : max_tile_i_j;
-    tile_J = dim_J_padded / DIM < max_tile_i_j ? dim_J_padded / DIM : max_tile_i_j;
-    tile_K = dim_K_padded / DIM < max_tile_k ? dim_K_padded / DIM : max_tile_k;
-  }
-
-  // Fill scratchpad as much as possible
-  while (true)
-  {
-    bool increased = false;
-
-    if (tiled_matmul_total_spad_rows(tile_I, tile_J + 1, tile_K) <= max_spad_rows &&
-        tiled_matmul_total_acc_rows(tile_I, tile_J + 1) <= max_acc_rows &&
-        (tile_J + 1) * DIM <= dim_J_padded)
-    {
-      tile_J++;
-      increased = true;
-    }
-
-    if (tiled_matmul_total_spad_rows(tile_I + 1, tile_J, tile_K) <= max_spad_rows &&
-        tiled_matmul_total_acc_rows(tile_I + 1, tile_J) <= max_acc_rows &&
-        (tile_I + 1) * DIM <= dim_I_padded)
-    {
-      tile_I++;
-      increased = true;
-    }
-
-    if (tiled_matmul_total_spad_rows(tile_I, tile_J, tile_K + 1) <= max_spad_rows &&
-        (tile_K + 1) * DIM <= dim_K_padded)
-    {
-      tile_K++;
-      increased = true;
-    }
-
-    if (!increased)
-      break;
-  }
-
-#ifdef PRINT_TILE
-#if PRINT_TILE
-  const int spad_rows = tiled_matmul_total_spad_rows(tile_I, tile_J, tile_K);
-  const int acc_rows = tiled_matmul_total_acc_rows(tile_I, tile_J);
-
-  printf("tile_I: %d\n", tile_I);
-  printf("tile_J: %d\n", tile_J);
-  printf("tile_K: %d\n\n", tile_K);
-
-  printf("spad_rows: %d\n", spad_rows);
-  printf("acc_rows: %d\n\n", acc_rows);
-
-  printf("spad_row utilization: %d%%\n", (spad_rows * 100) / max_spad_rows);
-  printf("acc_row utilization: %d%%\n\n", (acc_rows * 100) / max_acc_rows);
-
-  exit(EXIT_SUCCESS);
-#endif
-#endif
-
-  multi_tiled_matmul0(gemmini_num,
-                     dim_I, dim_J, dim_K,
-                     A, B, D, C,
-                     stride_A, stride_B, stride_D, stride_C,
-                     A_scale_factor, B_scale_factor, D_scale_factor,
-                     act, scale, bert_scale, repeating_bias,
-                     tile_I, tile_J, tile_K,
-                     transpose_A, transpose_B,
-                     full_C, low_D,
-                     weightA,
-                     tiled_matmul_type);
-
-#undef partition_rows
-#undef mats_in_partition
-#undef mats_in_acc
-#undef max_tile_i_j
-#undef max_tile_k
-}
-
 
 static void sp_tiled_conv(
         int custom_num, 

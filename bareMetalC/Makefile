@@ -58,11 +58,8 @@ tests = \
 	template_all2 \
 	template_32x32 \
 	template_32x32_2 \
-	template_all2_multi0 \
 	template_all2_multi1 \
-	template_all2_multi1_col \
 	template_all2_2_multi1 \
-	template_shared_all \
 
 tests_baremetal = $(tests:=-baremetal)
 
