@@ -60,6 +60,7 @@ tests = \
 	template_32x32_2 \
 	template_all2_multi1 \
 	template_all2_2_multi1 \
+	template_two \
 
 tests_baremetal = $(tests:=-baremetal)
 

@@ -11,9 +11,9 @@
 #include "include/gemmini_testutils_all.h"
 //#include "include/gemmini_nn.h"
 
-#define MAT_DIM_I 24
-#define MAT_DIM_J 24
-#define MAT_DIM_K 24
+#define MAT_DIM_I 128
+#define MAT_DIM_J 128
+#define MAT_DIM_K 128
 
 #define profile_data_num 8192
 

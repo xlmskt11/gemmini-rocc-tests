@@ -23,6 +23,7 @@
 #include "include/gemmini_counter.h"
 
 // made
+#define total_gemmini_num 4
 #define custom0 0
 #define custom1 1
 #define custom2 2
@@ -46,7 +47,8 @@
 
 // made
 #define SET_PROFILER_PADDR 23
-#define k_LOOP_WS_CONFIG_MV_BOUNDS_1 24
+#define k_LOOP_WS_CONFIG_MV_BOUNDS 24
+#define LOOP_WS_CONFIG_SPADDR 25
 
 #define k_MVIN3 14
 
@@ -74,6 +76,8 @@
 #define LAYERNORM 2
 #define IGELU 3
 #define SOFTMAX 4
+
+int group_id = 0;
 
 #ifdef ELEM_T_IS_FLOAT
 elem_t elem_t_bits_to_elem_t(elem_t_bits x) {
@@ -356,7 +360,7 @@ static void counter_reset(int custom_num) {
 // weight-stationary matmul loop
 #define gemmini_loop_ws(custom_num, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
   { \
-    ROCC_INSTRUCTION_RS1_RS2(custom_num, (0 << 21) | ((uint64_t)(0) << 16) | (uint64_t)(0), ((uint64_t)(K) << 32) | ((uint64_t)(pad_K) << 16) | (uint64_t)(0), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, (0 << 21) | ((uint64_t)(0) << 16) | (uint64_t)(0), ((uint64_t)(K) << 32) | ((uint64_t)(pad_K) << 16) | (uint64_t)(0), k_LOOP_WS_CONFIG_MV_BOUNDS) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
@@ -366,9 +370,10 @@ static void counter_reset(int custom_num) {
   }
 
 // made
-#define shared_gemmini_loop_ws(custom_num, group_list, group_id, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
+#define shared_gemmini_loop_ws(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
   { \
-      ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 21) | ((uint64_t)(group_id) << 16) | (uint64_t)(laddrI_offset), ((uint64_t)(mv_K) << 32) | ((uint64_t)(mv_pad_K) << 16) | (uint64_t)(laddrK_offset), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
+      ROCC_INSTRUCTION_RS1_RS2(custom_num, acc_addr_start, ((uint64_t)(sp_addr_start) << 32) | (uint64_t)(sp_addr_end), LOOP_WS_CONFIG_SPADDR) \
+      ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 21) | ((uint64_t)(group_id) << 16) | (uint64_t)(laddrI_offset), ((uint64_t)(mv_K) << 32) | ((uint64_t)(mv_pad_K) << 16) | (uint64_t)(laddrK_offset), k_LOOP_WS_CONFIG_MV_BOUNDS) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
@@ -928,7 +933,9 @@ static void multi_sp_tiled_matmul_os(int custom_num, const size_t added_gemmini_
 }
 
 // made
-static void shared_multi_sp_tiled_matmul_os(int custom_num, int group_list, int group_id, const elem_t *A, const elem_t *B, const void *D, void *C,
+static void shared_multi_sp_tiled_matmul_os(int custom_num, int group_list, int group_id,
+                                            size_t sp_addr_start, size_t sp_addr_end, size_t acc_addr_start,
+                                            const elem_t *A, const elem_t *B, const void *D, void *C,
                                             scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
                                             size_t mv_K, size_t mv_pad_K, size_t laddrI_offset, size_t laddrK_offset,
                                             size_t I, size_t J, size_t K, size_t pad_I, size_t pad_J, size_t pad_K,
@@ -1794,7 +1801,9 @@ static void multi_sp_tiled_matmul_ws(int gemmini_num, const size_t added_gemmini
 }
 
 // made
-static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int group_id, const elem_t *A, const elem_t *B, const void *D, void *C,
+static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int group_id,
+                                            size_t sp_addr_start, size_t sp_addr_end, size_t acc_addr_start,
+                                            const elem_t *A, const elem_t *B, const void *D, void *C,
                                             scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
                                             size_t mv_K, size_t mv_pad_K, size_t laddrI_offset, size_t laddrK_offset,
                                             size_t I, size_t J, size_t K, size_t pad_I, size_t pad_J, size_t pad_K,
@@ -1979,7 +1988,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
   switch (custom_num)
   {
   case 0:
-    shared_gemmini_loop_ws(custom0, group_list, group_id, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom0, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -1987,7 +1996,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
                            act);
     break;
   case 1:
-    shared_gemmini_loop_ws(custom1, group_list, group_id, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom1, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -1995,7 +2004,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
                            act);
     break;
   case 2:
-    shared_gemmini_loop_ws(custom2, group_list, group_id, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom2, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -2003,7 +2012,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
                            act);
     break;
   case 3:
-    shared_gemmini_loop_ws(custom3, group_list, group_id, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom3, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -2403,20 +2412,22 @@ static void multi_tiled_matmul_outer1(int gemmini_num,
 }
 
 // made
-static void shared_multi_tiled_matmul_outer(int gemmini_num,
-                                      size_t dim_I, size_t dim_J, size_t dim_K,
-                                      const elem_t *A, const elem_t *B,
-                                      const void *D, void *C,
-                                      size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
-                                      scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
-                                      size_t tile_I, size_t tile_J, size_t tile_K,
-                                      int act, acc_scale_t scale, acc_scale_t bert_scale,
-                                      bool repeating_bias,
-                                      bool a_transpose, bool b_transpose,
-                                      bool full_C, bool low_D,
-                                      uint8_t weightA,
-                                      int dataflow)
+static void shared_multi_tiled_matmul_outer(size_t gemmini_list,
+                                            size_t sp_addr_start, size_t sp_addr_range, size_t acc_addr_start, size_t acc_addr_range,
+                                            size_t dim_I, size_t dim_J, size_t dim_K,
+                                            const elem_t *A, const elem_t *B,
+                                            const void *D, void *C,
+                                            size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
+                                            scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+                                            size_t tile_I, size_t tile_J, size_t tile_K,
+                                            int act, acc_scale_t scale, acc_scale_t bert_scale,
+                                            bool repeating_bias,
+                                            bool a_transpose, bool b_transpose,
+                                            bool full_C, bool low_D,
+                                            uint8_t weightA,
+                                            int dataflow)
 {
+  int gemmini_num = 0;
 
   const size_t dim_I_padded = (dim_I / DIM + (dim_I % DIM != 0)) * DIM;
   const size_t dim_J_padded = (dim_J / DIM + (dim_J % DIM != 0)) * DIM;
@@ -2448,35 +2459,41 @@ static void shared_multi_tiled_matmul_outer(int gemmini_num,
   const size_t sizeof_D = low_D ? sizeof(elem_t) : sizeof(acc_t);
   const size_t sizeof_C = full_C ? sizeof(acc_t) : sizeof(elem_t);
 
-  // gemmini_fence();
-
-  switch (gemmini_num)
-  {
-  case 4:
-    gemmini_extended_config_ex(custom3, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom3, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom3, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom3, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom3, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-  case 3:
-    gemmini_extended_config_ex(custom2, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom2, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom2, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom2, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom2, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-  case 2:
-    gemmini_extended_config_ex(custom1, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom1, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom1, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom1, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom1, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-  case 1:
-    gemmini_extended_config_ex(custom0, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
-    gemmini_extended_config_st(custom0, stride_C * sizeof_C, act & 3, scale);
-    gemmini_extended3_config_ld(custom0, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
-    gemmini_extended3_config_ld(custom0, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
-    gemmini_extended3_config_ld(custom0, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
-    break;
+  for (int i = 0; i < total_gemmini_num; i++) {
+    if ((gemmini_list >> i) & 1) {
+      gemmini_num++;
+      switch (i)
+      {
+      case 3:
+        gemmini_extended_config_ex(custom3, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
+        gemmini_extended_config_st(custom3, stride_C * sizeof_C, act & 3, scale);
+        gemmini_extended3_config_ld(custom3, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
+        gemmini_extended3_config_ld(custom3, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
+        gemmini_extended3_config_ld(custom3, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
+        break;
+      case 2:
+        gemmini_extended_config_ex(custom2, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
+        gemmini_extended_config_st(custom2, stride_C * sizeof_C, act & 3, scale);
+        gemmini_extended3_config_ld(custom2, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
+        gemmini_extended3_config_ld(custom2, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
+        gemmini_extended3_config_ld(custom2, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
+        break;
+      case 1:
+        gemmini_extended_config_ex(custom1, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
+        gemmini_extended_config_st(custom1, stride_C * sizeof_C, act & 3, scale);
+        gemmini_extended3_config_ld(custom1, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
+        gemmini_extended3_config_ld(custom1, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
+        gemmini_extended3_config_ld(custom1, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
+        break;
+      case 0:
+        gemmini_extended_config_ex(custom0, dataflow, act & 3, 0, 1, a_transpose, b_transpose);
+        gemmini_extended_config_st(custom0, stride_C * sizeof_C, act & 3, scale);
+        gemmini_extended3_config_ld(custom0, stride_A * sizeof(elem_t), A_scale_factor, false, 0);
+        gemmini_extended3_config_ld(custom0, stride_B * sizeof(elem_t), B_scale_factor, false, 1);
+        gemmini_extended3_config_ld(custom0, repeating_bias ? 0 : (stride_D * sizeof_D), D_scale_factor, low_D, 2);
+        break;
+      }
+    }
   }
 
   if (act == IGELU)
@@ -2487,17 +2504,26 @@ static void shared_multi_tiled_matmul_outer(int gemmini_num,
 
     const acc_t qb = -1.769 / (S / sqrt_2);
     const acc_t qc = 1.0 / S_erf;
-    switch (gemmini_num)
+    for (int i = 0; i < total_gemmini_num; i++)
     {
-    case 4:
-      gemmini_config_norm(custom3, 0, 0, 0, 0, 0, qb, qc);
-    case 3:
-      gemmini_config_norm(custom2, 0, 0, 0, 0, 0, qb, qc);
-    case 2:
-      gemmini_config_norm(custom1, 0, 0, 0, 0, 0, qb, qc);
-    case 1:
-      gemmini_config_norm(custom0, 0, 0, 0, 0, 0, qb, qc);
-      break;
+      if ((gemmini_list >> i) & 1)
+      {
+        switch (i)
+        {
+        case 3:
+          gemmini_config_norm(custom3, 0, 0, 0, 0, 0, qb, qc);
+          break;
+        case 2:
+          gemmini_config_norm(custom2, 0, 0, 0, 0, 0, qb, qc);
+          break;
+        case 1:
+          gemmini_config_norm(custom1, 0, 0, 0, 0, 0, qb, qc);
+          break;
+        case 0:
+          gemmini_config_norm(custom0, 0, 0, 0, 0, 0, qb, qc);
+          break;
+        }
+      }
     }
   }
 
@@ -2512,25 +2538,36 @@ static void shared_multi_tiled_matmul_outer(int gemmini_num,
     const acc_t qb = b / bert_scale;
     const acc_t qc = c / (a * bert_scale * bert_scale);
 
-    switch (gemmini_num)
+    for (int i = 0; i < total_gemmini_num; i++)
     {
-    case 4:
-      gemmini_config_norm(custom3, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom3, qln2_inv, 1, 0, 1, 0, qb, qc);
-    case 3:
-      gemmini_config_norm(custom2, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom2, qln2_inv, 1, 0, 1, 0, qb, qc);
-    case 2:
-      gemmini_config_norm(custom1, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom1, qln2_inv, 1, 0, 1, 0, qb, qc);
-    case 1:
-      gemmini_config_norm(custom0, qln2, 0, 0, 1, 0, qb, qc);
-      gemmini_config_norm(custom0, qln2_inv, 1, 0, 1, 0, qb, qc);
-      break;
+      if ((gemmini_list >> i) & 1)
+      {
+        switch (i)
+        {
+        case 3:
+          gemmini_config_norm(custom3, qln2, 0, 0, 1, 0, qb, qc);
+          gemmini_config_norm(custom3, qln2_inv, 1, 0, 1, 0, qb, qc);
+          break;
+        case 2:
+          gemmini_config_norm(custom2, qln2, 0, 0, 1, 0, qb, qc);
+          gemmini_config_norm(custom2, qln2_inv, 1, 0, 1, 0, qb, qc);
+          break;
+        case 1:
+          gemmini_config_norm(custom1, qln2, 0, 0, 1, 0, qb, qc);
+          gemmini_config_norm(custom1, qln2_inv, 1, 0, 1, 0, qb, qc);
+          break;
+        case 0:
+          gemmini_config_norm(custom0, qln2, 0, 0, 1, 0, qb, qc);
+          gemmini_config_norm(custom0, qln2_inv, 1, 0, 1, 0, qb, qc);
+          break;
+        }
+      }
     }
   }
 
-  void (*inner)(int, int, int, const elem_t *, const elem_t *, const void *, void *,
+  void (*inner)(int, int, int,
+                size_t, size_t, size_t,
+                const elem_t *, const elem_t *, const void *, void *,
                 scale_t, scale_t, scale_acc_t,
                 size_t, size_t, size_t, size_t,
                 size_t, size_t, size_t, size_t, size_t, size_t,
@@ -2549,9 +2586,10 @@ static void shared_multi_tiled_matmul_outer(int gemmini_num,
     inner = &shared_multi_sp_tiled_matmul_ws;
   }
 
-  int group_id = 0;
-  // printf("tile_I = %d, tile_J = %d, tile_K = %d\n", tile_I, tile_J, tile_K);
-  // printf("I0 = %d, J0 = %d, K0 = %d\n", I0, J0, K0);
+  // int group_id = 0;
+  int inner_call_counter = 0;
+  int lastK_toggle = 0;
+  
   for (size_t i0 = 0; i0 < I0; i0++)
     for (size_t j0 = 0; j0 < J0; j0++)
       for (size_t k0 = 0; k0 < K0; k0++)
@@ -2591,7 +2629,23 @@ static void shared_multi_tiled_matmul_outer(int gemmini_num,
         {
           using_gemmini_num = (I < K) ? I : K;
         }
-        
+
+        size_t group_list = gemmini_list;
+        int shift_num = 0;
+        for (int i = 0; i < total_gemmini_num; i++)
+        {
+          size_t shifted_list = (gemmini_list >> i);
+          if (shift_num == using_gemmini_num)
+          {
+            group_list = group_list & ~(shifted_list << i);
+            break;
+          }
+          if (shifted_list & 1)
+          {
+            shift_num++;
+          }
+        }
+
         // for ldA, ldD, stC, ex
         const size_t I_div = I / using_gemmini_num;
         const size_t I_div_added = I_div + 1;
@@ -2612,78 +2666,76 @@ static void shared_multi_tiled_matmul_outer(int gemmini_num,
         size_t laddrI_offset = 0;
         size_t laddrK_offset = 0;
 
-        for (size_t gem_num = 0; gem_num < using_gemmini_num; ++gem_num)
+        const int t = (inner_call_counter & 1);
+        const size_t sp_addr_start = (t == 0) ? sp_addr_start : sp_addr_start + sp_addr_range / 2;
+        const size_t sp_addr_end = (t == 0) ? sp_addr_start + sp_addr_range / 2 : sp_addr_start + sp_addr_range;
+        const size_t acc_addr_start = lastK_toggle ? acc_addr_start : acc_addr_start + acc_addr_range / 2;
+
+        int activated_gemmini_num = 0;
+        for (int i = 0; i < total_gemmini_num; i++)
         {
-          size_t this_I = (gem_num < I_added_gemmini_num) ? I_div_added : I_div;
-          size_t this_pad_I = (gem_num == using_gemmini_num - 1) ? pad_I : 0;
+          if ((group_list >> i) & 1)
+          {
+            size_t this_I = (activated_gemmini_num < I_added_gemmini_num) ? I_div_added : I_div;
+            size_t this_pad_I = (activated_gemmini_num == using_gemmini_num - 1) ? pad_I : 0;
 
-          size_t this_K = (gem_num < K_added_gemmini_num) ? K_div_added : K_div;
-          size_t this_pad_K = (gem_num == using_gemmini_num - 1) ? pad_K : 0;
+            size_t this_K = (activated_gemmini_num < K_added_gemmini_num) ? K_div_added : K_div;
+            size_t this_pad_K = (activated_gemmini_num == using_gemmini_num - 1) ? pad_K : 0;
 
-          int group_list = (1 << using_gemmini_num) - 1;
+            (*inner)(i, group_list, group_id,
+                     sp_addr_start, sp_addr_end, acc_addr_start,
+                     a_local, b_local, (k0 != 0) ? NULL : (void *)d_local, (k0 == K0 - 1) ? (void *)c_local : NULL,
+                     A_scale_factor, B_scale_factor, D_scale_factor,
+                     this_K, this_pad_K, laddrI_offset, laddrK_offset, // mv_K, mv_pad_K, laddrI_offset, laddrK_offset
+                     this_I, J, K,
+                     this_pad_I, pad_J, pad_K,
+                     stride_A, stride_B, stride_D, stride_C,
+                     a_transpose, b_transpose,
+                     full_C, low_D,
+                     no_bias, repeating_bias,
+                     act);
 
-          (*inner)(gem_num, group_list, group_id, a_local, b_local, (k0 != 0) ? NULL : (void *)d_local, (k0 == K0 - 1) ? (void *)c_local : NULL,
-                   A_scale_factor, B_scale_factor, D_scale_factor,
-                   this_K, this_pad_K, laddrI_offset, laddrK_offset, // mv_K, mv_pad_K, laddrI_offset, laddrK_offset
-                   this_I, J, K,
-                   this_pad_I, pad_J, pad_K,
-                   stride_A, stride_B, stride_D, stride_C,
-                   a_transpose, b_transpose,
-                   full_C, low_D,
-                   no_bias, repeating_bias,
-                   act);
+            laddrI_offset += this_I;
+            laddrK_offset += this_K;
 
-          laddrI_offset += this_I;
-          laddrK_offset += this_K;
-
-          a_local += stride_A * DIM * this_I;
-          b_local += stride_B * DIM * this_K;
-          c_local += stride_C * DIM * this_I;
-          d_local += stride_D * DIM * this_I;
+            a_local += stride_A * DIM * this_I;
+            b_local += stride_B * DIM * this_K;
+            c_local += stride_C * DIM * this_I;
+            d_local += stride_D * DIM * this_I;
+            
+            activated_gemmini_num++;
+          }
         }
 
-        switch (using_gemmini_num)
-        {
-        case 4:
-          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          ROCC_INSTRUCTION_RS1_RS2(custom3, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          break;
-        case 3:
-          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          break;
-        case 2:
-          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          break;
-        case 1:
-          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          break;
+          for (int i = 0; i < total_gemmini_num; i++)
+          {
+            if ((group_list >> i) & 1)
+            {
+              switch (i)
+              {
+              case 3:
+                ROCC_INSTRUCTION_RS1_RS2(custom3, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+                break;
+              case 2:
+                ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+                break;
+              case 1:
+                ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+                break;
+              case 0:
+                ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+                break;
+              }
+            }
+          }
+
+          inner_call_counter++;
+          if (k0 == K0 - 1)
+            lastK_toggle ^= 1;
         }
-      }
 
   // gemmini_fence();
 }
-
-static acc_t int_sqrt(acc_t n) {
-  if (n == 0) return 0;
-
-  int bits = 0;
-  for (acc_t x = n; x > 0; x /= 2)
-    bits++;
-
-  acc_t x_prev = 1 << ((bits + 1) / 2);
-
-  while (1) {
-    acc_t x_next = (x_prev + n / x_prev) / 2;
-    if (x_next >= x_prev) return x_prev;
-    x_prev = x_next;
-  };
-}
-
 
 static elem_t scale_and_sat(acc_t x, int act, acc_scale_t scale, acc_scale_t bert_scale) {
   // Apply I-GELU if needed
@@ -3191,19 +3243,20 @@ static void multi_tiled_matmul1(int gemmini_num,
 }
 
 // made
-static void shared_multi_tiled_matmul(int gemmini_num,
-                                size_t dim_I, size_t dim_J, size_t dim_K,
-                                const elem_t *A, const elem_t *B,
-                                const void *D, void *C,
-                                size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
-                                scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
-                                int act, acc_scale_t scale, acc_scale_t bert_scale,
-                                bool repeating_bias,
-                                size_t tile_I, size_t tile_J, size_t tile_K,
-                                bool transpose_A, bool transpose_B,
-                                bool full_C, bool low_D,
-                                uint8_t weightA,
-                                enum tiled_matmul_type_t tiled_matmul_type)
+static void shared_multi_tiled_matmul(size_t gemmini_list,
+                                      size_t sp_addr_start, size_t sp_addr_range, size_t acc_addr_start, size_t acc_addr_range,
+                                      size_t dim_I, size_t dim_J, size_t dim_K,
+                                      const elem_t *A, const elem_t *B,
+                                      const void *D, void *C,
+                                      size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
+                                      scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+                                      int act, acc_scale_t scale, acc_scale_t bert_scale,
+                                      bool repeating_bias,
+                                      size_t tile_I, size_t tile_J, size_t tile_K,
+                                      bool transpose_A, bool transpose_B,
+                                      bool full_C, bool low_D,
+                                      uint8_t weightA,
+                                      enum tiled_matmul_type_t tiled_matmul_type)
 {
 
 #ifdef GEMMINI_ASSERTIONS
@@ -3246,8 +3299,8 @@ static void shared_multi_tiled_matmul(int gemmini_num,
 
   const bool double_buffered = tiled_matmul_type == WS;
 
-  const size_t total_spad_size = double_buffered ? BANK_NUM * BANK_ROWS / 2 : BANK_NUM * BANK_ROWS;
-  const size_t total_acc_size = double_buffered ? ACC_ROWS / 2 : ACC_ROWS;
+  const size_t total_spad_size = double_buffered ? sp_addr_range / 2 : sp_addr_range;
+  const size_t total_acc_size = double_buffered ? acc_addr_range / 2 : acc_addr_range;
 
   const size_t total_spad_rows =
       (tile_I * tile_K * DIM) + // Rows to store A
@@ -3307,17 +3360,18 @@ static void shared_multi_tiled_matmul(int gemmini_num,
   // Run a tiled matrix multiplication on either Gemmini or the CPU
   if (tiled_matmul_type == OS || tiled_matmul_type == WS)
   {
-    shared_multi_tiled_matmul_outer(gemmini_num,
-                              dim_I, dim_J, dim_K,
-                              A, B, D, C,
-                              stride_A, stride_B, stride_D, stride_C,
-                              A_scale_factor, B_scale_factor, D_scale_factor,
-                              tile_I, tile_J, tile_K,
-                              act, scale, bert_scale, repeating_bias,
-                              transpose_A, transpose_B,
-                              full_C, low_D,
-                              weightA,
-                              (int)tiled_matmul_type);
+    shared_multi_tiled_matmul_outer(gemmini_list,
+                                    sp_addr_start, sp_addr_range, acc_addr_start, acc_addr_range,
+                                    dim_I, dim_J, dim_K,
+                                    A, B, D, C,
+                                    stride_A, stride_B, stride_D, stride_C,
+                                    A_scale_factor, B_scale_factor, D_scale_factor,
+                                    tile_I, tile_J, tile_K,
+                                    act, scale, bert_scale, repeating_bias,
+                                    transpose_A, transpose_B,
+                                    full_C, low_D,
+                                    weightA,
+                                    (int)tiled_matmul_type);
   }
   else /*if (tiled_matmul_type == CPU)*/
   {
@@ -3596,43 +3650,33 @@ static void multi_tiled_matmul_auto1(int gemmini_num,
 }
 
 // made
-static void shared_multi_tiled_matmul_auto(int gemmini_num,
-                                     size_t dim_I, size_t dim_J, size_t dim_K,
-                                     const elem_t *A, const elem_t *B,
-                                     const void *D, void *C,
-                                     size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
-                                     scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
-                                     int act, acc_scale_t scale, acc_scale_t bert_scale,
-                                     bool repeating_bias,
-                                     bool transpose_A, bool transpose_B,
-                                     bool full_C, bool low_D,
-                                     uint8_t weightA,
-                                     enum tiled_matmul_type_t tiled_matmul_type)
+static void shared_multi_tiled_matmul_auto(size_t gemmini_list,
+                                           size_t sp_addr_start, size_t sp_addr_range, size_t acc_addr_start, size_t acc_addr_range,
+                                           size_t dim_I, size_t dim_J, size_t dim_K,
+                                           const elem_t *A, const elem_t *B,
+                                           const void *D, void *C,
+                                           size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
+                                           scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+                                           int act, acc_scale_t scale, acc_scale_t bert_scale,
+                                           bool repeating_bias,
+                                           bool transpose_A, bool transpose_B,
+                                           bool full_C, bool low_D,
+                                           uint8_t weightA,
+                                           enum tiled_matmul_type_t tiled_matmul_type)
 {
 
-#define partition_rows (BANK_NUM * BANK_ROWS / 2)
-#define mats_in_partition (partition_rows / DIM)
-#define mats_in_acc (ACC_ROWS / DIM)
-#define max_tile_i_j ((size_t)sqrt(mats_in_acc))
-#define max_tile_k (mats_in_partition / max_tile_i_j)
+  size_t partition_rows = (sp_addr_range / 2);
+  size_t mats_in_partition = (partition_rows / DIM);
+  size_t mats_in_acc = (acc_addr_range / DIM);
+  size_t max_tile_i_j = ((size_t)sqrt(mats_in_acc));
+  size_t max_tile_k = (mats_in_partition / max_tile_i_j);
 
   // "db_" means "double-buffered"
-#define db_partition_rows ((BANK_NUM * BANK_ROWS / 2) / 2)
-#define db_mats_in_partition (db_partition_rows / DIM)
-#define db_mats_in_acc ((ACC_ROWS / 2) / DIM)
-#define db_max_tile_i_j ((size_t)sqrt(db_mats_in_acc))
-#define db_max_tile_k (db_mats_in_partition / db_max_tile_i_j)
-
-  if (gemmini_num == 0)
-  {
-    printf("We need at least one gemmini!\n");
-    exit(1);
-  }
-  else if (gemmini_num > 4)
-  {
-    printf("We can have maximum four gemminis!\n");
-    exit(1);
-  }
+  size_t db_partition_rows_1 = ((sp_addr_range / 2) / 2);
+  size_t db_mats_in_partition_1 = (db_partition_rows_1 / DIM);
+  size_t db_mats_in_acc_1 = ((acc_addr_range / 2) / DIM);
+  size_t db_max_tile_i_j_1 = ((size_t)sqrt(db_mats_in_acc_1));
+  size_t db_max_tile_k_1 = (db_mats_in_partition_1 / db_max_tile_i_j_1);
 
   const size_t dim_I_padded = (dim_I / DIM + (dim_I % DIM != 0)) * DIM;
   const size_t dim_J_padded = (dim_J / DIM + (dim_J % DIM != 0)) * DIM;
@@ -3640,8 +3684,8 @@ static void shared_multi_tiled_matmul_auto(int gemmini_num,
 
   const bool double_buffered = tiled_matmul_type == WS;
 
-  const size_t max_spad_rows = double_buffered ? BANK_NUM * BANK_ROWS / 2 : BANK_NUM * BANK_ROWS;
-  const size_t max_acc_rows = double_buffered ? ACC_ROWS / 2 : ACC_ROWS;
+  const size_t max_spad_rows = double_buffered ? sp_addr_range / 2 : sp_addr_range;
+  const size_t max_acc_rows = double_buffered ? acc_addr_range / 2 : acc_addr_range;
 
   size_t tile_I, tile_J, tile_K;
 
@@ -3653,9 +3697,9 @@ static void shared_multi_tiled_matmul_auto(int gemmini_num,
   }
   else if (double_buffered)
   {
-    tile_I = dim_I_padded / DIM < db_max_tile_i_j ? dim_I_padded / DIM : db_max_tile_i_j;
-    tile_J = dim_J_padded / DIM < db_max_tile_i_j ? dim_J_padded / DIM : db_max_tile_i_j;
-    tile_K = dim_K_padded / DIM < db_max_tile_k ? dim_K_padded / DIM : db_max_tile_k;
+    tile_I = dim_I_padded / DIM < db_max_tile_i_j_1 ? dim_I_padded / DIM : db_max_tile_i_j_1;
+    tile_J = dim_J_padded / DIM < db_max_tile_i_j_1 ? dim_J_padded / DIM : db_max_tile_i_j_1;
+    tile_K = dim_K_padded / DIM < db_max_tile_k_1 ? dim_K_padded / DIM : db_max_tile_k_1;
   }
   else
   {
@@ -3715,17 +3759,18 @@ static void shared_multi_tiled_matmul_auto(int gemmini_num,
 #endif
 #endif
 
-  shared_multi_tiled_matmul(gemmini_num,
-                      dim_I, dim_J, dim_K,
-                      A, B, D, C,
-                      stride_A, stride_B, stride_D, stride_C,
-                      A_scale_factor, B_scale_factor, D_scale_factor,
-                      act, scale, bert_scale, repeating_bias,
-                      tile_I, tile_J, tile_K,
-                      transpose_A, transpose_B,
-                      full_C, low_D,
-                      weightA,
-                      tiled_matmul_type);
+  shared_multi_tiled_matmul(gemmini_list,
+                            sp_addr_start, sp_addr_range, acc_addr_start, acc_addr_range,
+                            dim_I, dim_J, dim_K,
+                            A, B, D, C,
+                            stride_A, stride_B, stride_D, stride_C,
+                            A_scale_factor, B_scale_factor, D_scale_factor,
+                            act, scale, bert_scale, repeating_bias,
+                            tile_I, tile_J, tile_K,
+                            transpose_A, transpose_B,
+                            full_C, low_D,
+                            weightA,
+                            tiled_matmul_type);
 
 #undef partition_rows
 #undef mats_in_partition
