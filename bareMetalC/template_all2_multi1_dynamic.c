@@ -11,10 +11,13 @@
 #include "include/gemmini_testutils_all.h"
 // #include "include/gemmini_nn.h"
 
-#define gemmini_num 4
-#define MAT_DIM_I 128
-#define MAT_DIM_J 128
-#define MAT_DIM_K 128
+#define gemmini_num 1
+#define MAT_DIM_I1 64
+#define MAT_DIM_J1 64
+#define MAT_DIM_K1 64
+#define MAT_DIM_I 144
+#define MAT_DIM_J 144
+#define MAT_DIM_K 144
 
 #define profile_data_num 30
 
@@ -101,6 +104,9 @@ int main() {
     printf("MAT_DIM_I: %d\n", MAT_DIM_I);
     printf("MAT_DIM_J: %d\n", MAT_DIM_J);
     printf("MAT_DIM_K: %d\n", MAT_DIM_K);
+    printf("MAT_DIM_I1: %d\n", MAT_DIM_I1);
+    printf("MAT_DIM_J1: %d\n", MAT_DIM_J1);
+    printf("MAT_DIM_K1: %d\n", MAT_DIM_K1);
 
     printf("Flush All Gemmini TLB of stale virtual addresses\n");
     gemmini_flush(custom0, 0);
@@ -113,10 +119,16 @@ int main() {
     static elem_t full_B[MAT_DIM_K][MAT_DIM_J] row_align(1);
     static elem_t full_C[MAT_DIM_I][MAT_DIM_J] row_align(1);
     static ACC_T full_D[MAT_DIM_I][MAT_DIM_J] row_align_acc(1);
+    static elem_t full_A1[MAT_DIM_I1][MAT_DIM_K1] row_align(1);
+    static elem_t full_B1[MAT_DIM_K1][MAT_DIM_J1] row_align(1);
+    static elem_t full_C1[MAT_DIM_I1][MAT_DIM_J1] row_align(1);
+    static ACC_T full_D1[MAT_DIM_I1][MAT_DIM_J1] row_align_acc(1);
 
 #if !FAST && CHECK
     static full_t gold_full[MAT_DIM_I][MAT_DIM_J];
     static elem_t gold[MAT_DIM_I][MAT_DIM_J];
+    static full_t gold_full1[MAT_DIM_I1][MAT_DIM_J1];
+    static elem_t gold1[MAT_DIM_I1][MAT_DIM_J1];
 #endif
 
     printf("Init A\n");
@@ -135,6 +147,24 @@ int main() {
       }
     }
 
+    printf("Init A1\n");
+    for (size_t i = 0; i < MAT_DIM_I1; ++i)
+    {
+        for (size_t j = 0; j < MAT_DIM_K1; ++j)
+        {
+            full_A1[i][j] = RAND % 2;
+        }
+    }
+
+    printf("Init D1\n");
+    for (size_t i = 0; i < MAT_DIM_I1; ++i)
+    {
+        for (size_t j = 0; j < MAT_DIM_J1; ++j)
+        {
+            full_D1[i][j] = NO_BIAS ? 0 : RAND % 2;
+        }
+    }
+
 #if FAST
   // identity matrix
   printf("Init B\n");
@@ -143,6 +173,14 @@ int main() {
       full_B[i][j] = i == j;
     }
   }
+  printf("Init B1\n");
+  for (size_t i = 0; i < MAT_DIM_K1; ++i)
+  {
+      for (size_t j = 0; j < MAT_DIM_J1; ++j)
+      {
+          full_B1[i][j] = i == j;
+      }
+  }
 #else
   printf("Init B\n");
   for (size_t i = 0; i < MAT_DIM_K; ++i) {
@@ -150,26 +188,47 @@ int main() {
       full_B[i][j] = RAND % 2;
     }
   }
+  printf("Init B1\n");
+  for (size_t i = 0; i < MAT_DIM_K1; ++i)
+  {
+      for (size_t j = 0; j < MAT_DIM_J1; ++j)
+      {
+          full_B1[i][j] = RAND % 2;
+      }
+  }
 #if CHECK
   printf("Calculate Output\n");
   full_matmul(full_A, full_B, full_D, gold_full);
   full_matscale(gold_full, gold, ACC_SCALE_IDENTITY);
+  full_matmul(full_A1, full_B1, full_D1, gold_full1);
+  full_matscale(gold_full1, gold1, ACC_SCALE_IDENTITY);
 #endif
 #endif
-  int tile_id = 1;
+
   printf("Do Gemmini tiled matmul process\n");
   uint64_t matmul_start = read_cycles();
-  shared_multi_tiled_matmul_auto(15, tile_id,
-                                 0, 0,
-                                 MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
-                                 (elem_t *)full_A, (elem_t *)full_B, NO_BIAS ? NULL : &full_D[0][0], (elem_t *)full_C,
-                                 MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
-                                 MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
-                                 NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
-                                 false, false,
-                                 false, !FULL_BIAS_WIDTH,
-                                 1,
-                                 WS);
+//   shared_multi_tiled_matmul_auto(14, 1,
+//                                  0, BANK_NUM * BANK_ROWS * 3 / 4, 0, ACC_ROWS * 3 / 4,
+//                                  MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
+//                                  (elem_t *)full_A, (elem_t *)full_B, NO_BIAS ? NULL : &full_D[0][0], (elem_t *)full_C,
+//                                  MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
+//                                  MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
+//                                  NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
+//                                  false, false,
+//                                  false, !FULL_BIAS_WIDTH,
+//                                  1,
+//                                  WS);
+//   shared_multi_tiled_matmul_auto(1, 2,
+//                                  BANK_NUM * BANK_ROWS * 3 / 4, BANK_NUM * BANK_ROWS / 4, ACC_ROWS * 3 / 4, ACC_ROWS / 4,
+//                                  MAT_DIM_I1, MAT_DIM_J1, MAT_DIM_K1,
+//                                  (elem_t *)full_A1, (elem_t *)full_B1, NO_BIAS ? NULL : &full_D1[0][0], (elem_t *)full_C1,
+//                                  MAT_DIM_K1, MAT_DIM_J1, MAT_DIM_J1, MAT_DIM_J1,
+//                                  MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
+//                                  NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
+//                                  false, false,
+//                                  false, !FULL_BIAS_WIDTH,
+//                                  1,
+//                                  WS);
 #if FENCE
   gemmini_fence();
 #endif
@@ -191,6 +250,17 @@ int main() {
 
     exit(1);
   }
+  if (!is_equal_dynamic(full_C1, full_A1, MAT_DIM_I1, MAT_DIM_J1))
+  {
+      printf("Incorrect output matrix!\n");
+      printf("C1:\n");
+      printMatrix_dynamic(full_C1, MAT_DIM_I1, MAT_DIM_J1);
+      printf("A1:\n");
+      printMatrix_dynamic(full_A1, MAT_DIM_I1, MAT_DIM_J1);
+      printf("\n");
+
+      exit(1);
+  }
 #else
   if (!is_equal_dynamic(full_C, gold, MAT_DIM_I, MAT_DIM_J)) {
     printf("Incorrect output matrix!\n");
@@ -201,6 +271,17 @@ int main() {
     printf("\n");
 
     exit(1);
+  }
+  if (!is_equal_dynamic(full_C1, gold1, MAT_DIM_I1, MAT_DIM_J1))
+  {
+      printf("Incorrect output matrix!\n");
+      printf("C1:\n");
+      printMatrix_dynamic(full_C1, MAT_DIM_I1, MAT_DIM_J1);
+      printf("Gold1:\n");
+      printMatrix_dynamic(gold1, MAT_DIM_I1, MAT_DIM_J1);
+      printf("\n");
+
+      exit(1);
   }
 #endif
   printf("Output matrix came out as expected\n");
@@ -222,4 +303,3 @@ int main() {
 
   exit(0);
 }
-

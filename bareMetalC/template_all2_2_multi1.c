@@ -12,9 +12,9 @@
 //#include "include/gemmini_nn.h"
 
 #define gemmini_num 4
-#define MAT_DIM_I 32
-#define MAT_DIM_J 32
-#define MAT_DIM_K 32
+#define MAT_DIM_I 64
+#define MAT_DIM_J 64
+#define MAT_DIM_K 64
 
 #define NO_BIAS true
 #define FULL_BIAS_WIDTH true
@@ -163,15 +163,15 @@ int main() {
 
   printf("Do Gemmini tiled matmul process\n");
   uint64_t matmul_start = read_cycles();
-  multi_tiled_matmul_auto1(gemmini_num, MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
-                           (elem_t *)first_full_A, (elem_t *)first_full_B, NO_BIAS ? NULL : &first_full_D[0][0], (elem_t *)first_full_C,
-                           MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
-                           MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
-                           NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
-                           false, false,
-                           false, !FULL_BIAS_WIDTH,
-                           1,
-                           WS);
+  shared_multi_tiled_matmul_auto(2, MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
+                                 (elem_t *)first_full_A, (elem_t *)first_full_B, NO_BIAS ? NULL : &first_full_D[0][0], (elem_t *)first_full_C,
+                                 MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
+                                 MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
+                                 NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
+                                 false, false,
+                                 false, !FULL_BIAS_WIDTH,
+                                 1,
+                                 WS);
 #if FENCE == 1
   gemmini_fence();
 #endif
@@ -180,15 +180,15 @@ int main() {
 
   // printf("Do second Gemmini tiled matmul process\n");
   // uint64_t second_matmul_start = read_cycles();
-  multi_tiled_matmul_auto1(gemmini_num, MAT_DIM_I, MAT_DIM_K, MAT_DIM_J,
-                           (elem_t *)first_full_C, (elem_t *)second_full_B, NO_BIAS ? NULL : &second_full_D[0][0], (elem_t *)second_full_C,
-                           MAT_DIM_J, MAT_DIM_K, MAT_DIM_K, MAT_DIM_K,
-                           MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
-                           NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
-                           false, false,
-                           false, !FULL_BIAS_WIDTH,
-                           1,
-                           WS);
+  shared_multi_tiled_matmul_auto(4, MAT_DIM_I, MAT_DIM_K, MAT_DIM_J,
+                                 (elem_t *)first_full_C, (elem_t *)second_full_B, NO_BIAS ? NULL : &second_full_D[0][0], (elem_t *)second_full_C,
+                                 MAT_DIM_J, MAT_DIM_K, MAT_DIM_K, MAT_DIM_K,
+                                 MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
+                                 NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
+                                 false, false,
+                                 false, !FULL_BIAS_WIDTH,
+                                 1,
+                                 WS);
 #if FENCE == 1
   gemmini_fence();
 #endif
