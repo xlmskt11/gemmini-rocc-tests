@@ -59,7 +59,10 @@ tests = \
 	template_32x32 \
 	template_32x32_2 \
 	template_all2_multi1 \
-	# template_all2_2_multi1
+	template_all2_multi1_conv \
+	template_32x32_conv \
+	template_all2_multi1_dynamic \
+	template_all2_multi1_conv_dynamic \
 
 tests_baremetal = $(tests:=-baremetal)
 

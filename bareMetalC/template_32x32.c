@@ -11,18 +11,18 @@
 #include "include/gemmini_testutils_all.h"
 //#include "include/gemmini_nn.h"
 
-#define MAT_DIM_I 24
-#define MAT_DIM_J 24
-#define MAT_DIM_K 24
+#define MAT_DIM_I 64
+#define MAT_DIM_J 64
+#define MAT_DIM_K 64
 
 #define profile_data_num 8192
 
-#define NO_BIAS true
+#define NO_BIAS false
 #define FULL_BIAS_WIDTH true
-#define REPEATING_BIAS true
+#define REPEATING_BIAS false
 
 #define RAND rand()
-#define FAST true
+#define FAST false
 #define CHECK true
 #define FENCE true
 #define PROFILE false

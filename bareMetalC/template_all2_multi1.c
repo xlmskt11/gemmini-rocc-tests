@@ -11,19 +11,19 @@
 #include "include/gemmini_testutils_all.h"
 // #include "include/gemmini_nn.h"
 
-#define gemmini_num 4
-#define MAT_DIM_I 128
-#define MAT_DIM_J 128
-#define MAT_DIM_K 128
+#define gemmini_configuration 7
+#define MAT_DIM_I 78
+#define MAT_DIM_J 96
+#define MAT_DIM_K 88
 
 #define profile_data_num 30
 
-#define NO_BIAS true
+#define NO_BIAS false
 #define FULL_BIAS_WIDTH true
-#define REPEATING_BIAS true
+#define REPEATING_BIAS false
 
 #define RAND rand()
-#define FAST true
+#define FAST false
 #define CHECK true
 #define FENCE true
 #define PROFILE false
@@ -37,6 +37,29 @@ typedef acc_t ACC_T;
 #else
 typedef elem_t ACC_T;
 #endif
+
+void print_gemmini_use(unsigned mask)
+{
+  int idx[4], n = 0;
+
+  // bit0→gemmini0, bit1→gemmini1, bit2→gemmini2, bit3→gemmini3
+  for (int g = 0; g < 4; ++g)
+  {
+    if (mask & (1u << g))
+      idx[n++] = g;
+  }
+
+  printf("Use %d Gemmini", n);
+  if (n > 0)
+  {
+    printf(" ");
+    for (int i = 0; i < n; ++i)
+    {
+      printf("%d%s", idx[i], (i == n - 1) ? "" : ", ");
+    }
+  }
+  printf(" with DIM: %d\n", DIM);
+}
 
 void full_matmul(elem_t A[MAT_DIM_I][MAT_DIM_K], elem_t B[MAT_DIM_K][MAT_DIM_J], ACC_T D[MAT_DIM_I][MAT_DIM_J], full_t C_full[MAT_DIM_I][MAT_DIM_J]) {
   for (size_t r = 0; r < MAT_DIM_I; r++)
@@ -90,14 +113,14 @@ int main() {
 
 #if PROFILE
     printf("Set profiler address\n");
-    static uint64_t P[gemmini_num][profile_data_num] row_align(1);
+    static uint64_t P[total_gemmini_num][profile_data_num] row_align(1);
     gemmini_profiler(custom0, (uint64_t *)P[0]);
     gemmini_profiler(custom1, (uint64_t *)P[1]);
     gemmini_profiler(custom2, (uint64_t *)P[2]);
     gemmini_profiler(custom3, (uint64_t *)P[3]);
 #endif
 
-    printf("%d Gemmini with DIM: %d\n", gemmini_num, DIM);
+    print_gemmini_use(gemmini_configuration);
     printf("MAT_DIM_I: %d\n", MAT_DIM_I);
     printf("MAT_DIM_J: %d\n", MAT_DIM_J);
     printf("MAT_DIM_K: %d\n", MAT_DIM_K);
@@ -132,6 +155,7 @@ int main() {
     for (size_t i = 0; i < MAT_DIM_I; ++i) {
       for (size_t j = 0; j < MAT_DIM_J; ++j) {
         full_D[i][j] = NO_BIAS ? 0 : RAND % 2;
+        // full_D[i][j] = NO_BIAS ? 0 : 5;
       }
     }
 
@@ -159,8 +183,20 @@ int main() {
   int tile_id = 1;
   printf("Do Gemmini tiled matmul process\n");
   uint64_t matmul_start = read_cycles();
-  shared_multi_tiled_matmul_auto(15, tile_id,
+  // shared_multi_tiled_matmul_auto(gemmini_configuration, tile_id,
+  //                                0, 0,
+  //                                MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
+  //                                (elem_t *)full_A, (elem_t *)full_B, NO_BIAS ? NULL : &full_D[0][0], (elem_t *)full_C,
+  //                                MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
+  //                                MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
+  //                                NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
+  //                                false, false,
+  //                                false, !FULL_BIAS_WIDTH,
+  //                                1,
+  //                                WS);
+  shared_multi_tiled_matmul_auto_test(gemmini_configuration, tile_id,
                                  0, 0,
+                                 BANK_NUM * BANK_ROWS / 2, ACC_ROWS / 2,
                                  MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
                                  (elem_t *)full_A, (elem_t *)full_B, NO_BIAS ? NULL : &full_D[0][0], (elem_t *)full_C,
                                  MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
@@ -207,7 +243,7 @@ int main() {
 #endif
 
 #if PROFILE
-  for (int i = 0; i < gemmini_num; i++)
+  for (int i = 0; i < total_gemmini_num; i++)
   {
     for (int j = 0; j < profile_data_num; j++)
     {
