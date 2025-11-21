@@ -20,6 +20,7 @@
 #define CHECK true
 #define FENCE true
 #define PROFILE false
+#define MULTI true
 
 #define q_type(p) (p >> 62)
 #define start(p) ((p >> 31) & ((1 << 31) - 1))
@@ -29,7 +30,7 @@
 #define IN_ROW_DIM_m0 25
 #define IN_COL_DIM_m0 25
 #define IN_CHANNELS_m0 3
-#define OUT_CHANNELS_m0 32
+#define OUT_CHANNELS_m0 28
 #define KERNEL_DIM_m0 3
 #define PADDING_m0 1
 #define STRIDE_m0 2
@@ -38,7 +39,7 @@
 #define IN_ROW_DIM_m1 16
 #define IN_COL_DIM_m1 16
 #define IN_CHANNELS_m1 9
-#define OUT_CHANNELS_m1 96
+#define OUT_CHANNELS_m1 88
 #define KERNEL_DIM_m1 3
 #define PADDING_m1 1
 #define STRIDE_m1 2
@@ -361,9 +362,11 @@ int main()
 #if PROFILE
   printf("Set profiler address\n");
   static uint64_t P[total_gemmini_num][profile_data_num] row_align(1);
+#if MULTI
   gemmini_profiler(custom0, (uint64_t *)P[0]);
   gemmini_profiler(custom1, (uint64_t *)P[1]);
   gemmini_profiler(custom2, (uint64_t *)P[2]);
+#endif
   gemmini_profiler(custom3, (uint64_t *)P[3]);
 #endif
 
@@ -376,9 +379,11 @@ int main()
   printf("Model m1 output dimensions (rows by columns): %u by %u\n\n", OUT_ROW_DIM_m1, OUT_COL_DIM_m1);
 
   printf("Flush All Gemmini TLB of stale virtual addresses\n");
+#if MULTI
   gemmini_flush(custom0, 0);
   gemmini_flush(custom1, 0);
   gemmini_flush(custom2, 0);
+#endif
   gemmini_flush(custom3, 0);
 
   static elem_t input_m0[BATCH_SIZE_m0][IN_ROW_DIM_m0][IN_COL_DIM_m0][IN_CHANNELS_m0];
@@ -462,43 +467,183 @@ int main()
   int tile_id_m1 = 2;
   printf("Gemmini conv...\n");
   uint64_t start_gemmini = read_cycles();
-  shared_multi_tiled_conv_auto_test(gemmini_configuration_m0, tile_id_m0,
-                                    0, 0,
-                                    BANK_NUM * BANK_ROWS / 4, ACC_ROWS / 4,
-                                    BATCH_SIZE_m0, IN_ROW_DIM_m0, IN_COL_DIM_m0, IN_CHANNELS_m0,
-                                    OUT_CHANNELS_m0, OUT_ROW_DIM_m0, OUT_COL_DIM_m0,
-                                    STRIDE_m0, 1, 1, PADDING_m0, KERNEL_DIM_m0,
-                                    false, false, false, false, false,
+  // shared_multi_tiled_conv_auto_test(gemmini_configuration_m0, tile_id_m0,
+  //                                   0, 0,
+  //                                   BANK_NUM * BANK_ROWS / 4, ACC_ROWS / 4,
+  //                                   BATCH_SIZE_m0, IN_ROW_DIM_m0, IN_COL_DIM_m0, IN_CHANNELS_m0,
+  //                                   OUT_CHANNELS_m0, OUT_ROW_DIM_m0, OUT_COL_DIM_m0,
+  //                                   STRIDE_m0, 1, 1, PADDING_m0, KERNEL_DIM_m0,
+  //                                   false, false, false, false, false,
 
-                                    (elem_t *)input_m0,
-                                    (elem_t *)weights_mat_m0,
-                                    NO_BIAS ? NULL : (acc_t *)bias_m0,
-                                    (elem_t *)output_mat_m0,
+  //                                   (elem_t *)input_m0,
+  //                                   (elem_t *)weights_mat_m0,
+  //                                   NO_BIAS ? NULL : (acc_t *)bias_m0,
+  //                                   (elem_t *)output_mat_m0,
 
-                                    NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, 0, 0,
+  //                                   NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, 0, 0,
 
-                                    WS);
-  shared_multi_tiled_conv_auto_test(gemmini_configuration_m1, tile_id_m1,
-                                    BANK_NUM * BANK_ROWS / 4, ACC_ROWS / 4,
-                                    BANK_NUM * BANK_ROWS * 3 / 4, ACC_ROWS * 3 / 4,
-                                    BATCH_SIZE_m1, IN_ROW_DIM_m1, IN_COL_DIM_m1, IN_CHANNELS_m1,
-                                    OUT_CHANNELS_m1, OUT_ROW_DIM_m1, OUT_COL_DIM_m1,
-                                    STRIDE_m1, 1, 1, PADDING_m1, KERNEL_DIM_m1,
-                                    false, false, false, false, false,
+  //                                   WS);
+  // shared_multi_tiled_conv_auto_test(gemmini_configuration_m1, tile_id_m1,
+  //                                   BANK_NUM * BANK_ROWS / 4, ACC_ROWS / 4,
+  //                                   BANK_NUM * BANK_ROWS * 3 / 4, ACC_ROWS * 3 / 4,
+  //                                   BATCH_SIZE_m1, IN_ROW_DIM_m1, IN_COL_DIM_m1, IN_CHANNELS_m1,
+  //                                   OUT_CHANNELS_m1, OUT_ROW_DIM_m1, OUT_COL_DIM_m1,
+  //                                   STRIDE_m1, 1, 1, PADDING_m1, KERNEL_DIM_m1,
+  //                                   false, false, false, false, false,
 
-                                    (elem_t *)input_m1,
-                                    (elem_t *)weights_mat_m1,
-                                    NO_BIAS ? NULL : (acc_t *)bias_m1,
-                                    (elem_t *)output_mat_m1,
+  //                                   (elem_t *)input_m1,
+  //                                   (elem_t *)weights_mat_m1,
+  //                                   NO_BIAS ? NULL : (acc_t *)bias_m1,
+  //                                   (elem_t *)output_mat_m1,
 
-                                    NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, 0, 0,
+  //                                   NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, 0, 0,
 
-                                    WS);
+  //                                   WS);
+
+#if MULTI
+  // 1) 각 matmul에 대해 tiling factor 자동 계산
+  shared_multi_conv_job_t j0, j1;
+
+  size_t spad_start_addr = 0;
+  size_t acc_start_addr = 0;
+  size_t spad_rows_used_0, acc_rows_used_0;
+  int batches_0, porows_0, pocols_0, pochs_0, krows_0, kcols_0, kchs_0;
+  int pool_size_out_0, pool_stride_out_0, pool_padding_out_0;
+  size_t spad_rows_used_1, acc_rows_used_1;
+  int batches_1, porows_1, pocols_1, pochs_1, krows_1, kcols_1, kchs_1;
+  int pool_size_out_1, pool_stride_out_1, pool_padding_out_1;
+
+  shared_multi_choose_conv_tiling_factors(
+      gemmini_configuration_m0,
+      spad_start_addr, acc_start_addr,
+      TOTAL_SPAD_ROWS / 4, TOTAL_ACC_ROWS / 4,
+      BATCH_SIZE_m0, IN_ROW_DIM_m0, IN_COL_DIM_m0, IN_CHANNELS_m0,
+      OUT_CHANNELS_m0, OUT_ROW_DIM_m0, OUT_COL_DIM_m0,
+      STRIDE_m0, 1, 1, PADDING_m0, KERNEL_DIM_m0,
+      false, false, false, false, false,
+      0, 0, 0,
+      &batches_0, &porows_0, &pocols_0, &pochs_0,
+      &krows_0, &kcols_0, &kchs_0,
+      &pool_size_out_0, &pool_stride_out_0, &pool_padding_out_0,
+      &spad_rows_used_0, &acc_rows_used_0);
+
+  shared_multi_tiled_conv_job_init(
+      &j0,
+      gemmini_configuration_m0, tile_id_m0,
+      spad_start_addr, acc_start_addr,
+      spad_rows_used_0, acc_rows_used_0,
+      BATCH_SIZE_m0, IN_ROW_DIM_m0, IN_COL_DIM_m0, IN_CHANNELS_m0,
+      OUT_CHANNELS_m0, OUT_ROW_DIM_m0, OUT_COL_DIM_m0,
+      STRIDE_m0, 1, 1, PADDING_m0, KERNEL_DIM_m0,
+      false, false, false, false, false,
+
+      batches_0, porows_0, pocols_0, pochs_0,
+      krows_0, kcols_0, kchs_0,
+
+      (elem_t *)input_m0,
+      (elem_t *)weights_mat_m0,
+      NO_BIAS ? NULL : (acc_t *)bias_m0,
+      (elem_t *)output_mat_m0,
+
+      NO_ACTIVATION, ACC_SCALE_IDENTITY, pool_size_out_0, pool_stride_out_0, pool_padding_out_0,
+
+      WS);
+
+  spad_start_addr += spad_rows_used_0;
+  acc_start_addr += acc_rows_used_0;
+
+  shared_multi_choose_conv_tiling_factors(
+      gemmini_configuration_m1,
+      spad_start_addr, acc_start_addr,
+      TOTAL_SPAD_ROWS - spad_start_addr, TOTAL_ACC_ROWS - acc_start_addr,
+      BATCH_SIZE_m1, IN_ROW_DIM_m1, IN_COL_DIM_m1, IN_CHANNELS_m1,
+      OUT_CHANNELS_m1, OUT_ROW_DIM_m1, OUT_COL_DIM_m1,
+      STRIDE_m1, 1, 1, PADDING_m1, KERNEL_DIM_m1,
+      false, false, false, false, false,
+      0, 0, 0,
+      &batches_1, &porows_1, &pocols_1, &pochs_1,
+      &krows_1, &kcols_1, &kchs_1,
+      &pool_size_out_1, &pool_stride_out_1, &pool_padding_out_1,
+      &spad_rows_used_1, &acc_rows_used_1);
+
+  shared_multi_tiled_conv_job_init(
+      &j1,
+      gemmini_configuration_m1, tile_id_m1,
+      spad_start_addr, acc_start_addr,
+      spad_rows_used_1, acc_rows_used_1,
+      BATCH_SIZE_m1, IN_ROW_DIM_m1, IN_COL_DIM_m1, IN_CHANNELS_m1,
+      OUT_CHANNELS_m1, OUT_ROW_DIM_m1, OUT_COL_DIM_m1,
+      STRIDE_m1, 1, 1, PADDING_m1, KERNEL_DIM_m1,
+      false, false, false, false, false,
+
+      batches_1, porows_1, pocols_1, pochs_1,
+      krows_1, kcols_1, kchs_1,
+
+      (elem_t *)input_m1,
+      (elem_t *)weights_mat_m1,
+      NO_BIAS ? NULL : (acc_t *)bias_m1,
+      (elem_t *)output_mat_m1,
+
+      NO_ACTIVATION, ACC_SCALE_IDENTITY, pool_size_out_1, pool_stride_out_1, pool_padding_out_1,
+
+      WS);
+
+  spad_start_addr += spad_rows_used_1;
+  acc_start_addr += acc_rows_used_1;
+
+  while (!j0.done || !j1.done)
+  {
+    if (!j0.done)
+      shared_multi_tiled_conv_job_step(&j0);
+    if (!j1.done)
+      shared_multi_tiled_conv_job_step(&j1);
+  }
+
+#else
+  tiled_conv_auto(custom3,
+                  BATCH_SIZE_m0, IN_ROW_DIM_m0, IN_COL_DIM_m0, IN_CHANNELS_m0,
+                  OUT_CHANNELS_m0, OUT_ROW_DIM_m0, OUT_COL_DIM_m0,
+                  STRIDE_m0, 1, 1, PADDING_m0, KERNEL_DIM_m0,
+                  false, false, false, false, false,
+
+                  (elem_t *)input_m0,
+                  (elem_t *)weights_mat_m0,
+                  NO_BIAS ? NULL : (acc_t *)bias_m0,
+                  (elem_t *)output_mat_m0,
+
+                  NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, 0, 0,
+
+                  WS);
+  tiled_conv_auto(custom3,
+                  BATCH_SIZE_m1, IN_ROW_DIM_m1, IN_COL_DIM_m1, IN_CHANNELS_m1,
+                  OUT_CHANNELS_m1, OUT_ROW_DIM_m1, OUT_COL_DIM_m1,
+                  STRIDE_m1, 1, 1, PADDING_m1, KERNEL_DIM_m1,
+                  false, false, false, false, false,
+
+                  (elem_t *)input_m1,
+                  (elem_t *)weights_mat_m1,
+                  NO_BIAS ? NULL : (acc_t *)bias_m1,
+                  (elem_t *)output_mat_m1,
+
+                  NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, 0, 0,
+
+                  WS);
+#endif
+
 #if FENCE
   gemmini_fence();
 #endif
 
   uint64_t end_gemmini = read_cycles();
+
+#if MULTI
+  printf("total spad_rows reserved: %d\n", spad_start_addr);
+  printf("total acc_rows reserved: %d\n\n", acc_start_addr);
+
+  printf("scratchpad row utilization: %d%%\n", (spad_start_addr * 100) / TOTAL_SPAD_ROWS);
+  printf("accumulator row utilization: %d%%\n\n", (acc_start_addr * 100) / TOTAL_ACC_ROWS);
+#endif
+
   printf("Gemmini convs took %llu cycles\n", end_gemmini - start_gemmini);
 
 #if CHECK
@@ -516,6 +661,11 @@ int main()
 
   if (!success_m0 || !success_m1)
   {
+    if (!success_m0 && !success_m1)
+    {
+      printf("Incorrect output for both models!\n");
+    }
+    
     if (!success_m0)
     {
       printf("Incorrect output for model m0!\n");
