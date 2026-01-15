@@ -11,23 +11,21 @@
 #include "include/gemmini_testutils_all.h"
 // #include "include/gemmini_nn.h"
 
-#define gemmini_configuration 15
-#define MAT_DIM_I 192
-#define MAT_DIM_J 256
-#define MAT_DIM_K 512
-
+#define PROFILE false
 #define profile_data_num 30
 
+#define MULTI true
+#define gemmini_configuration 15
+
+#define MAT_DIM_I 256
+#define MAT_DIM_J 256
+#define MAT_DIM_K 256
+#define RAND rand()
+#define FAST true
 #define NO_BIAS false
 #define FULL_BIAS_WIDTH true
 #define REPEATING_BIAS false
-
-#define RAND rand()
-#define FAST true
-#define CHECK false
-#define FENCE true
-#define PROFILE false
-#define MULTI false
+#define CHECK true
 
 #define q_type(p) (p >> 62)
 #define start(p) ((p >> 31) & ((1 << 31) - 1))
@@ -141,10 +139,10 @@ int main() {
     gemmini_flush(custom3, 0);
 
     printf("Initialize our input and output matrices in main memory\n");
-    static elem_t full_A[MAT_DIM_I][MAT_DIM_K] row_align(1);
-    static elem_t full_B[MAT_DIM_K][MAT_DIM_J] row_align(1);
-    static elem_t full_C[MAT_DIM_I][MAT_DIM_J] row_align(1);
-    static ACC_T full_D[MAT_DIM_I][MAT_DIM_J] row_align_acc(1);
+    static elem_t full_A[MAT_DIM_I][MAT_DIM_K] row_align(MAX_BLOCK_LEN);
+    static elem_t full_B[MAT_DIM_K][MAT_DIM_J] row_align(MAX_BLOCK_LEN);
+    static elem_t full_C[MAT_DIM_I][MAT_DIM_J] row_align(MAX_BLOCK_LEN);
+    static ACC_T full_D[MAT_DIM_I][MAT_DIM_J] row_align_acc(MAX_BLOCK_LEN_ACC);
 
 #if !FAST && CHECK
     static full_t gold_full[MAT_DIM_I][MAT_DIM_J];
@@ -164,7 +162,6 @@ int main() {
     for (size_t i = 0; i < MAT_DIM_I; ++i) {
       for (size_t j = 0; j < MAT_DIM_J; ++j) {
         full_D[i][j] = NO_BIAS ? 0 : RAND % 2;
-        // full_D[i][j] = NO_BIAS ? 0 : 5;
       }
     }
 
@@ -189,68 +186,76 @@ int main() {
   full_matscale(gold_full, gold, ACC_SCALE_IDENTITY);
 #endif
 #endif
-  int tile_id = 1;
-  printf("Do Gemmini tiled matmul process\n");
-  uint64_t matmul_start = read_cycles();
-  // shared_multi_tiled_matmul_auto(gemmini_configuration, tile_id,
-  //                                0, 0,
-  //                                MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
-  //                                (elem_t *)full_A, (elem_t *)full_B, NO_BIAS ? NULL : &full_D[0][0], (elem_t *)full_C,
-  //                                MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
-  //                                MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
-  //                                NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
-  //                                false, false,
-  //                                false, !FULL_BIAS_WIDTH,
-  //                                1,
-  //                                WS);
-  // shared_multi_tiled_matmul_auto_test(gemmini_configuration, tile_id,
-  //                                0, 0,
-  //                                BANK_NUM * BANK_ROWS / 2, ACC_ROWS / 2,
-  //                                MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
-  //                                (elem_t *)full_A, (elem_t *)full_B, NO_BIAS ? NULL : &full_D[0][0], (elem_t *)full_C,
-  //                                MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
-  //                                MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
-  //                                NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
-  //                                false, false,
-  //                                false, !FULL_BIAS_WIDTH,
-  //                                1,
-  //                                WS);
-#if MULTI
-  // 1) 각 matmul에 대해 tiling factor 자동 계산
   shared_multi_matmul_job_t j0;
+  int total_cycles = 0;
+  printf("Do Gemmini tiled matmul process\n");
+#if MULTI
+  const size_t sp_addr_range = BANK_NUM * BANK_ROWS;
+  const size_t acc_addr_range = ACC_ROWS;
+  const size_t max_spad_rows = sp_addr_range / 2;
+  const size_t max_acc_rows = acc_addr_range / 2;
 
-  size_t spad_start_addr = 0;
-  size_t acc_start_addr = 0;
-  size_t spad_rows_used_0, acc_rows_used_0;
-  size_t tile_I0, tile_J0, tile_K0;
-  shared_multi_choose_tiling_factors(
-      gemmini_configuration,
-      spad_start_addr, acc_start_addr,
-      TOTAL_SPAD_ROWS, TOTAL_ACC_ROWS,
-      MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
-      NO_ACTIVATION, WS,
-      &tile_I0, &tile_J0, &tile_K0,
-      &spad_rows_used_0, &acc_rows_used_0);
+  for (size_t tile_I = 4; tile_I <= 16; ++tile_I) {
+    for (size_t tile_J = 1; tile_J <= 16; ++tile_J) {
+      for (size_t tile_K = 4; tile_K <= 16; ++tile_K) {
+        if (tiled_matmul_total_spad_rows(tile_I, tile_J, tile_K) <= max_spad_rows &&
+            tiled_matmul_total_acc_rows(tile_I, tile_J) <= max_acc_rows) {
+      
+          gemmini_flush(custom0, 0);
+          gemmini_flush(custom1, 0);
+          gemmini_flush(custom2, 0);
+          gemmini_flush(custom3, 0);
 
-  shared_multi_tiled_matmul_job_init(
-      &j0,
-      gemmini_configuration, tile_id,
-      spad_start_addr, acc_start_addr,
-      spad_rows_used_0, acc_rows_used_0,
-      MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
-      (elem_t *)full_A, (elem_t *)full_B, NO_BIAS ? NULL : &full_D[0][0], (elem_t *)full_C,
-      MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
-      MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
-      tile_I0, tile_J0, tile_K0,
-      NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
-      false, false,
-      false, !FULL_BIAS_WIDTH,
-      1,
-      WEIGHT_STATIONARY);
+          memset(&j0, 0, sizeof(shared_multi_matmul_job_t));
+          j0.tile_id = 1;
+          j0.gemmini_list = gemmini_configuration;
+          j0.sp_addr_start = 0;
+          j0.acc_addr_start = 0;
+          j0.sp_addr_range = TOTAL_SPAD_ROWS;
+          j0.acc_addr_range = TOTAL_ACC_ROWS;
+          j0.dim_I = MAT_DIM_I;
+          j0.dim_J = MAT_DIM_J;
+          j0.dim_K = MAT_DIM_K;
+          j0.A = (elem_t *)full_A;
+          j0.B = (elem_t *)full_B;
+          j0.D = NO_BIAS ? NULL : &full_D[0][0];
+          j0.C = (elem_t *)full_C;
+          j0.stride_A = MAT_DIM_K;
+          j0.stride_B = MAT_DIM_J;
+          j0.stride_D = MAT_DIM_J;
+          j0.stride_C = MAT_DIM_J;
+          j0.A_scale_factor = MVIN_SCALE_IDENTITY;
+          j0.B_scale_factor = MVIN_SCALE_IDENTITY;
+          j0.D_scale_factor = MVIN_SCALE_IDENTITY;
+          j0.act = NO_ACTIVATION;
+          j0.scale = ACC_SCALE_IDENTITY;
+          j0.bert_scale = 0;
+          j0.repeating_bias = REPEATING_BIAS;
+          j0.a_transpose = false;
+          j0.b_transpose = false;
+          j0.full_C = false;
+          j0.low_D = !FULL_BIAS_WIDTH;
+          j0.weightA = 1;
+          j0.dataflow = WEIGHT_STATIONARY;
 
-  while (!j0.done)
-  {
-    shared_multi_tiled_matmul_job_step(&j0);
+          uint64_t matmul_start = read_cycles();
+
+          shared_multi_choose_tiling_factors_static(&j0, tile_I, tile_J, tile_K);
+          shared_multi_tiled_matmul_job_init(&j0);
+          while (!j0.done)
+          {
+            shared_multi_tiled_matmul_job_step(&j0);
+          }
+
+          gemmini_fence();
+
+          uint64_t matmul_end = read_cycles();
+
+          printf("tile_I: %d, tile_J: %d, tile_K: %d Matmul cycle: %d\n", tile_I, tile_J, tile_K, matmul_end - matmul_start);
+          total_cycles = total_cycles + (matmul_end - matmul_start);
+        }
+      }
+    }
   }
 #else
   tiled_matmul_auto(custom3, MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
@@ -263,12 +268,8 @@ int main() {
                     1,
                     WS);
 #endif
-#if FENCE
-  gemmini_fence();
-#endif
 
-  uint64_t matmul_end = read_cycles();
-  printf("Matmul cycle: %d\n", matmul_end - matmul_start);
+  printf("Total Matmul cycle: %d\n", total_cycles);
 
 #if CHECK
   printf("Check \"Out\" matrix\n");
@@ -315,4 +316,3 @@ int main() {
 
   exit(0);
 }
-

@@ -8,16 +8,15 @@
 #endif
 #include "include/gemmini_testutils_all.h"
 
-#define gemmini_configuration 15
+#define PROFILE false
 #define profile_data_num 30
 
-#define NO_BIAS false
+#define MULTI true
+#define gemmini_configuration 15
 
 #define FAST true
+#define NO_BIAS false
 #define CHECK false
-#define FENCE true
-#define PROFILE false
-#define MULTI false
 
 #define q_type(p) (p >> 62)
 #define start(p) ((p >> 31) & ((1 << 31) - 1))
@@ -45,10 +44,10 @@
 
 #else
 
-#define IN_ROW_DIM 17
-#define IN_COL_DIM 17
-#define IN_CHANNELS 18
-#define OUT_CHANNELS 19
+#define IN_ROW_DIM 28
+#define IN_COL_DIM 28
+#define IN_CHANNELS 64
+#define OUT_CHANNELS 128
 
 #endif
 
@@ -237,17 +236,23 @@ int main() {
     // assert((in_dim + 2*padding - kernel_dim) % stride == 0);
 
     printf("Input dimensions (rows by columns): %u by %u\n", IN_ROW_DIM, IN_COL_DIM);
+    printf("Input channels: %u\n", IN_CHANNELS);
+    printf("Batch size: %u\n", BATCH_SIZE);
+    printf("Kernel dimensions: %u by %u\n", KERNEL_DIM, KERNEL_DIM);
+    printf("Stride: %u\n", STRIDE);
+    printf("Padding: %u\n", PADDING);
+    printf("Output channels: %u\n", OUT_CHANNELS);
     printf("Output dimensions (rows by columns): %u by %u\n\n", OUT_ROW_DIM, OUT_COL_DIM);
 
-    static elem_t input[BATCH_SIZE][IN_ROW_DIM][IN_COL_DIM][IN_CHANNELS];
-    static acc_t bias[OUT_CHANNELS];
+    static elem_t input[BATCH_SIZE][IN_ROW_DIM][IN_COL_DIM][IN_CHANNELS] row_align(MAX_BLOCK_LEN);
+    static acc_t bias[OUT_CHANNELS] row_align_acc(MAX_BLOCK_LEN_ACC);
 
     printf("Randomize inputs...\n");
     init_random(&input[0][0][0][0], sizeof(input) / sizeof(elem_t));
 
 #if CHECK && !FAST
     printf("Randomize weights...\n");
-    static elem_t weights[OUT_CHANNELS][KERNEL_DIM][KERNEL_DIM][IN_CHANNELS];
+    static elem_t weights[OUT_CHANNELS][KERNEL_DIM][KERNEL_DIM][IN_CHANNELS] row_align(MAX_BLOCK_LEN);
     init_random(&weights[0][0][0][0], sizeof(weights) / sizeof(elem_t));
 #endif
 
@@ -257,8 +262,8 @@ int main() {
     else
         init_random_acc(&bias[0], sizeof(bias) / sizeof(acc_t));
 
-#if !FAST && CHECK
-    static elem_t output[BATCH_SIZE][OUT_ROW_DIM][OUT_COL_DIM][OUT_CHANNELS];
+#if CHECK && !FAST
+    static elem_t output[BATCH_SIZE][OUT_ROW_DIM][OUT_COL_DIM][OUT_CHANNELS] row_align(MAX_BLOCK_LEN);
 
     printf("CPU conv...\n");
     uint64_t start_cpu = read_cycles();
@@ -277,8 +282,8 @@ int main() {
     printf("CPU conv took %llu cycles\n", end_cpu - start_cpu);
 #endif
 
-    static elem_t weights_mat[PATCH_SIZE][OUT_CHANNELS];
-    static elem_t output_mat[N_PATCHES][OUT_CHANNELS];
+    static elem_t weights_mat[PATCH_SIZE][OUT_CHANNELS] row_align(MAX_BLOCK_LEN);
+    static elem_t output_mat[N_PATCHES][OUT_CHANNELS] row_align(MAX_BLOCK_LEN);
 
 #if CHECK && !FAST
     printf("Flatten weights...\n");
@@ -291,75 +296,118 @@ int main() {
     init_random(&weights_mat[0][0], sizeof(weights_mat) / sizeof(elem_t));
 #endif
 
-    int tile_id = 1;
-    printf("Gemmini conv...\n");
-    uint64_t start_gemmini = read_cycles();
-    // shared_multi_tiled_conv_auto(gemmini_configuration, tile_id,
-    //     0, 0,
-    //     BATCH_SIZE, IN_ROW_DIM, IN_COL_DIM, IN_CHANNELS,
-    //     OUT_CHANNELS, OUT_ROW_DIM, OUT_COL_DIM,
-    //     STRIDE, 1, 1, PADDING, KERNEL_DIM,
-    //     false, false, false, false, false,
-
-    //     (elem_t*)input,
-    //     (elem_t*)weights_mat,
-    //     NO_BIAS ? NULL : (acc_t*)bias,
-    //     (elem_t*)output_mat,
-
-    //     NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, 0, 0,
-
-    //     WS);
-
-#if MULTI
     shared_multi_conv_job_t j0;
 
-    size_t spad_start_addr = 0;
-    size_t acc_start_addr = 0;
-    size_t spad_rows_used_0, acc_rows_used_0;
-    int batches_0, porows_0, pocols_0, pochs_0, krows_0, kcols_0, kchs_0;
-    int pool_size_out_0, pool_stride_out_0, pool_padding_out_0;
+#if MULTI
+    int total_cycles = 0;
+    printf("Do Gemmini tiled conv process\n");
 
-    shared_multi_choose_conv_tiling_factors(
-        gemmini_configuration,
-        spad_start_addr, acc_start_addr,
-        TOTAL_SPAD_ROWS, TOTAL_ACC_ROWS,
-        BATCH_SIZE, IN_ROW_DIM, IN_COL_DIM, IN_CHANNELS,
-        OUT_CHANNELS, OUT_ROW_DIM, OUT_COL_DIM,
-        STRIDE, 1, 1, PADDING, KERNEL_DIM,
-        false, false, false, false, false,
-        0, 0, 0,
-        &batches_0, &porows_0, &pocols_0, &pochs_0,
-        &krows_0, &kcols_0, &kchs_0,
-        &pool_size_out_0, &pool_stride_out_0, &pool_padding_out_0,
-        &spad_rows_used_0, &acc_rows_used_0);
+    const size_t sp_addr_range = BANK_NUM * BANK_ROWS;
+    const size_t acc_addr_range = ACC_ROWS;
+    const size_t max_spad_rows = sp_addr_range / 2;
+    const size_t max_acc_rows = acc_addr_range / 2;
 
-    shared_multi_tiled_conv_job_init(
-        &j0,
-        gemmini_configuration, tile_id,
-        spad_start_addr, acc_start_addr,
-        spad_rows_used_0, acc_rows_used_0,
-        BATCH_SIZE, IN_ROW_DIM, IN_COL_DIM, IN_CHANNELS,
-        OUT_CHANNELS, OUT_ROW_DIM, OUT_COL_DIM,
-        STRIDE, 1, 1, PADDING, KERNEL_DIM,
-        false, false, false, false, false,
+    const int pool_size = 1;
+    const int pool_stride = 1;
+    const int pool_padding = 0;
+    const bool downsample = STRIDE == 2 && KERNEL_DIM == 1 && PADDING == 0 &&
+                            IN_ROW_DIM % 2 == 0 && IN_COL_DIM % 2 == 0;
 
-        batches_0, porows_0, pocols_0, pochs_0,
-        krows_0, kcols_0, kchs_0,
-
-        (elem_t *)input,
-        (elem_t *)weights_mat,
-        NO_BIAS ? NULL : (acc_t *)bias,
-        (elem_t *)output_mat,
-
-        NO_ACTIVATION, ACC_SCALE_IDENTITY, pool_size_out_0, pool_stride_out_0, pool_padding_out_0,
-
-        WS);
-
-    while (!j0.done)
+    for (int porows = 1; porows <= OUT_ROW_DIM; porows += 1)
     {
-        shared_multi_tiled_conv_job_step(&j0);
+        for (int krows = 1; krows <= KERNEL_DIM; krows += 1)
+        {
+          for (int kcols = 1; kcols <= KERNEL_DIM; kcols += 1)
+          {
+            for (int pocols = 16; pocols <= OUT_COL_DIM; pocols += 16)
+            {
+                for (int pochs = 64; pochs <= OUT_CHANNELS; pochs += 16)
+                {
+                    for (int kchs = 64; kchs <= IN_CHANNELS; kchs += 16)
+                    {
+                        const int batches = 1;
+
+                        const int spad_rows = tiled_conv_total_spad_rows(false,
+                                                                        STRIDE, 1, 1, downsample, false, false,
+                                                                        batches, porows, pocols, pochs, krows, kcols, kchs,
+                                                                        pool_size, pool_stride);
+                        
+                        const int acc_rows = tiled_conv_total_spad_rows(true,
+                                                                        STRIDE, 1, 1, downsample, false, false,
+                                                                        batches, porows, pocols, pochs, krows, kcols, kchs,
+                                                                        pool_size, pool_stride);
+
+                        if (spad_rows > max_spad_rows || acc_rows > max_acc_rows) {
+                            printf("spad_rows: %d, acc_rows: %d exceed max limit\n", spad_rows, acc_rows);
+                            continue;
+                        }
+
+                        gemmini_flush(custom0, 0);
+                        gemmini_flush(custom1, 0);
+                        gemmini_flush(custom2, 0);
+                        gemmini_flush(custom3, 0);
+
+                        memset(&j0, 0, sizeof(shared_multi_conv_job_t));
+                        j0.tile_id = 1;
+                        j0.gemmini_list = gemmini_configuration;
+                        j0.sp_addr_start = 0;
+                        j0.acc_addr_start = 0;
+                        j0.sp_addr_range = TOTAL_SPAD_ROWS;
+                        j0.acc_addr_range = TOTAL_ACC_ROWS;
+                        j0.batch_size = BATCH_SIZE;
+                        j0.in_row_dim = IN_ROW_DIM;
+                        j0.in_col_dim = IN_COL_DIM;
+                        j0.in_channels = IN_CHANNELS;
+                        j0.out_channels = OUT_CHANNELS;
+                        j0.out_row_dim = OUT_ROW_DIM;
+                        j0.out_col_dim = OUT_COL_DIM;
+                        j0.stride = STRIDE;
+                        j0.input_dilation = 1;
+                        j0.kernel_dilation = 1;
+                        j0.padding = PADDING;
+                        j0.kernel_dim = KERNEL_DIM;
+                        j0.wrot180 = false;
+                        j0.trans_output_1203 = false;
+                        j0.trans_input_3120 = false;
+                        j0.trans_weight_1203 = false;
+                        j0.trans_weight_0132 = false;
+                        j0.input = (elem_t *)input;
+                        j0.weights = (elem_t *)weights_mat;
+                        j0.bias = NO_BIAS ? NULL : (acc_t *)bias;
+                        j0.output = (elem_t *)output_mat;
+                        j0.act = NO_ACTIVATION;
+                        j0.scale = ACC_SCALE_IDENTITY;
+                        j0.pool_size = 1;
+                        j0.pool_stride = 1;
+                        j0.pool_padding = 0;
+                        j0.tiled_conv_type = WS;
+
+                        uint64_t start_gemmini = read_cycles();
+
+                        shared_multi_choose_conv_tiling_factors_static(&j0, batches, porows, pocols, pochs, krows, kcols, kchs);
+                        shared_multi_tiled_conv_job_init(&j0);
+                        while (!j0.done)
+                        {
+                        shared_multi_tiled_conv_job_step(&j0);
+                        }
+
+                        gemmini_fence();
+                        uint64_t end_gemmini = read_cycles();
+
+                        printf("batches: %d, porows: %d, pocols: %d, pochs: %d, krows: %d, kcols: %d, kchs: %d, total_spad_rows: %d, total_acc_rows: %d, Conv cycle: %llu\n",
+                            batches, porows, pocols, pochs, krows, kcols, kchs, spad_rows, acc_rows, end_gemmini - start_gemmini);
+                        total_cycles += (end_gemmini - start_gemmini);
+                    }
+                    }
+                }
+            }
+        }
     }
+
+    printf("Total Conv cycle: %d\n", total_cycles);
 #else
+    printf("Gemmini conv...\n");
+    uint64_t start_gemmini = read_cycles();
     tiled_conv_auto(custom3,
                     BATCH_SIZE, IN_ROW_DIM, IN_COL_DIM, IN_CHANNELS,
                     OUT_CHANNELS, OUT_ROW_DIM, OUT_COL_DIM,
@@ -374,12 +422,10 @@ int main() {
                     NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, 0, 0,
 
                     WS);
-#endif
-#if FENCE
     gemmini_fence();
-#endif
     uint64_t end_gemmini = read_cycles();
     printf("Gemmini conv took %llu cycles\n", end_gemmini - start_gemmini);
+#endif
 
 #if !FAST && CHECK
     assert(sizeof(output_mat) == sizeof(output));

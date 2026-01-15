@@ -386,21 +386,21 @@ int main()
 #endif
   gemmini_flush(custom3, 0);
 
-  static elem_t input_m0[BATCH_SIZE_m0][IN_ROW_DIM_m0][IN_COL_DIM_m0][IN_CHANNELS_m0];
-  static elem_t weights_m0[OUT_CHANNELS_m0][KERNEL_DIM_m0][KERNEL_DIM_m0][IN_CHANNELS_m0];
-  static acc_t bias_m0[OUT_CHANNELS_m0];
-  static elem_t weights_mat_m0[PATCH_SIZE_m0][OUT_CHANNELS_m0];
-  static elem_t output_mat_m0[N_PATCHES_m0][OUT_CHANNELS_m0];
+  static elem_t input_m0[BATCH_SIZE_m0][IN_ROW_DIM_m0][IN_COL_DIM_m0][IN_CHANNELS_m0] row_align(MAX_BLOCK_LEN);
+  static elem_t weights_m0[OUT_CHANNELS_m0][KERNEL_DIM_m0][KERNEL_DIM_m0][IN_CHANNELS_m0] row_align(MAX_BLOCK_LEN);
+  static acc_t bias_m0[OUT_CHANNELS_m0] row_align_acc(MAX_BLOCK_LEN_ACC);
+  static elem_t weights_mat_m0[PATCH_SIZE_m0][OUT_CHANNELS_m0] row_align(MAX_BLOCK_LEN);
+  static elem_t output_mat_m0[N_PATCHES_m0][OUT_CHANNELS_m0] row_align(MAX_BLOCK_LEN);
 
-  static elem_t input_m1[BATCH_SIZE_m1][IN_ROW_DIM_m1][IN_COL_DIM_m1][IN_CHANNELS_m1];
-  static elem_t weights_m1[OUT_CHANNELS_m1][KERNEL_DIM_m1][KERNEL_DIM_m1][IN_CHANNELS_m1];
-  static acc_t bias_m1[OUT_CHANNELS_m1];
-  static elem_t weights_mat_m1[PATCH_SIZE_m1][OUT_CHANNELS_m1];
-  static elem_t output_mat_m1[N_PATCHES_m1][OUT_CHANNELS_m1];
+  static elem_t input_m1[BATCH_SIZE_m1][IN_ROW_DIM_m1][IN_COL_DIM_m1][IN_CHANNELS_m1] row_align(MAX_BLOCK_LEN);
+  static elem_t weights_m1[OUT_CHANNELS_m1][KERNEL_DIM_m1][KERNEL_DIM_m1][IN_CHANNELS_m1] row_align(MAX_BLOCK_LEN);
+  static acc_t bias_m1[OUT_CHANNELS_m1] row_align_acc(MAX_BLOCK_LEN_ACC);
+  static elem_t weights_mat_m1[PATCH_SIZE_m1][OUT_CHANNELS_m1] row_align(MAX_BLOCK_LEN);
+  static elem_t output_mat_m1[N_PATCHES_m1][OUT_CHANNELS_m1] row_align(MAX_BLOCK_LEN);
 
 #if !FAST && CHECK
-  static elem_t output_m0[BATCH_SIZE_m0][OUT_ROW_DIM_m0][OUT_COL_DIM_m0][OUT_CHANNELS_m0];
-  static elem_t output_m1[BATCH_SIZE_m1][OUT_ROW_DIM_m1][OUT_COL_DIM_m1][OUT_CHANNELS_m1];
+  static elem_t output_m0[BATCH_SIZE_m0][OUT_ROW_DIM_m0][OUT_COL_DIM_m0][OUT_CHANNELS_m0] row_align(MAX_BLOCK_LEN);
+  static elem_t output_m1[BATCH_SIZE_m1][OUT_ROW_DIM_m1][OUT_COL_DIM_m1][OUT_CHANNELS_m1] row_align(MAX_BLOCK_LEN);
 #endif
 
   printf("Randomize inputs...\n");
@@ -501,95 +501,91 @@ int main()
   //                                   WS);
 
 #if MULTI
-  // 1) 각 matmul에 대해 tiling factor 자동 계산
   shared_multi_conv_job_t j0, j1;
 
   size_t spad_start_addr = 0;
   size_t acc_start_addr = 0;
-  size_t spad_rows_used_0, acc_rows_used_0;
-  int batches_0, porows_0, pocols_0, pochs_0, krows_0, kcols_0, kchs_0;
-  int pool_size_out_0, pool_stride_out_0, pool_padding_out_0;
-  size_t spad_rows_used_1, acc_rows_used_1;
-  int batches_1, porows_1, pocols_1, pochs_1, krows_1, kcols_1, kchs_1;
-  int pool_size_out_1, pool_stride_out_1, pool_padding_out_1;
+  j0.tile_id = tile_id_m0;
+  j0.gemmini_list = gemmini_configuration_m0;
+  j0.sp_addr_start = spad_start_addr;
+  j0.acc_addr_start = acc_start_addr;
+  j0.sp_addr_range = TOTAL_SPAD_ROWS / 4;
+  j0.acc_addr_range = TOTAL_ACC_ROWS / 4;
+  j0.batch_size = BATCH_SIZE_m0;
+  j0.in_row_dim = IN_ROW_DIM_m0;
+  j0.in_col_dim = IN_COL_DIM_m0;
+  j0.in_channels = IN_CHANNELS_m0;
+  j0.out_channels = OUT_CHANNELS_m0;
+  j0.out_row_dim = OUT_ROW_DIM_m0;
+  j0.out_col_dim = OUT_COL_DIM_m0;
+  j0.stride = STRIDE_m0;
+  j0.input_dilation = 1;
+  j0.kernel_dilation = 1;
+  j0.padding = PADDING_m0;
+  j0.kernel_dim = KERNEL_DIM_m0;
+  j0.wrot180 = false;
+  j0.trans_output_1203 = false;
+  j0.trans_input_3120 = false;
+  j0.trans_weight_1203 = false;
+  j0.trans_weight_0132 = false;
+  j0.input = (elem_t *)input_m0;
+  j0.weights = (elem_t *)weights_mat_m0;
+  j0.bias = NO_BIAS ? NULL : (acc_t *)bias_m0;
+  j0.output = (elem_t *)output_mat_m0;
+  j0.act = NO_ACTIVATION;
+  j0.scale = ACC_SCALE_IDENTITY;
+  j0.pool_size = 0;
+  j0.pool_stride = 0;
+  j0.pool_padding = 0;
+  j0.tiled_conv_type = WS;
 
-  shared_multi_choose_conv_tiling_factors(
-      gemmini_configuration_m0,
-      spad_start_addr, acc_start_addr,
-      TOTAL_SPAD_ROWS / 4, TOTAL_ACC_ROWS / 4,
-      BATCH_SIZE_m0, IN_ROW_DIM_m0, IN_COL_DIM_m0, IN_CHANNELS_m0,
-      OUT_CHANNELS_m0, OUT_ROW_DIM_m0, OUT_COL_DIM_m0,
-      STRIDE_m0, 1, 1, PADDING_m0, KERNEL_DIM_m0,
-      false, false, false, false, false,
-      0, 0, 0,
-      &batches_0, &porows_0, &pocols_0, &pochs_0,
-      &krows_0, &kcols_0, &kchs_0,
-      &pool_size_out_0, &pool_stride_out_0, &pool_padding_out_0,
-      &spad_rows_used_0, &acc_rows_used_0);
+  shared_multi_choose_conv_tiling_factors(&j0);
 
-  shared_multi_tiled_conv_job_init(
-      &j0,
-      gemmini_configuration_m0, tile_id_m0,
-      spad_start_addr, acc_start_addr,
-      spad_rows_used_0, acc_rows_used_0,
-      BATCH_SIZE_m0, IN_ROW_DIM_m0, IN_COL_DIM_m0, IN_CHANNELS_m0,
-      OUT_CHANNELS_m0, OUT_ROW_DIM_m0, OUT_COL_DIM_m0,
-      STRIDE_m0, 1, 1, PADDING_m0, KERNEL_DIM_m0,
-      false, false, false, false, false,
+  shared_multi_tiled_conv_job_init(&j0);
 
-      batches_0, porows_0, pocols_0, pochs_0,
-      krows_0, kcols_0, kchs_0,
+  spad_start_addr += j0.sp_addr_range;
+  acc_start_addr += j0.acc_addr_range;
 
-      (elem_t *)input_m0,
-      (elem_t *)weights_mat_m0,
-      NO_BIAS ? NULL : (acc_t *)bias_m0,
-      (elem_t *)output_mat_m0,
+  j1.tile_id = tile_id_m1;
+  j1.gemmini_list = gemmini_configuration_m1;
+  j1.sp_addr_start = spad_start_addr;
+  j1.acc_addr_start = acc_start_addr;
+  j1.sp_addr_range = TOTAL_SPAD_ROWS - spad_start_addr;
+  j1.acc_addr_range = TOTAL_ACC_ROWS - acc_start_addr;
+  j1.batch_size = BATCH_SIZE_m1;
+  j1.in_row_dim = IN_ROW_DIM_m1;
+  j1.in_col_dim = IN_COL_DIM_m1;
+  j1.in_channels = IN_CHANNELS_m1;
+  j1.out_channels = OUT_CHANNELS_m1;
+  j1.out_row_dim = OUT_ROW_DIM_m1;
+  j1.out_col_dim = OUT_COL_DIM_m1;
+  j1.stride = STRIDE_m1;
+  j1.input_dilation = 1;
+  j1.kernel_dilation = 1;
+  j1.padding = PADDING_m1;
+  j1.kernel_dim = KERNEL_DIM_m1;
+  j1.wrot180 = false;
+  j1.trans_output_1203 = false;
+  j1.trans_input_3120 = false;
+  j1.trans_weight_1203 = false;
+  j1.trans_weight_0132 = false;
+  j1.input = (elem_t *)input_m1;
+  j1.weights = (elem_t *)weights_mat_m1;
+  j1.bias = NO_BIAS ? NULL : (acc_t *)bias_m1;
+  j1.output = (elem_t *)output_mat_m1;
+  j1.act = NO_ACTIVATION;
+  j1.scale = ACC_SCALE_IDENTITY;
+  j1.pool_size = 0;
+  j1.pool_stride = 0;
+  j1.pool_padding = 0;
+  j1.tiled_conv_type = WS;
 
-      NO_ACTIVATION, ACC_SCALE_IDENTITY, pool_size_out_0, pool_stride_out_0, pool_padding_out_0,
+  shared_multi_choose_conv_tiling_factors(&j1);
 
-      WS);
+  shared_multi_tiled_conv_job_init(&j1);
 
-  spad_start_addr += spad_rows_used_0;
-  acc_start_addr += acc_rows_used_0;
-
-  shared_multi_choose_conv_tiling_factors(
-      gemmini_configuration_m1,
-      spad_start_addr, acc_start_addr,
-      TOTAL_SPAD_ROWS - spad_start_addr, TOTAL_ACC_ROWS - acc_start_addr,
-      BATCH_SIZE_m1, IN_ROW_DIM_m1, IN_COL_DIM_m1, IN_CHANNELS_m1,
-      OUT_CHANNELS_m1, OUT_ROW_DIM_m1, OUT_COL_DIM_m1,
-      STRIDE_m1, 1, 1, PADDING_m1, KERNEL_DIM_m1,
-      false, false, false, false, false,
-      0, 0, 0,
-      &batches_1, &porows_1, &pocols_1, &pochs_1,
-      &krows_1, &kcols_1, &kchs_1,
-      &pool_size_out_1, &pool_stride_out_1, &pool_padding_out_1,
-      &spad_rows_used_1, &acc_rows_used_1);
-
-  shared_multi_tiled_conv_job_init(
-      &j1,
-      gemmini_configuration_m1, tile_id_m1,
-      spad_start_addr, acc_start_addr,
-      spad_rows_used_1, acc_rows_used_1,
-      BATCH_SIZE_m1, IN_ROW_DIM_m1, IN_COL_DIM_m1, IN_CHANNELS_m1,
-      OUT_CHANNELS_m1, OUT_ROW_DIM_m1, OUT_COL_DIM_m1,
-      STRIDE_m1, 1, 1, PADDING_m1, KERNEL_DIM_m1,
-      false, false, false, false, false,
-
-      batches_1, porows_1, pocols_1, pochs_1,
-      krows_1, kcols_1, kchs_1,
-
-      (elem_t *)input_m1,
-      (elem_t *)weights_mat_m1,
-      NO_BIAS ? NULL : (acc_t *)bias_m1,
-      (elem_t *)output_mat_m1,
-
-      NO_ACTIVATION, ACC_SCALE_IDENTITY, pool_size_out_1, pool_stride_out_1, pool_padding_out_1,
-
-      WS);
-
-  spad_start_addr += spad_rows_used_1;
-  acc_start_addr += acc_rows_used_1;
+  spad_start_addr += j1.sp_addr_range;
+  acc_start_addr += j1.acc_addr_range;
 
   while (!j0.done || !j1.done)
   {
