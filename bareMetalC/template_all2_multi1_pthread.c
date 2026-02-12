@@ -1,11 +1,14 @@
 // See LICENSE for license details.
 
+#define _GNU_SOURCE
 #include <stdint.h>
 #include <stddef.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
 #ifndef BAREMETAL
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #endif
 #include "include/gemmini_testutils_all.h"
@@ -17,15 +20,16 @@
 #define MULTI true
 #define gemmini_configuration 15
 
-#define MAT_DIM_I 64
-#define MAT_DIM_J 64
-#define MAT_DIM_K 64
+#define MAT_DIM_I 256
+#define MAT_DIM_J 256
+#define MAT_DIM_K 256
 #define RAND rand()
 #define FAST true
 #define NO_BIAS true
 #define FULL_BIAS_WIDTH true
 #define REPEATING_BIAS false
 #define CHECK true
+#define WARMUP_DIM 32
 
 #define q_type(p) (p >> 62)
 #define start(p) ((p >> 31) & ((1 << 31) - 1))
@@ -86,7 +90,7 @@ int full_is_equal(elem_t x[MAT_DIM_I][MAT_DIM_J], elem_t y[MAT_DIM_I][MAT_DIM_J]
 }
 
 void full_matscale(full_t full[MAT_DIM_I][MAT_DIM_J], elem_t out[MAT_DIM_I][MAT_DIM_J], acc_scale_t scale) {
-  for (size_t r = 0; r < MAT_DIM_I; r++)                             
+  for (size_t r = 0; r < MAT_DIM_I; r++)
     for (size_t c = 0; c < MAT_DIM_J; c++) {
       // Scale element
       full_t scaled = ACC_SCALE(full[r][c], scale);
@@ -99,17 +103,51 @@ void full_matscale(full_t full[MAT_DIM_I][MAT_DIM_J], elem_t out[MAT_DIM_I][MAT_
       out[r][c] = scaled; // TODO should we also saturate when using floats?
 #endif
     }
-} 
+}
 
+static void warmup_matmul(elem_t *A, elem_t *B, elem_t *C) {
+  printf("Warm-up matmul\n");
+  gemmini_flush(custom3, 0);
+  tiled_matmul_auto(custom0, WARMUP_DIM, WARMUP_DIM, WARMUP_DIM,
+                    A, B, NULL, C,
+                    MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
+                    MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
+                    NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
+                    false, false,
+                    false, !FULL_BIAS_WIDTH,
+                    1,
+                    WS);
+  tiled_matmul_auto(custom1, WARMUP_DIM, WARMUP_DIM, WARMUP_DIM,
+                    A, B, NULL, C,
+                    MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
+                    MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
+                    NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
+                    false, false,
+                    false, !FULL_BIAS_WIDTH,
+                    1,
+                    WS);
+  tiled_matmul_auto(custom2, WARMUP_DIM, WARMUP_DIM, WARMUP_DIM,
+                    A, B, NULL, C,
+                    MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
+                    MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
+                    NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
+                    false, false,
+                    false, !FULL_BIAS_WIDTH,
+                    1,
+                    WS);
+  tiled_matmul_auto(custom3, WARMUP_DIM, WARMUP_DIM, WARMUP_DIM,
+                    A, B, NULL, C,
+                    MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
+                    MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
+                    NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
+                    false, false,
+                    false, !FULL_BIAS_WIDTH,
+                    1,
+                    WS);
+  gemmini_fence();
+}
 
-int main() {
-#ifndef BAREMETAL
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-      perror("mlockall failed");
-      exit(1);
-    }
-#endif
-
+static int run_matmul(void) {
 #if PROFILE
     printf("Set profiler address\n");
     static uint64_t P[total_gemmini_num][profile_data_num] row_align(1);
@@ -186,6 +224,9 @@ int main() {
   full_matscale(gold_full, gold, ACC_SCALE_IDENTITY);
 #endif
 #endif
+
+  warmup_matmul((elem_t *)full_A, (elem_t *)full_B, (elem_t *)full_C);
+
   shared_multi_matmul_job_t j0;
   int total_cycles = 0;
   printf("Do Gemmini tiled matmul process\n");
@@ -200,7 +241,7 @@ int main() {
       for (size_t tile_K = 4; tile_K <= 16; ++tile_K) {
         if (tiled_matmul_total_spad_rows(tile_I, tile_J, tile_K) <= max_spad_rows &&
             tiled_matmul_total_acc_rows(tile_I, tile_J) <= max_acc_rows) {
-      
+
           gemmini_flush(custom0, 0);
           gemmini_flush(custom1, 0);
           gemmini_flush(custom2, 0);
@@ -265,7 +306,7 @@ int main() {
             printMatrix_dynamic(full_A, MAT_DIM_I, MAT_DIM_J);
             printf("\n");
 
-            exit(1);
+            return 1;
           }
 #else
           if (!is_equal_dynamic(full_C, gold, MAT_DIM_I, MAT_DIM_J))
@@ -277,7 +318,7 @@ int main() {
             printMatrix_dynamic(gold, MAT_DIM_I, MAT_DIM_J);
             printf("\n");
 
-            exit(1);
+            return 1;
           }
 #endif
           printf("Output matrix came out as expected\n");
@@ -317,5 +358,43 @@ int main() {
   }
 #endif
 
-  exit(0);
+  return 0;
+}
+
+#ifndef BAREMETAL
+static void *matmul_thread(void *arg) {
+  (void)arg;
+  int cpu_id = sched_getcpu();
+  printf("entered matmul thread - cpu_id: %d\n", cpu_id);
+  int rc = run_matmul();
+  return (void *)(intptr_t)rc;
+}
+#endif
+
+int main() {
+#ifndef BAREMETAL
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+      perror("mlockall failed");
+      exit(1);
+    }
+
+    printf("create threading\n");
+    pthread_t thread;
+    pthread_attr_t attr;
+    cpu_set_t cpuset;
+
+    pthread_attr_init(&attr);
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
+    pthread_create(&thread, &attr, matmul_thread, NULL);
+
+    void *thread_ret = NULL;
+    pthread_join(thread, &thread_ret);
+    pthread_attr_destroy(&attr);
+
+    return (int)(intptr_t)thread_ret;
+#else
+    return run_matmul();
+#endif
 }

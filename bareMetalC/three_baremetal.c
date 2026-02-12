@@ -15,11 +15,11 @@
 #define profile_data_num 30
 
 #define MULTI true
-#define gemmini_configuration 15
+#define gemmini_configuration 7
 
-#define MAT_DIM_I 64
-#define MAT_DIM_J 64
-#define MAT_DIM_K 64
+#define MAT_DIM_I 256
+#define MAT_DIM_J 256
+#define MAT_DIM_K 256
 #define RAND rand()
 #define FAST true
 #define NO_BIAS true
@@ -195,9 +195,9 @@ int main() {
   const size_t max_spad_rows = sp_addr_range / 2;
   const size_t max_acc_rows = acc_addr_range / 2;
 
-  for (size_t tile_I = 4; tile_I <= 16; ++tile_I) {
+  for (size_t tile_I = 3; tile_I <= 16; ++tile_I) {
     for (size_t tile_J = 1; tile_J <= 16; ++tile_J) {
-      for (size_t tile_K = 4; tile_K <= 16; ++tile_K) {
+      for (size_t tile_K = 3; tile_K <= 16; ++tile_K) {
         if (tiled_matmul_total_spad_rows(tile_I, tile_J, tile_K) <= max_spad_rows &&
             tiled_matmul_total_acc_rows(tile_I, tile_J) <= max_acc_rows) {
       

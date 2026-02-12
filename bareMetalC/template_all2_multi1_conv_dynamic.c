@@ -507,8 +507,8 @@ int main()
   size_t acc_start_addr = 0;
   j0.tile_id = tile_id_m0;
   j0.gemmini_list = gemmini_configuration_m0;
-  j0.sp_addr_start = spad_start_addr;
-  j0.acc_addr_start = acc_start_addr;
+  // j0.sp_addr_start = spad_start_addr;
+  // j0.acc_addr_start = acc_start_addr;
   j0.sp_addr_range = TOTAL_SPAD_ROWS / 4;
   j0.acc_addr_range = TOTAL_ACC_ROWS / 4;
   j0.batch_size = BATCH_SIZE_m0;
@@ -548,8 +548,8 @@ int main()
 
   j1.tile_id = tile_id_m1;
   j1.gemmini_list = gemmini_configuration_m1;
-  j1.sp_addr_start = spad_start_addr;
-  j1.acc_addr_start = acc_start_addr;
+  // j1.sp_addr_start = spad_start_addr;
+  // j1.acc_addr_start = acc_start_addr;
   j1.sp_addr_range = TOTAL_SPAD_ROWS - spad_start_addr;
   j1.acc_addr_range = TOTAL_ACC_ROWS - acc_start_addr;
   j1.batch_size = BATCH_SIZE_m1;

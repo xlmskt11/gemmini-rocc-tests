@@ -432,10 +432,10 @@ static void counter_reset(int custom_num) {
   }
 
 // made
-#define shared_gemmini_loop_ws(custom_num, group_list, group_id, sp_addr_start, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
+#define shared_gemmini_loop_ws(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
   { \
-      ROCC_INSTRUCTION_RS1_RS2(custom_num, acc_addr_start, sp_addr_start, k_LOOP_WS_CONFIG_SPADDR) \
-      ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 36) | ((uint64_t)(group_id) << 32) | (uint64_t)(laddrK_offset) << 16 | (uint64_t)(laddrI_offset), ((uint64_t)(mv_K) << 32) | ((uint64_t)(mv_pad_K) << 16) | (uint64_t)(ex_I), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
+      ROCC_INSTRUCTION_RS1_RS2(custom_num, acc_addr_start, ((uint64_t)(sp_addr_end) << 16) | (uint64_t)(sp_addr_start), k_LOOP_WS_CONFIG_SPADDR) \
+      ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 48) | ((uint64_t)(group_id) << 32) | (uint64_t)(laddrK_offset) << 16 | (uint64_t)(laddrI_offset), ((uint64_t)(mv_K) << 32) | ((uint64_t)(mv_pad_K) << 16) | (uint64_t)(ex_I), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
@@ -466,10 +466,10 @@ static void counter_reset(int custom_num) {
   }
 
 // made
-#define shared_gemmini_loop_conv_ws(custom_num, group_list, group_id, sp_addr_start, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_dim, in_channels, out_channels, out_dim, pool_out_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, activation, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw) \
+#define shared_gemmini_loop_conv_ws(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_dim, in_channels, out_channels, out_dim, pool_out_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, activation, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw) \
   { \
-    ROCC_INSTRUCTION_RS1_RS2(custom_num, acc_addr_start, sp_addr_start, k_LOOP_CONV_WS_CONFIG_SPADDR) \
-    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 36) | ((uint64_t)(group_id) << 32) | (uint64_t)(laddrkchs_offset) << 16 | (uint64_t)(laddrochs_offset), ((uint64_t)(mv_kchs) << 16) | (uint64_t)(ex_ochs), k_LOOP_CONV_WS_CONFIG_MV_BOUNDS_1) \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, acc_addr_start, ((uint64_t)(sp_addr_end) << 16) | sp_addr_start, k_LOOP_CONV_WS_CONFIG_SPADDR) \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 48) | ((uint64_t)(group_id) << 32) | (uint64_t)(laddrkchs_offset) << 16 | (uint64_t)(laddrochs_offset), ((uint64_t)(mv_kchs) << 16) | (uint64_t)(ex_ochs), k_LOOP_CONV_WS_CONFIG_MV_BOUNDS_1) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(out_channels) << 48) | ((uint64_t)(in_channels) << 32) | ((uint64_t)(in_dim) << 16) | (uint64_t)(batch_size), \
       ((uint64_t)(padding) << 48) | ((uint64_t)(stride) << 32) | ((uint64_t)(pool_out_dim) << 16) | (uint64_t)(out_dim), k_LOOP_CONV_WS_CONFIG_1) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(kernel_dim) << 48) | ((uint64_t)(pool_size) << 32) | ((uint64_t)(pool_stride) << 16) | (uint64_t)(pool_padding), \
@@ -1888,7 +1888,7 @@ static void multi_sp_tiled_matmul_ws(int gemmini_num, const size_t added_gemmini
 
 // made
 static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int group_id,
-                                            size_t sp_addr_start, size_t acc_addr_start,
+                                            size_t sp_addr_start, size_t sp_addr_end, size_t acc_addr_start,
                                             const elem_t *A, const elem_t *B, const void *D, void *C,
                                             scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
                                             size_t ex_I, size_t mv_K, size_t mv_pad_K, size_t laddrI_offset, size_t laddrK_offset,
@@ -2074,7 +2074,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
   switch (custom_num)
   {
   case 0:
-    shared_gemmini_loop_ws(custom0, group_list, group_id, sp_addr_start, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom0, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -2082,7 +2082,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
                            act);
     break;
   case 1:
-    shared_gemmini_loop_ws(custom1, group_list, group_id, sp_addr_start, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom1, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -2090,7 +2090,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
                            act);
     break;
   case 2:
-    shared_gemmini_loop_ws(custom2, group_list, group_id, sp_addr_start, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom2, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -2098,7 +2098,7 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
                            act);
     break;
   case 3:
-    shared_gemmini_loop_ws(custom3, group_list, group_id, sp_addr_start, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
+    shared_gemmini_loop_ws(custom3, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
                            A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
@@ -3988,6 +3988,17 @@ static size_t tiled_matmul_total_spad_rows(size_t I, size_t J, size_t K) {
   return (I * K + K * J) * DIM;
 }
 
+// made
+static size_t tiled_matmul_A_spad_rows(size_t I, size_t J, size_t K)
+{
+  return (I * K) * DIM;
+}
+
+// made
+static size_t tiled_matmul_B_spad_rows(size_t I, size_t J, size_t K)
+{
+  return (K * J) * DIM;
+}
 
 static size_t tiled_matmul_total_acc_rows(size_t I, size_t J) {
   return (I * J) * DIM;
@@ -5171,7 +5182,7 @@ static void sp_tiled_conv(
 // made
 static void shared_multi_sp_tiled_conv(
     int custom_num, int group_list, int group_id,
-    size_t sp_addr_start, size_t acc_addr_start,
+    size_t sp_addr_start, size_t sp_addr_end, size_t acc_addr_start,
     int batch_size, int in_row_dim, int in_col_dim, int in_channels,
     int out_channels, int out_row_dim, int out_col_dim,
     int pool_out_row_dim, int pool_out_col_dim,
@@ -5277,16 +5288,16 @@ static void shared_multi_sp_tiled_conv(
     switch (custom_num)
     {
     case 0:
-      shared_gemmini_loop_conv_ws(custom0, group_list, group_id, sp_addr_start, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
+      shared_gemmini_loop_conv_ws(custom0, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
       break;
     case 1:
-      shared_gemmini_loop_conv_ws(custom1, group_list, group_id, sp_addr_start, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
+      shared_gemmini_loop_conv_ws(custom1, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
       break;
     case 2:
-      shared_gemmini_loop_conv_ws(custom2, group_list, group_id, sp_addr_start, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
+      shared_gemmini_loop_conv_ws(custom2, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
       break;
     case 3:
-      shared_gemmini_loop_conv_ws(custom3, group_list, group_id, sp_addr_start, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
+      shared_gemmini_loop_conv_ws(custom3, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
       break;
     }
 
@@ -5611,7 +5622,7 @@ static void shared_multi_sp_tiled_conv(
 // made
 static void shared_multi_sp_tiled_conv_test(
     int custom_num, int group_list, int group_id,
-    size_t sp_addr_start, size_t acc_addr_start,
+    size_t sp_addr_start, size_t sp_addr_end, size_t acc_addr_start,
     int batch_size, int in_row_dim, int in_col_dim, int in_channels,
     int out_channels, int out_row_dim, int out_col_dim,
     int pool_out_row_dim, int pool_out_col_dim,
@@ -5717,16 +5728,16 @@ static void shared_multi_sp_tiled_conv_test(
     switch (custom_num)
     {
     case 0:
-      shared_gemmini_loop_conv_ws(custom0, group_list, group_id, sp_addr_start, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
+      shared_gemmini_loop_conv_ws(custom0, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
       break;
     case 1:
-      shared_gemmini_loop_conv_ws(custom1, group_list, group_id, sp_addr_start, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
+      shared_gemmini_loop_conv_ws(custom1, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
       break;
     case 2:
-      shared_gemmini_loop_conv_ws(custom2, group_list, group_id, sp_addr_start, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
+      shared_gemmini_loop_conv_ws(custom2, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
       break;
     case 3:
-      shared_gemmini_loop_conv_ws(custom3, group_list, group_id, sp_addr_start, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
+      shared_gemmini_loop_conv_ws(custom3, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_row_dim, in_channels, out_channels, out_row_dim, pool_out_row_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, act, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw);
       break;
     }
 
@@ -6118,6 +6129,49 @@ static int tiled_conv_total_spad_rows(bool acc,
     const int C_rows = out_channels_per_bank * batches * orows * ocols;
 
     return acc ? C_rows : A_rows + B_rows;
+}
+
+// made
+static int tiled_conv_total_spad_rows_test(bool acc, bool A, bool B,
+        int stride,
+        int input_dilation,
+        int kernel_dilation,
+        bool downsample,
+        bool trans_weight_0132,
+        bool trans_input_3120,
+        int batches,
+        int porows, int pocols, int ochs,
+        int krows, int kcols, int kchs,
+        int pool_size, int pool_stride) {
+
+    const int orows = porows * pool_stride + pool_size - 1;
+    const int ocols = pocols * pool_stride + pool_size - 1;
+
+    const int krows_dilated = krows + (kernel_dilation - 1)*(krows - 1);
+    const int kcols_dilated = kcols + (kernel_dilation - 1)*(kcols - 1);
+
+    int irows = orows * stride + krows_dilated - 1; // - 2 * padding;
+    int icols = ocols * stride + kcols_dilated - 1; // - 2 * padding;
+    const int ichs = kchs;
+
+    irows = irows / input_dilation + (irows % input_dilation != 0);
+    icols = icols / input_dilation + (icols % input_dilation != 0);
+
+    const int in_channels_per_bank = ichs / DIM + (ichs % DIM != 0);
+    const int out_channels_per_bank = ochs / DIM + (ochs % DIM != 0);
+    const int batches_per_bank = batches / DIM + (batches % DIM != 0);
+
+    const int A_rows = trans_input_3120 ?
+        (batches_per_bank * ichs * (irows >> downsample) * (icols >> downsample)) :
+        (in_channels_per_bank * batches * (irows >> downsample) * (icols >> downsample));
+
+    const int B_rows = trans_weight_0132 ?
+      in_channels_per_bank * kcols * krows * ochs :
+      out_channels_per_bank * kcols * krows * kchs;
+
+    const int C_rows = out_channels_per_bank * batches * orows * ocols;
+
+    return acc ? C_rows : A ? A_rows : B ? B_rows : A_rows + B_rows;
 }
 
 
@@ -7046,7 +7100,7 @@ static void shared_multi_tiled_conv(
 
                 const int t = (inner_call_counter & 1);
                 const size_t local_sp_addr_start = (t == 0) ? sp_addr_start : sp_addr_start + BANK_NUM * BANK_ROWS / 2;
-                // const size_t sp_addr_end = (t == 0) ? sp_addr_start + BANK_NUM * BANK_ROWS / 2 : sp_addr_start + BANK_NUM * BANK_ROWS - 1;
+                const size_t local_sp_addr_end = (t == 0) ? sp_addr_start + BANK_NUM * BANK_ROWS / 2 : sp_addr_start + BANK_NUM * BANK_ROWS - 1;
                 const size_t local_acc_addr_start = lastK_toggle ? acc_addr_start : acc_addr_start + ACC_ROWS / 2;
 
                 int activated_gemmini_num = 0;
@@ -7068,7 +7122,7 @@ static void shared_multi_tiled_conv(
 
                     shared_multi_sp_tiled_conv(
                         i, group_list, tile_id << 1 | t,
-                        local_sp_addr_start, local_acc_addr_start,
+                        local_sp_addr_start, local_sp_addr_end, local_acc_addr_start,
                         batch_size, in_row_dim, in_col_dim, in_channels,
                         out_channels, out_row_dim, out_col_dim,
                         pool_out_row_dim, pool_out_col_dim,
@@ -7495,7 +7549,7 @@ static void shared_multi_tiled_conv_test(
 
                 const int t = (inner_call_counter & 1);
                 const size_t local_sp_addr_start = (t == 0) ? sp_addr_start : sp_addr_start + sp_addr_range / 2;
-                // const size_t sp_addr_end = (t == 0) ? sp_addr_start + BANK_NUM * BANK_ROWS / 2 : sp_addr_start + BANK_NUM * BANK_ROWS - 1;
+                const size_t local_sp_addr_end = (t == 0) ? sp_addr_start + BANK_NUM * BANK_ROWS / 2 : sp_addr_start + BANK_NUM * BANK_ROWS - 1;
                 const size_t local_acc_addr_start = lastK_toggle ? acc_addr_start : acc_addr_start + acc_addr_range / 2;
 
                 int activated_gemmini_num = 0;
@@ -7519,7 +7573,7 @@ static void shared_multi_tiled_conv_test(
 
                     shared_multi_sp_tiled_conv_test(
                         i, group_list, tile_id << 1 | t,
-                        local_sp_addr_start, local_acc_addr_start,
+                        local_sp_addr_start, local_sp_addr_end, local_acc_addr_start,
                         batch_size, in_row_dim, in_col_dim, in_channels,
                         out_channels, out_row_dim, out_col_dim,
                         pool_out_row_dim, pool_out_col_dim,
@@ -8963,8 +9017,9 @@ typedef struct
   // 입력 인자들
   int gemmini_list;
   int tile_id;
-  size_t sp_addr_start, acc_addr_start;
+  size_t sp_addr_start_stack, sp_addr_end_stack, acc_addr_start_stack;
   size_t sp_addr_range, acc_addr_range;
+  size_t sp_addr_A_stacked, sp_addr_B_stacked, acc_addr_stacked;
   size_t dim_I, dim_J, dim_K;
   const elem_t *A;
   const elem_t *B;
@@ -9003,12 +9058,6 @@ typedef struct
 
 static void shared_multi_choose_tiling_factors_static(shared_multi_matmul_job_t *job, size_t tI_static, size_t tJ_static, size_t tK_static)
 {
-  if (job->sp_addr_start % 2 != 0 || job->acc_addr_start % 2 != 0 ||
-      job->sp_addr_range % 2 != 0 || job->acc_addr_range % 2 != 0)
-  {
-    printf("sp/acc addr_start/range must be even\n");
-    exit(1);
-  }
 
   job->gemmini_num = 0;
   for (int i = 0; i < total_gemmini_num; i++)
@@ -9171,16 +9220,13 @@ static void shared_multi_choose_tiling_factors_static(shared_multi_matmul_job_t 
   job->tile_K = tK_static;
   job->sp_addr_range = tiled_matmul_total_spad_rows(tI_static, tJ_static, tK_static) * 2;
   job->acc_addr_range = tiled_matmul_total_acc_rows(tI_static, tJ_static) * 2;
+  job->sp_addr_A_stacked = tiled_matmul_A_spad_rows(tI_static, tJ_static, tK_static);
+  job->sp_addr_B_stacked = tiled_matmul_B_spad_rows(tI_static, tJ_static, tK_static);
+  job->acc_addr_stacked = tiled_matmul_total_acc_rows(tI_static, tJ_static);
 }
 
 static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
 {
-  if (job->sp_addr_start % 2 != 0 || job->acc_addr_start % 2 != 0 ||
-      job->sp_addr_range % 2 != 0 || job->acc_addr_range % 2 != 0)
-  {
-    printf("sp/acc addr_start/range must be even\n");
-    exit(1);
-  }
 
   job->gemmini_num = 0;
   for (int i = 0; i < total_gemmini_num; i++)
@@ -9343,6 +9389,9 @@ static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
   job->tile_K = tK;
   job->sp_addr_range = tiled_matmul_total_spad_rows(tI, tJ, tK) * 2;
   job->acc_addr_range = tiled_matmul_total_acc_rows(tI, tJ) * 2;
+  job->sp_addr_A_stacked = tiled_matmul_A_spad_rows(tI, tJ, tK);
+  job->sp_addr_B_stacked = tiled_matmul_B_spad_rows(tI, tJ, tK);
+  job->acc_addr_stacked = tiled_matmul_total_acc_rows(tI, tJ);
 }
 
 void shared_multi_tiled_matmul_job_init(shared_multi_matmul_job_t *job)
@@ -9372,7 +9421,7 @@ void shared_multi_tiled_matmul_job_init(shared_multi_matmul_job_t *job)
 
   job->i0 = job->j0 = job->k0 = 0;
   job->inner_call_counter = 0;
-  job->lastK_toggle = 0;
+  job->lastK_toggle = 1;
   job->done = false;
 
   // 여기부터는 기존 outer_test에서 했던 Gemmini config 부분을 그대로 가져옴
@@ -9500,7 +9549,7 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
   const size_t sizeof_C = job->sizeof_C;
 
   void (*inner)(int, int, int,
-                size_t, size_t,
+                size_t, size_t, size_t,
                 const elem_t *, const elem_t *, const void *, void *,
                 scale_t, scale_t, scale_acc_t,
                 size_t, size_t, size_t, size_t, size_t,
@@ -9561,8 +9610,9 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
   const uint8_t weightA = job->weightA;
   const int dataflow = job->dataflow;
 
-  const size_t sp_addr_start = job->sp_addr_start;
-  const size_t acc_addr_start = job->acc_addr_start;
+  const size_t sp_addr_start_stack = job->sp_addr_start_stack;
+  const size_t sp_addr_end_stack = job->sp_addr_end_stack;
+  const size_t acc_addr_start_stack = job->acc_addr_start_stack;
   const size_t sp_addr_range = job->sp_addr_range;
   const size_t acc_addr_range = job->acc_addr_range;
   const int tile_id = job->tile_id;
@@ -9637,8 +9687,9 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
   size_t laddrK_offset = 0;
 
   const int t = (job->inner_call_counter & 1);
-  const size_t local_sp_addr_start = (t == 0) ? sp_addr_start : sp_addr_start + sp_addr_range / 2;
-  const size_t local_acc_addr_start = job->lastK_toggle ? acc_addr_start : acc_addr_start + acc_addr_range / 2;
+  const size_t local_sp_addr_start = (t == 0) ? sp_addr_start_stack : sp_addr_start_stack + BANK_NUM * BANK_ROWS / 2;
+  const size_t local_sp_addr_end = (t == 0) ? BANK_NUM * BANK_ROWS / 2 - sp_addr_end_stack : BANK_NUM * BANK_ROWS - sp_addr_end_stack;
+  const size_t local_acc_addr_start = job->lastK_toggle ? acc_addr_start_stack : acc_addr_start_stack + ACC_ROWS / 2;
 
   int activated_gemmini_num = 0;
   for (int i = 0; i < total_gemmini_num; i++)
@@ -9654,7 +9705,7 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
       size_t this_pad_K = (activated_gemmini_num == ldB_gemmini_num - 1) ? pad_K : 0;
 
       (*inner)(i, group_list, tile_id << 1 | t,
-               local_sp_addr_start, local_acc_addr_start,
+               local_sp_addr_start, local_sp_addr_end, local_acc_addr_start,
                a_local, b_local, (k0 != 0) ? NULL : (void *)d_local, (k0 == K0 - 1) ? (void *)c_local : NULL,
                A_scale_factor, B_scale_factor, D_scale_factor,
                this_I, this_K, this_pad_K, laddrI_offset, laddrK_offset,
@@ -9765,7 +9816,8 @@ typedef struct
   int act;
   acc_scale_t scale;
   int gemmini_list;
-  size_t sp_addr_start, acc_addr_start;
+  size_t sp_addr_start_stack, sp_addr_end_stack, acc_addr_start_stack;
+  size_t sp_addr_A_stacked, sp_addr_B_stacked, acc_addr_stacked;
   size_t sp_addr_range, acc_addr_range;
   int tile_id;
 
@@ -9779,13 +9831,6 @@ typedef struct
 
 static void shared_multi_choose_conv_tiling_factors_static(shared_multi_conv_job_t *job, int batches_static, int porows_static, int pocols_static, int pochs_static, int krows_static, int kcols_static, int kchs_static)
 {
-  if (job->sp_addr_start % 2 != 0 || job->acc_addr_start % 2 != 0 ||
-      job->sp_addr_range % 2 != 0 || job->acc_addr_range % 2 != 0)
-  {
-    printf("sp/acc addr_start/range must be even\n");
-    exit(1);
-  }
-
   job->gemmini_num = 0;
   for (int i = 0; i < total_gemmini_num; i++)
   {
@@ -9996,17 +10041,20 @@ static void shared_multi_choose_conv_tiling_factors_static(shared_multi_conv_job
 
   job->sp_addr_range = spad_rows * 2;
   job->acc_addr_range = acc_rows * 2;
+
+  job->sp_addr_A_stacked = tiled_conv_total_spad_rows_test(false, true, false,
+                                                           job->stride, job->input_dilation, job->kernel_dilation, downsample, job->trans_weight_0132, job->trans_input_3120,
+                                                           batches_static, porows_static, pocols_static, pochs_static, krows_static, kcols_static, kchs_static,
+                                                           pool_size, pool_stride);
+  job->sp_addr_B_stacked = tiled_conv_total_spad_rows_test(false, false, true,
+                                                           job->stride, job->input_dilation, job->kernel_dilation, downsample, job->trans_weight_0132, job->trans_input_3120,
+                                                           batches_static, porows_static, pocols_static, pochs_static, krows_static, kcols_static, kchs_static,
+                                                           pool_size, pool_stride);
+  job->acc_addr_stacked = acc_rows;
 }
 
 static void shared_multi_choose_conv_tiling_factors(shared_multi_conv_job_t *job)
 {
-  if (job->sp_addr_start % 2 != 0 || job->acc_addr_start % 2 != 0 ||
-      job->sp_addr_range % 2 != 0 || job->acc_addr_range % 2 != 0)
-  {
-    printf("sp/acc addr_start/range must be even\n");
-    exit(1);
-  }
-
   job->gemmini_num = 0;
   for (int i = 0; i < total_gemmini_num; i++)
   {
@@ -10217,6 +10265,16 @@ static void shared_multi_choose_conv_tiling_factors(shared_multi_conv_job_t *job
 
   job->sp_addr_range = spad_rows * 2;
   job->acc_addr_range = acc_rows * 2;
+
+  job->sp_addr_A_stacked = tiled_conv_total_spad_rows_test(false, true, false,
+                                                           job->stride, job->input_dilation, job->kernel_dilation, downsample, job->trans_weight_0132, job->trans_input_3120,
+                                                           batches, porows, pocols, pochs, krows, kcols, kchs,
+                                                           pool_size, pool_stride);
+  job->sp_addr_B_stacked = tiled_conv_total_spad_rows_test(false, false, true,
+                                                           job->stride, job->input_dilation, job->kernel_dilation, downsample, job->trans_weight_0132, job->trans_input_3120,
+                                                           batches, porows, pocols, pochs, krows, kcols, kchs,
+                                                           pool_size, pool_stride);
+  job->acc_addr_stacked = acc_rows;
 }
 
 void shared_multi_tiled_conv_job_init(shared_multi_conv_job_t *job)
@@ -10366,7 +10424,7 @@ void shared_multi_tiled_conv_job_init(shared_multi_conv_job_t *job)
 
   job->b = job->porow = job->pocol = job->poch = job->krow = job->kcol = job->kch = 0;
   job->inner_call_counter = 0;
-  job->lastK_toggle = 0;
+  job->lastK_toggle = 1;
   job->done = false;
 }
 
@@ -10423,8 +10481,9 @@ static void shared_multi_tiled_conv_job_step(shared_multi_conv_job_t *job)
 
   int gemmini_list = job->gemmini_list;
   int gemmini_num = job->gemmini_num;
-  size_t sp_addr_start = job->sp_addr_start;
-  size_t acc_addr_start = job->acc_addr_start;
+  size_t sp_addr_start_stack = job->sp_addr_start_stack;
+  size_t sp_addr_end_stack = job->sp_addr_end_stack;
+  size_t acc_addr_start_stack = job->acc_addr_start_stack;
   size_t sp_addr_range = job->sp_addr_range;
   size_t acc_addr_range = job->acc_addr_range;
   int tile_id = job->tile_id;
@@ -10576,9 +10635,9 @@ static void shared_multi_tiled_conv_job_step(shared_multi_conv_job_t *job)
   size_t laddrkchs_offset = 0;
 
   const int t = (job->inner_call_counter & 1);
-  const size_t local_sp_addr_start = (t == 0) ? sp_addr_start : sp_addr_start + sp_addr_range / 2;
-  // const size_t sp_addr_end = (t == 0) ? sp_addr_start + BANK_NUM * BANK_ROWS / 2 : sp_addr_start + BANK_NUM * BANK_ROWS - 1;
-  const size_t local_acc_addr_start = job->lastK_toggle ? acc_addr_start : acc_addr_start + acc_addr_range / 2;
+  const size_t local_sp_addr_start = (t == 0) ? sp_addr_start_stack : sp_addr_start_stack + BANK_NUM * BANK_ROWS / 2;
+  const size_t local_sp_addr_end = (t == 0) ? BANK_NUM * BANK_ROWS / 2 - sp_addr_end_stack : BANK_NUM * BANK_ROWS - sp_addr_end_stack;
+  const size_t local_acc_addr_start = job->lastK_toggle ? acc_addr_start_stack : acc_addr_start_stack + ACC_ROWS / 2;
 
   int activated_gemmini_num = 0;
   for (int i = 0; i < total_gemmini_num; i++)
@@ -10601,7 +10660,7 @@ static void shared_multi_tiled_conv_job_step(shared_multi_conv_job_t *job)
 
       shared_multi_sp_tiled_conv_test(
           i, group_list, tile_id << 1 | t,
-          local_sp_addr_start, local_acc_addr_start,
+          local_sp_addr_start, local_sp_addr_end, local_acc_addr_start,
           batch_size, in_row_dim, in_col_dim, in_channels,
           out_channels, out_row_dim, out_col_dim,
           pool_out_row_dim, pool_out_col_dim,

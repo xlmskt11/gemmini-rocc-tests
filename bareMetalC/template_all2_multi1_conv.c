@@ -350,8 +350,9 @@ int main() {
                         memset(&j0, 0, sizeof(shared_multi_conv_job_t));
                         j0.tile_id = 1;
                         j0.gemmini_list = gemmini_configuration;
-                        j0.sp_addr_start = 0;
-                        j0.acc_addr_start = 0;
+                        j0.sp_addr_start_stack = 0;
+                        j0.sp_addr_end_stack = 0;
+                        j0.acc_addr_start_stack = 0;
                         j0.sp_addr_range = TOTAL_SPAD_ROWS;
                         j0.acc_addr_range = TOTAL_ACC_ROWS;
                         j0.batch_size = BATCH_SIZE;
