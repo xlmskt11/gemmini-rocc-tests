@@ -11,11 +11,11 @@
 #include "include/gemmini_testutils_all.h"
 // #include "include/gemmini_nn.h"
 
-#define PROFILE true
+#define PROFILE false
 #define profile_data_num 5000
 
 #define MULTI true
-#define gemmini_configuration 1
+#define gemmini_configuration 15
 
 #define MAT_DIM_I 128
 #define MAT_DIM_J 128
@@ -195,9 +195,9 @@ int main() {
   const size_t max_spad_rows = sp_addr_range / 2;
   const size_t max_acc_rows = acc_addr_range / 2;
 
-  int tile_I = 1;
-  int tile_J = 1;
-  int tile_K = 1;
+  int tile_I = 4;
+  int tile_J = 4;
+  int tile_K = 4;
 
   memset(&j0, 0, sizeof(shared_multi_matmul_job_t));
   j0.tile_id = 1;
