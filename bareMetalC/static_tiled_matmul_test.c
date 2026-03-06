@@ -17,9 +17,9 @@
 #define MULTI true
 #define gemmini_configuration 15
 
-#define MAT_DIM_I 128
-#define MAT_DIM_J 128
-#define MAT_DIM_K 128
+#define MAT_DIM_I 256
+#define MAT_DIM_J 256
+#define MAT_DIM_K 256
 #define RAND rand()
 #define FAST true
 #define NO_BIAS true
