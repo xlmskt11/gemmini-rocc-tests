@@ -288,7 +288,7 @@ int main() {
                     WS);
 #endif
 
-  // printf("Total Matmul cycle: %d\n", matmul_end - matmul_start);
+  printf("Total Matmul cycle: %d\n", matmul_end - matmul_start);
 
 #if PROFILE
   for (int i = 0; i < total_gemmini_num; i++)
