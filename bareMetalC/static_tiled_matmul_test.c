@@ -190,14 +190,10 @@ int main() {
   int total_cycles = 0;
   printf("Do Gemmini tiled matmul process\n");
 #if MULTI
-  const size_t sp_addr_range = BANK_NUM * BANK_ROWS;
-  const size_t acc_addr_range = ACC_ROWS;
-  const size_t max_spad_rows = sp_addr_range / 2;
-  const size_t max_acc_rows = acc_addr_range / 2;
 
-  int tile_I = 4;
+  int tile_I = 8;
   int tile_J = 4;
-  int tile_K = 4;
+  int tile_K = 8;
 
   memset(&j0, 0, sizeof(shared_multi_matmul_job_t));
   j0.tile_id = 1;
@@ -234,7 +230,7 @@ int main() {
 
   uint64_t matmul_start = read_cycles();
 
-  shared_multi_choose_tiling_factors(&j0);
+  shared_multi_choose_tiling_factors_static(&j0, tile_I, tile_J, tile_K);
   shared_multi_tiled_matmul_job_init(&j0);
   while (!j0.done)
   {
