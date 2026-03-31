@@ -15,6 +15,7 @@ tests = \
 	template_all2_multi1_conv_dynamic \
 	one_baremetal \
 	two_baremetal \
+	static_tiled_conv_test \
 	static_tiled_matmul_test \
 	static_tiled_matmul_test_profile \
 	three_baremetal \
@@ -93,4 +94,3 @@ run-baremetal: $(runs_baremetal)
 	$(RUNNER)$(abs_top_srcdir)/build/bareMetalC/$^
 
 junk += $(tests_baremetal) $(tests_linux) $(tests_pk)
-
