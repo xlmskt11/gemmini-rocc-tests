@@ -78,6 +78,16 @@
 #define OUTPUT_STATIONARY 0
 #define WEIGHT_STATIONARY 1
 
+static inline int gemmini_group_last_member(size_t group_list) {
+  for (int i = total_gemmini_num - 1; i >= 0; --i) {
+    if ((group_list >> i) & 1) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
 #define NO_ACTIVATION 0
 #define RELU 1
 #define LAYERNORM 2
@@ -435,13 +445,15 @@ static void counter_reset(int custom_num) {
 #define shared_gemmini_loop_ws(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
   { \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, acc_addr_start, ((uint64_t)(sp_addr_end) << 16) | (uint64_t)(sp_addr_start), k_LOOP_WS_CONFIG_SPADDR) \
-      ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 48) | ((uint64_t)(group_id) << 32) | (uint64_t)(laddrK_offset) << 16 | (uint64_t)(laddrI_offset), ((uint64_t)(mv_K) << 32) | ((uint64_t)(mv_pad_K) << 16) | (uint64_t)(ex_I), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
+      ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(laddrK_offset) << 16) | (uint64_t)(laddrI_offset), ((uint64_t)(mv_K) << 32) | ((uint64_t)(mv_pad_K) << 16) | (uint64_t)(ex_I), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, D_stride, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC) \
-      ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((B_transpose) << 1) | (A_transpose), k_LOOP_WS) \
+      if ((custom_num) == gemmini_group_last_member(group_list)) { \
+        ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 48) | ((uint64_t)(group_id) << 32) | ((uint64_t)(act) << 8) | ((uint64_t)(low_D) << 2) | ((uint64_t)(full_C) << 1) | (uint64_t)(ex_accumulate), ((uint64_t)(B_transpose) << 1) | (uint64_t)(A_transpose), k_LOOP_WS) \
+      } \
   }
 
 // weight-stationary conv loop
@@ -469,7 +481,7 @@ static void counter_reset(int custom_num) {
 #define shared_gemmini_loop_conv_ws(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_ochs, mv_kchs, laddrochs_offset, laddrkchs_offset, batch_size, in_dim, in_channels, out_channels, out_dim, pool_out_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, activation, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw) \
   { \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, acc_addr_start, ((uint64_t)(sp_addr_end) << 16) | sp_addr_start, k_LOOP_CONV_WS_CONFIG_SPADDR) \
-    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 48) | ((uint64_t)(group_id) << 32) | (uint64_t)(laddrkchs_offset) << 16 | (uint64_t)(laddrochs_offset), ((uint64_t)(mv_kchs) << 16) | (uint64_t)(ex_ochs), k_LOOP_CONV_WS_CONFIG_MV_BOUNDS_1) \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(laddrkchs_offset) << 16) | (uint64_t)(laddrochs_offset), ((uint64_t)(mv_kchs) << 16) | (uint64_t)(ex_ochs), k_LOOP_CONV_WS_CONFIG_MV_BOUNDS_1) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(out_channels) << 48) | ((uint64_t)(in_channels) << 32) | ((uint64_t)(in_dim) << 16) | (uint64_t)(batch_size), \
       ((uint64_t)(padding) << 48) | ((uint64_t)(stride) << 32) | ((uint64_t)(pool_out_dim) << 16) | (uint64_t)(out_dim), k_LOOP_CONV_WS_CONFIG_1) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(kernel_dim) << 48) | ((uint64_t)(pool_size) << 32) | ((uint64_t)(pool_stride) << 16) | (uint64_t)(pool_padding), \
@@ -482,9 +494,11 @@ static void counter_reset(int custom_num) {
       output, k_LOOP_CONV_WS_CONFIG_5) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, bias, \
       input, k_LOOP_CONV_WS_CONFIG_6) \
-    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(max_pixels_per_row) << 8) | ((dw) << 6) | ((trans_input_3120) << 5) | ((trans_weight_0132) << 4) | ((trans_weight_1203) << 3) | ((trans_output_1203) << 2) | ((wrot180) << 1) | (no_bias), \
-      ((activation) << 3)| ((input_dilated) << 2) | ((downsample) << 1) | (no_pool), \
-      k_LOOP_CONV_WS) \
+    if ((custom_num) == gemmini_group_last_member(group_list)) { \
+      ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 48) | ((uint64_t)(group_id) << 32) | ((uint64_t)(max_pixels_per_row) << 8) | ((uint64_t)(dw) << 6) | ((uint64_t)(trans_input_3120) << 5) | ((uint64_t)(trans_weight_0132) << 4) | ((uint64_t)(trans_weight_1203) << 3) | ((uint64_t)(trans_output_1203) << 2) | ((uint64_t)(wrot180) << 1) | (uint64_t)(no_bias), \
+        ((uint64_t)(activation) << 3) | ((uint64_t)(input_dilated) << 2) | ((uint64_t)(downsample) << 1) | (uint64_t)(no_pool), \
+        k_LOOP_CONV_WS) \
+    } \
   }
 
 // Tiling functions
