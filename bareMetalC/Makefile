@@ -17,8 +17,14 @@ tests = \
 	two_baremetal \
 	static_tiled_conv_test \
 	static_tiled_matmul_test \
+	static_tiled_matmul_2group_test \
+	static_tiled_matmul_transpose_test \
 	static_tiled_matmul_test_profile \
 	three_baremetal \
+	static_tiled_matmul_test_2 \
+	llama_shape_test0 \
+	llama_shape_test1 \
+	llama_shape_test2
 
 tests_baremetal = $(tests:=-baremetal)
 

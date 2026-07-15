@@ -22,6 +22,9 @@
 // Counter Definition
 #include "include/gemmini_counter.h"
 
+// Page-packing
+#include "include/gemmini_page_packed.h"
+
 // made
 // #define PRINT_TILE true
 #define TOTAL_SPAD_ROWS (BANK_NUM * BANK_ROWS)
@@ -33,6 +36,131 @@
 #define custom1 1
 #define custom2 2
 #define custom3 3
+
+static size_t tiled_matmul_total_spad_rows(size_t I, size_t J, size_t K)
+{
+  return (I * K + K * J) * DIM;
+}
+
+// made
+static size_t tiled_matmul_A_spad_rows(size_t I, size_t J, size_t K)
+{
+  return (I * K) * DIM;
+}
+
+// made
+static size_t tiled_matmul_B_spad_rows(size_t I, size_t J, size_t K)
+{
+  return (K * J) * DIM;
+}
+
+static size_t tiled_matmul_total_acc_rows(size_t I, size_t J)
+{
+  return (I * J) * DIM;
+}
+
+static bool tiled_matmul_split_spad_rows_fit(size_t I, size_t J, size_t K, size_t max_operand_spad_rows)
+{
+  return tiled_matmul_A_spad_rows(I, J, K) <= max_operand_spad_rows &&
+         tiled_matmul_B_spad_rows(I, J, K) <= max_operand_spad_rows;
+}
+
+static size_t tiled_matmul_tile_balance_score(size_t I, size_t J, size_t K)
+{
+  const size_t max_IJ = I > J ? I : J;
+  const size_t max_IJK = max_IJ > K ? max_IJ : K;
+  const size_t min_IJ = I < J ? I : J;
+  const size_t min_IJK = min_IJ < K ? min_IJ : K;
+  return max_IJK - min_IJK;
+}
+
+static size_t tiled_matmul_tile_tail_gap(size_t total_tiles, size_t tile)
+{
+  const size_t remainder = total_tiles % tile;
+  return remainder == 0 ? 0 : tile - remainder;
+}
+
+static size_t tiled_matmul_tile_tail_score(size_t total_I, size_t total_J, size_t total_K,
+                                           size_t I, size_t J, size_t K)
+{
+  return tiled_matmul_tile_tail_gap(total_I, I) +
+         tiled_matmul_tile_tail_gap(total_J, J) +
+         tiled_matmul_tile_tail_gap(total_K, K);
+}
+
+static inline uint64_t gemmini_timing_read_cycles(void)
+{
+  uint64_t cycles;
+  asm volatile("rdcycle %0" : "=r"(cycles));
+  return cycles;
+}
+
+static uint64_t gemmini_matmul_start_cycles[total_gemmini_num];
+
+static inline void gemmini_reset_matmul_start_cycles(void)
+{
+  for (int i = 0; i < total_gemmini_num; ++i)
+  {
+    gemmini_matmul_start_cycles[i] = 0;
+  }
+}
+
+static inline void gemmini_record_matmul_start_cycle(int custom_num)
+{
+  if (custom_num >= 0 && custom_num < total_gemmini_num &&
+      gemmini_matmul_start_cycles[custom_num] == 0)
+  {
+    gemmini_matmul_start_cycles[custom_num] = gemmini_timing_read_cycles();
+  }
+}
+
+static inline uint64_t gemmini_get_matmul_start_cycle(void)
+{
+  uint64_t first_cycle = 0;
+
+  for (int i = 0; i < total_gemmini_num; ++i)
+  {
+    const uint64_t cycle = gemmini_matmul_start_cycles[i];
+    if (cycle != 0 && (first_cycle == 0 || cycle < first_cycle))
+    {
+      first_cycle = cycle;
+    }
+  }
+
+  return first_cycle;
+}
+
+static bool multi_tiled_matmul_auto1_override_enabled = false;
+static size_t multi_tiled_matmul_auto1_override_tile_I = 0;
+static size_t multi_tiled_matmul_auto1_override_tile_J = 0;
+static size_t multi_tiled_matmul_auto1_override_tile_K = 0;
+
+static void multi_tiled_matmul_auto1_set_tiling_override(bool enabled,
+                                                         size_t tile_I,
+                                                         size_t tile_J,
+                                                         size_t tile_K)
+{
+  multi_tiled_matmul_auto1_override_enabled = enabled;
+  multi_tiled_matmul_auto1_override_tile_I = tile_I;
+  multi_tiled_matmul_auto1_override_tile_J = tile_J;
+  multi_tiled_matmul_auto1_override_tile_K = tile_K;
+}
+
+static bool tiled_matmul_auto_override_enabled = false;
+static size_t tiled_matmul_auto_override_tile_I = 0;
+static size_t tiled_matmul_auto_override_tile_J = 0;
+static size_t tiled_matmul_auto_override_tile_K = 0;
+
+static void tiled_matmul_auto_set_tiling_override(bool enabled,
+                                                  size_t tile_I,
+                                                  size_t tile_J,
+                                                  size_t tile_K)
+{
+  tiled_matmul_auto_override_enabled = enabled;
+  tiled_matmul_auto_override_tile_I = tile_I;
+  tiled_matmul_auto_override_tile_J = tile_J;
+  tiled_matmul_auto_override_tile_K = tile_K;
+}
 
 #define k_CONFIG 0
 #define k_MVIN2 1
@@ -56,6 +184,7 @@
 #define k_LOOP_WS_CONFIG_SPADDR 25
 #define k_LOOP_CONV_WS_CONFIG_MV_BOUNDS_1 26
 #define k_LOOP_CONV_WS_CONFIG_SPADDR 27
+#define k_LOOP_WS_CONFIG_PAGE_OFFSETS 28
 
 #define k_MVIN3 14
 
@@ -223,6 +352,13 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) \
   ROCC_INSTRUCTION_0_R_R(x, rs1, rs2, funct)
 
+#define GEMMINI_ISSUE_LOOP_WS(custom_num, rs1, rs2)            \
+  do                                                           \
+  {                                                            \
+    gemmini_record_matmul_start_cycle(custom_num);             \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, rs1, rs2, k_LOOP_WS); \
+  } while (0)
+
 // mvin and mvout
 #define gemmini_extended_mvin(custom_num, dram_addr, spad_addr, cols, rows) \
   ROCC_INSTRUCTION_RS1_RS2(custom_num, dram_addr, ((uint64_t)(rows) << (ADDR_LEN + 16)) | ((uint64_t)(cols) << ADDR_LEN) | (spad_addr), k_MVIN)
@@ -333,7 +469,7 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
 
 // Read counter
 static uint32_t counter_read(int custom_num, size_t index) {
-  uint32_t config_reg = (index & 0x7) << 4;
+  uint32_t config_reg = (index & 0xf) << 4;
   uint32_t res;
   switch (custom_num)
   {
@@ -360,7 +496,7 @@ static void counter_configure(int custom_num, size_t index, size_t counter_code)
     counter_code -= INCREMENTAL_COUNTERS;
   }
 
-  uint32_t config_reg = (index & 0x7) << 4 | 0x8 | (counter_code & 0x3f) << 12 | non_incremental << 31;
+  uint32_t config_reg = (index & 0xf) << 4 | 0x8 | (counter_code & 0x3f) << 12 | non_incremental << 31;
   uint32_t placeholder;
   switch (custom_num)
   {
@@ -432,13 +568,32 @@ static void counter_reset(int custom_num) {
 // weight-stationary matmul loop
 #define gemmini_loop_ws(custom_num, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
   { \
-    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(0) << 36) | ((uint64_t)(0) << 32) | (uint64_t)(0) << 16 | (uint64_t)(0), ((uint64_t)(K) << 32) | ((uint64_t)(pad_K) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, D_stride, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((B_transpose) << 1) | (A_transpose), k_LOOP_WS) \
+  }
+
+#define GEMMINI_PACK_PAGE_BLOCK_OFFSETS(first_row, first_col, second_row, second_col) \
+  ((((uint64_t)(first_row) & 0xffff) << 0) |                                          \
+   (((uint64_t)(first_col) & 0xffff) << 16) |                                         \
+   (((uint64_t)(second_row) & 0xffff) << 32) |                                        \
+   (((uint64_t)(second_col) & 0xffff) << 48))
+
+#define gemmini_loop_ws_with_page_offsets(custom_num, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, A_row_offset, A_col_offset, B_row_offset, B_col_offset, D_row_offset, D_col_offset, C_row_offset, C_col_offset) \
+  {                                                                                                                                                                                                                                                                                                                  \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS)                                                                                                          \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB)                                                                                                                                                                                                                                            \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC)                                                                                                                                                                                                                                            \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB)                                                                                                                                                                                                                            \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, D_stride, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC)                                                                                                                                                                                                                            \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num,                                                                                                                                                                                                                                                                             \
+                             GEMMINI_PACK_PAGE_BLOCK_OFFSETS(A_row_offset, A_col_offset, B_row_offset, B_col_offset),                                                                                                                                                                                                \
+                             GEMMINI_PACK_PAGE_BLOCK_OFFSETS(D_row_offset, D_col_offset, C_row_offset, C_col_offset),                                                                                                                                                                                                \
+                             k_LOOP_WS_CONFIG_PAGE_OFFSETS)                                                                                                                                                                                                                                                          \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((B_transpose) << 1) | (A_transpose), k_LOOP_WS);                                                                                                                                              \
   }
 
 // made
@@ -456,10 +611,28 @@ static void counter_reset(int custom_num) {
       } \
   }
 
+#define shared_gemmini_loop_ws_with_page_offsets(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, A_row_offset, A_col_offset, B_row_offset, B_col_offset, D_row_offset, D_col_offset, C_row_offset, C_col_offset) \
+  {                                                                                                                                                                                                                                                                                                                                                                                                                                               \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, acc_addr_start, ((uint64_t)(sp_addr_end) << 16) | (uint64_t)(sp_addr_start), k_LOOP_WS_CONFIG_SPADDR)                                                                                                                                                                                                                                                                                                    \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(laddrK_offset) << 16) | (uint64_t)(laddrI_offset), ((uint64_t)(mv_K) << 32) | ((uint64_t)(mv_pad_K) << 16) | (uint64_t)(ex_I), k_LOOP_WS_CONFIG_MV_BOUNDS_1)                                                                                                                                                                                                                                 \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS)                                                                                                                                                                                                                                       \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB)                                                                                                                                                                                                                                                                                                                                                                         \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC)                                                                                                                                                                                                                                                                                                                                                                         \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB)                                                                                                                                                                                                                                                                                                                                                         \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, D_stride, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC)                                                                                                                                                                                                                                                                                                                                                         \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num,                                                                                                                                                                                                                                                                                                                                                                                                          \
+                             GEMMINI_PACK_PAGE_BLOCK_OFFSETS(A_row_offset, A_col_offset, B_row_offset, B_col_offset),                                                                                                                                                                                                                                                                                                                             \
+                             GEMMINI_PACK_PAGE_BLOCK_OFFSETS(D_row_offset, D_col_offset, C_row_offset, C_col_offset),                                                                                                                                                                                                                                                                                                                             \
+                             k_LOOP_WS_CONFIG_PAGE_OFFSETS)                                                                                                                                                                                                                                                                                                                                                                                       \
+    if ((custom_num) == gemmini_group_last_member(group_list))                                                                                                                                                                                                                                                                                                                                                                                    \
+    {                                                                                                                                                                                                                                                                                                                                                                                                                                             \
+      ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 48) | ((uint64_t)(group_id) << 32) | ((uint64_t)(act) << 8) | ((uint64_t)(low_D) << 2) | ((uint64_t)(full_C) << 1) | (uint64_t)(ex_accumulate), ((uint64_t)(B_transpose) << 1) | (uint64_t)(A_transpose), k_LOOP_WS);                                                                                                                                                                  \
+    }                                                                                                                                                                                                                                                                                                                                                                                                                                             \
+  }
+
 // weight-stationary conv loop
 #define gemmini_loop_conv_ws(custom_num, batch_size, in_dim, in_channels, out_channels, out_dim, pool_out_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, activation, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw) \
   { \
-    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(0) << 36) | ((uint64_t)(0) << 32) | (uint64_t)(0) << 16 | (uint64_t)(0), ((uint64_t)(kchs) << 16) | (uint64_t)(pochs), k_LOOP_CONV_WS_CONFIG_MV_BOUNDS_1) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(out_channels) << 48) | ((uint64_t)(in_channels) << 32) | ((uint64_t)(in_dim) << 16) | (uint64_t)(batch_size), \
       ((uint64_t)(padding) << 48) | ((uint64_t)(stride) << 32) | ((uint64_t)(pool_out_dim) << 16) | (uint64_t)(out_dim), k_LOOP_CONV_WS_CONFIG_1) \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(kernel_dim) << 48) | ((uint64_t)(pool_size) << 32) | ((uint64_t)(pool_stride) << 16) | (uint64_t)(pool_padding), \
@@ -1526,6 +1699,59 @@ static void sp_tiled_matmul_ws(int custom_num, const elem_t * A, const elem_t * 
   }
 }
 
+static void sp_tiled_matmul_ws_with_page_offsets(
+    int custom_num, const elem_t *A, const elem_t *B, const void *D, void *C,
+    scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+    size_t I, size_t J, size_t K, size_t pad_I, size_t pad_J, size_t pad_K,
+    size_t A_row_stride, size_t B_row_stride, size_t D_row_stride, size_t C_row_stride,
+    bool a_transpose, bool b_transpose, bool full_C, bool low_D,
+    bool no_bias, bool repeating_bias, int act,
+    size_t A_row_offset, size_t A_col_offset,
+    size_t B_row_offset, size_t B_col_offset,
+    size_t D_row_offset, size_t D_col_offset,
+    size_t C_row_offset, size_t C_col_offset)
+{
+  (void)A_scale_factor;
+  (void)B_scale_factor;
+  (void)D_scale_factor;
+
+  switch (custom_num)
+  {
+  case 0:
+    gemmini_loop_ws_with_page_offsets(custom0, I, J, K, pad_I, pad_J, pad_K,
+                                      A, B, no_bias ? NULL : D, C,
+                                      A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                                      a_transpose, b_transpose, full_C, low_D, !no_bias || D == NULL, act,
+                                      A_row_offset, A_col_offset, B_row_offset, B_col_offset,
+                                      D_row_offset, D_col_offset, C_row_offset, C_col_offset);
+    break;
+  case 1:
+    gemmini_loop_ws_with_page_offsets(custom1, I, J, K, pad_I, pad_J, pad_K,
+                                      A, B, no_bias ? NULL : D, C,
+                                      A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                                      a_transpose, b_transpose, full_C, low_D, !no_bias || D == NULL, act,
+                                      A_row_offset, A_col_offset, B_row_offset, B_col_offset,
+                                      D_row_offset, D_col_offset, C_row_offset, C_col_offset);
+    break;
+  case 2:
+    gemmini_loop_ws_with_page_offsets(custom2, I, J, K, pad_I, pad_J, pad_K,
+                                      A, B, no_bias ? NULL : D, C,
+                                      A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                                      a_transpose, b_transpose, full_C, low_D, !no_bias || D == NULL, act,
+                                      A_row_offset, A_col_offset, B_row_offset, B_col_offset,
+                                      D_row_offset, D_col_offset, C_row_offset, C_col_offset);
+    break;
+  case 3:
+    gemmini_loop_ws_with_page_offsets(custom3, I, J, K, pad_I, pad_J, pad_K,
+                                      A, B, no_bias ? NULL : D, C,
+                                      A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                                      a_transpose, b_transpose, full_C, low_D, !no_bias || D == NULL, act,
+                                      A_row_offset, A_col_offset, B_row_offset, B_col_offset,
+                                      D_row_offset, D_col_offset, C_row_offset, C_col_offset);
+    break;
+  }
+}
+
 // made
 static void multi_sp_tiled_matmul_ws(int gemmini_num, const size_t added_gemmini_num,
                                      size_t i0, const size_t I0, const size_t divided_dim_I, const size_t added_divided_dim_I,
@@ -1723,180 +1949,196 @@ static void multi_sp_tiled_matmul_ws(int gemmini_num, const size_t added_gemmini
   const elem_t *custom1_A_local = custom0_A_local + A_row_stride * ((added_gemmini_num > 0) ? added_divided_dim_I : divided_dim_I);
   const elem_t *custom2_A_local = custom1_A_local + A_row_stride * ((added_gemmini_num > 1) ? added_divided_dim_I : divided_dim_I);
   const elem_t *custom3_A_local = custom2_A_local + A_row_stride * ((added_gemmini_num > 2) ? added_divided_dim_I : divided_dim_I);
+  const size_t sizeof_D = low_D ? sizeof(elem_t) : sizeof(acc_t);
+  const size_t sizeof_C = full_C ? sizeof(acc_t) : sizeof(elem_t);
+  const void *custom0_D_local = D;
+  const void *custom1_D_local = D;
+  const void *custom2_D_local = D;
+  const void *custom3_D_local = D;
   void *custom0_C_local = C;
   void *custom1_C_local = C;
   void *custom2_C_local = C;
   void *custom3_C_local = C;
-  if (C != NULL) {
-    custom1_C_local = (void *)((int8_t *)custom0_C_local + C_row_stride * ((added_gemmini_num > 0) ? added_divided_dim_I : divided_dim_I));
-    custom2_C_local = (void *)((int8_t *)custom1_C_local + C_row_stride * ((added_gemmini_num > 1) ? added_divided_dim_I : divided_dim_I));
-    custom3_C_local = (void *)((int8_t *)custom2_C_local + C_row_stride * ((added_gemmini_num > 2) ? added_divided_dim_I : divided_dim_I));
+  if (D != NULL && !no_bias && !repeating_bias)
+  {
+    custom1_D_local = (const void *)((const int8_t *)custom0_D_local + D_row_stride * ((added_gemmini_num > 0) ? added_divided_dim_I : divided_dim_I) * sizeof_D);
+    custom2_D_local = (const void *)((const int8_t *)custom1_D_local + D_row_stride * ((added_gemmini_num > 1) ? added_divided_dim_I : divided_dim_I) * sizeof_D);
+    custom3_D_local = (const void *)((const int8_t *)custom2_D_local + D_row_stride * ((added_gemmini_num > 2) ? added_divided_dim_I : divided_dim_I) * sizeof_D);
+  }
+  if (C != NULL)
+  {
+    custom1_C_local = (void *)((int8_t *)custom0_C_local + C_row_stride * ((added_gemmini_num > 0) ? added_divided_dim_I : divided_dim_I) * sizeof_C);
+    custom2_C_local = (void *)((int8_t *)custom1_C_local + C_row_stride * ((added_gemmini_num > 1) ? added_divided_dim_I : divided_dim_I) * sizeof_C);
+    custom3_C_local = (void *)((int8_t *)custom2_C_local + C_row_stride * ((added_gemmini_num > 2) ? added_divided_dim_I : divided_dim_I) * sizeof_C);
   }
 
   switch (gemmini_num)
   {
-    case 1:
-      if (i0 < I0) {
+  case 1:
+    if (i0 < I0)
+    {
+      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : custom0_D_local, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+      GEMMINI_ISSUE_LOOP_WS(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+    }
+    break;
+  case 2:
+    if (i0 < I0)
+    {
+      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom1_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom1_I), k_LOOP_WS_CONFIG_BOUNDS);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, custom1_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : custom0_D_local, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : custom1_D_local, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+      GEMMINI_ISSUE_LOOP_WS(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+      GEMMINI_ISSUE_LOOP_WS(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+    }
+    else if (added_gemmini_num > 0)
+    {
+      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : custom0_D_local, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+      GEMMINI_ISSUE_LOOP_WS(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+    }
+    break;
+  case 3:
+    if (i0 < I0)
+    {
+      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom1_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom1_I), k_LOOP_WS_CONFIG_BOUNDS);
+      ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom2_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom2_I), k_LOOP_WS_CONFIG_BOUNDS);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, custom1_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom2, custom2_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : custom0_D_local, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : custom1_D_local, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom2, no_bias ? NULL : custom2_D_local, custom2_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom2, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom2, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+      GEMMINI_ISSUE_LOOP_WS(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+      GEMMINI_ISSUE_LOOP_WS(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+      GEMMINI_ISSUE_LOOP_WS(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+    }
+    else
+    {
+      switch (added_gemmini_num)
+      {
+      case 1:
         ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
         ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : custom0_D_local, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
         ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
         ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-      }
-      break;
-    case 2:
-      if (i0 < I0)
-      {
+        GEMMINI_ISSUE_LOOP_WS(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+        break;
+      case 2:
         ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
         ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom1_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom1_I), k_LOOP_WS_CONFIG_BOUNDS);
         ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
         ROCC_INSTRUCTION_RS1_RS2(custom1, custom1_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : custom0_D_local, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+        ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : custom1_D_local, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
         ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
         ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
         ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
         ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+        GEMMINI_ISSUE_LOOP_WS(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+        GEMMINI_ISSUE_LOOP_WS(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+        break;
       }
-      else if (added_gemmini_num > 0) {
+    }
+    break;
+  case 4:
+    if (i0 < I0)
+    {
+      ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom1_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom1_I), k_LOOP_WS_CONFIG_BOUNDS);
+      ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom2_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom2_I), k_LOOP_WS_CONFIG_BOUNDS);
+      ROCC_INSTRUCTION_RS1_RS2(custom3, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom3_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom3_I), k_LOOP_WS_CONFIG_BOUNDS);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, custom1_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom2, custom2_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom3, custom3_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : custom0_D_local, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : custom1_D_local, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom2, no_bias ? NULL : custom2_D_local, custom2_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom3, no_bias ? NULL : custom3_D_local, custom3_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom2, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom3, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+      ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom2, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+      ROCC_INSTRUCTION_RS1_RS2(custom3, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+      GEMMINI_ISSUE_LOOP_WS(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+      GEMMINI_ISSUE_LOOP_WS(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+      GEMMINI_ISSUE_LOOP_WS(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+      GEMMINI_ISSUE_LOOP_WS(custom3, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+    }
+    else
+    {
+      switch (added_gemmini_num)
+      {
+      case 1:
         ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
         ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : custom0_D_local, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
         ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
         ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-      }
-      break;
-    case 3:
-      if (i0 < I0)
-      {
+        GEMMINI_ISSUE_LOOP_WS(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+        break;
+      case 2:
+        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
+        ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom1_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom1_I), k_LOOP_WS_CONFIG_BOUNDS);
+        ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+        ROCC_INSTRUCTION_RS1_RS2(custom1, custom1_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
+        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : custom0_D_local, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+        ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : custom1_D_local, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+        ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+        ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
+        ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+        ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
+        GEMMINI_ISSUE_LOOP_WS(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+        GEMMINI_ISSUE_LOOP_WS(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+        break;
+      case 3:
         ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
         ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom1_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom1_I), k_LOOP_WS_CONFIG_BOUNDS);
         ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom2_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom2_I), k_LOOP_WS_CONFIG_BOUNDS);
         ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
         ROCC_INSTRUCTION_RS1_RS2(custom1, custom1_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
         ROCC_INSTRUCTION_RS1_RS2(custom2, custom2_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, no_bias ? NULL : D, custom2_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : custom0_D_local, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+        ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : custom1_D_local, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
+        ROCC_INSTRUCTION_RS1_RS2(custom2, no_bias ? NULL : custom2_D_local, custom2_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
         ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
         ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
         ROCC_INSTRUCTION_RS1_RS2(custom2, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
         ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
         ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
         ROCC_INSTRUCTION_RS1_RS2(custom2, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+        GEMMINI_ISSUE_LOOP_WS(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+        GEMMINI_ISSUE_LOOP_WS(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+        GEMMINI_ISSUE_LOOP_WS(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose));
+        break;
       }
-      else
-      {
-        switch (added_gemmini_num) {
-          case 1:
-            ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
-            ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-            ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-            ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-            ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-            ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-            break;
-          case 2:
-            ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
-            ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom1_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom1_I), k_LOOP_WS_CONFIG_BOUNDS);
-            ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-            ROCC_INSTRUCTION_RS1_RS2(custom1, custom1_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-            ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-            ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-            ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-            ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-            ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-            ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-            ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-            ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-            break;
-        }
-      }
-      break;
-    case 4:
-      if (i0 < I0)
-      {
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom1_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom1_I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom2_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom2_I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom3, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom3_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom3_I), k_LOOP_WS_CONFIG_BOUNDS);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, custom1_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, custom2_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom3, custom3_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, no_bias ? NULL : D, custom2_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom3, no_bias ? NULL : D, custom3_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom3, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom3, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-        ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-        ROCC_INSTRUCTION_RS1_RS2(custom3, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-      }
-      else
-      {
-        switch (added_gemmini_num)
-        {
-        case 1:
-          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          break;
-        case 2:
-          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom1_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom1_I), k_LOOP_WS_CONFIG_BOUNDS);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, custom1_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          break;
-        case 3:
-          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom0_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom0_I), k_LOOP_WS_CONFIG_BOUNDS);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom1_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom1_I), k_LOOP_WS_CONFIG_BOUNDS);
-          ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(custom2_pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(custom2_I), k_LOOP_WS_CONFIG_BOUNDS);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, custom0_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, custom1_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom2, custom2_A_local, B, k_LOOP_WS_CONFIG_ADDRS_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, no_bias ? NULL : D, custom0_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, no_bias ? NULL : D, custom1_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom2, no_bias ? NULL : D, custom2_C_local, k_LOOP_WS_CONFIG_ADDRS_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom2, A_row_stride, B_row_stride, k_LOOP_WS_CONFIG_STRIDES_AB);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom2, repeating_bias ? 0 : D_row_stride, C_row_stride, k_LOOP_WS_CONFIG_STRIDES_DC);
-          ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || D == NULL), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-          break;
-        }
-      }
-      break;
+    }
+    break;
   }
 }
 
@@ -2120,6 +2362,54 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
                            act);
     break;
   }
+}
+
+static void shared_multi_sp_tiled_matmul_ws_with_page_offsets(
+    int custom_num, int group_list, int group_id,
+    size_t sp_addr_start, size_t sp_addr_end, size_t acc_addr_start,
+    const elem_t *A, const elem_t *B, const void *D, void *C,
+    scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+    size_t ex_I, size_t mv_K, size_t mv_pad_K, size_t laddrI_offset, size_t laddrK_offset,
+    size_t I, size_t J, size_t K, size_t pad_I, size_t pad_J, size_t pad_K,
+    size_t A_row_stride, size_t B_row_stride, size_t D_row_stride, size_t C_row_stride,
+    bool a_transpose, bool b_transpose, bool full_C, bool low_D,
+    bool no_bias, bool repeating_bias, int act,
+    size_t A_row_offset, size_t A_col_offset,
+    size_t B_row_offset, size_t B_col_offset,
+    size_t D_row_offset, size_t D_col_offset,
+    size_t C_row_offset, size_t C_col_offset)
+{
+  (void)A_scale_factor;
+  (void)B_scale_factor;
+  (void)D_scale_factor;
+
+#define SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_CASE(custom)                                                                 \
+  shared_gemmini_loop_ws_with_page_offsets(custom, group_list, group_id,                                                \
+                                           sp_addr_start, sp_addr_end, acc_addr_start,                                  \
+                                           ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,                          \
+                                           I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,                   \
+                                           A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride, \
+                                           a_transpose, b_transpose, full_C, low_D, !no_bias || D == NULL, act,         \
+                                           A_row_offset, A_col_offset, B_row_offset, B_col_offset,                      \
+                                           D_row_offset, D_col_offset, C_row_offset, C_col_offset)
+
+  switch (custom_num)
+  {
+  case 0:
+    SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_CASE(custom0);
+    break;
+  case 1:
+    SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_CASE(custom1);
+    break;
+  case 2:
+    SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_CASE(custom2);
+    break;
+  case 3:
+    SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_CASE(custom3);
+    break;
+  }
+
+#undef SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_CASE
 }
 
 static void tiled_matmul_outer(int custom_num, size_t dim_I, size_t dim_J, size_t dim_K,
@@ -3607,7 +3897,7 @@ static void multi_tiled_matmul1(int gemmini_num,
     exit(1);
   }
 
-  const size_t divided_dim_I = dim_I / gemmini_num + 1;
+  const size_t divided_dim_I = dim_I / gemmini_num + (dim_I % gemmini_num != 0);
 
   const size_t dim_I_padded = (divided_dim_I / DIM + (divided_dim_I % DIM != 0)) * DIM;
   const size_t dim_J_padded = (dim_J / DIM + (dim_J % DIM != 0)) * DIM;
@@ -3998,26 +4288,6 @@ static void shared_multi_tiled_matmul_test(int gemmini_list, int tile_id,
   }
 }
 
-static size_t tiled_matmul_total_spad_rows(size_t I, size_t J, size_t K) {
-  return (I * K + K * J) * DIM;
-}
-
-// made
-static size_t tiled_matmul_A_spad_rows(size_t I, size_t J, size_t K)
-{
-  return (I * K) * DIM;
-}
-
-// made
-static size_t tiled_matmul_B_spad_rows(size_t I, size_t J, size_t K)
-{
-  return (K * J) * DIM;
-}
-
-static size_t tiled_matmul_total_acc_rows(size_t I, size_t J) {
-  return (I * J) * DIM;
-}
-
 // This function runs a tiled matrix multiplication, with automatically
 // calculated tiling factors
 static void tiled_matmul_auto(int custom_num, size_t dim_I, size_t dim_J, size_t dim_K,
@@ -4173,7 +4443,7 @@ static void multi_tiled_matmul_auto1(int gemmini_num,
     exit(1);
   }
 
-  const size_t divided_dim_I = dim_I / gemmini_num + 1;
+  const size_t divided_dim_I = dim_I / gemmini_num + (dim_I % gemmini_num != 0);
 
   const size_t dim_I_padded = (divided_dim_I / DIM + (divided_dim_I % DIM != 0)) * DIM;
   const size_t dim_J_padded = (dim_J / DIM + (dim_J % DIM != 0)) * DIM;
@@ -4235,6 +4505,13 @@ static void multi_tiled_matmul_auto1(int gemmini_num,
 
     if (!increased)
       break;
+  }
+
+  if (multi_tiled_matmul_auto1_override_enabled)
+  {
+    tile_I = multi_tiled_matmul_auto1_override_tile_I;
+    tile_J = multi_tiled_matmul_auto1_override_tile_J;
+    tile_K = multi_tiled_matmul_auto1_override_tile_K;
   }
 
 #ifdef PRINT_TILE
@@ -9270,6 +9547,7 @@ static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
   const bool double_buffered = job->dataflow == WEIGHT_STATIONARY;
 
   const size_t max_spad_rows = double_buffered ? job->sp_addr_range / 2 : job->sp_addr_range;
+  const size_t max_operand_spad_rows = max_spad_rows / 2;
   const size_t max_acc_rows = double_buffered ? job->acc_addr_range / 2 : job->acc_addr_range;
 
   size_t tI, tJ, tK;
@@ -9301,45 +9579,73 @@ static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
     tK = max_k < max_tile_k ? max_k : max_tile_k;
   }
 
-  if (tI >= job->gemmini_num)
+  const size_t max_i_tiles = job->dim_I_padded / DIM;
+  const size_t max_j_tiles = job->dim_J_padded / DIM;
+  const size_t max_k_tiles = job->dim_K_padded / DIM;
+  const size_t min_i_tiles = 1;
+  const size_t min_k_tiles = 1;
+  const size_t preferred_min_i_tiles = job->gemmini_num <= max_i_tiles ? job->gemmini_num : max_i_tiles;
+  const size_t preferred_min_k_tiles = job->gemmini_num <= max_k_tiles ? job->gemmini_num : max_k_tiles;
+
+  if (tI < preferred_min_i_tiles)
   {
-    if (tI % job->gemmini_num != 0)
-    {
-      tI = (tI / job->gemmini_num) * job->gemmini_num;
-    }
+    tI = preferred_min_i_tiles;
   }
-  else
+  else if (tI >= job->gemmini_num && tI % job->gemmini_num != 0)
   {
-    if (job->gemmini_num * DIM <= job->dim_I_padded)
-    {
-      tI = job->gemmini_num;
-    }
+    tI = (tI / job->gemmini_num) * job->gemmini_num;
   }
 
-  if (tK >= job->gemmini_num)
+  if (tK < preferred_min_k_tiles)
   {
-    if (tK % job->gemmini_num != 0)
-    {
-      tK = (tK / job->gemmini_num) * job->gemmini_num;
-    }
-  }
-  else
-  {
-    if (job->gemmini_num * DIM <= job->dim_K_padded)
-    {
-      tK = job->gemmini_num;
-    }
+    tK = preferred_min_k_tiles;
   }
 
   while (true)
   {
     bool decreased = false;
 
-    if ((tiled_matmul_total_spad_rows(tI, tJ, tK) > max_spad_rows ||
+    if ((tiled_matmul_B_spad_rows(tI, tJ, tK) > max_operand_spad_rows ||
          tiled_matmul_total_acc_rows(tI, tJ) > max_acc_rows) &&
         tJ > 1)
     {
       tJ--;
+      decreased = true;
+    }
+
+    // Prefer the gemmini_num lower bounds, then fall back to 1 if capacity still cannot fit.
+    if (!decreased &&
+        !tiled_matmul_split_spad_rows_fit(tI, tJ, tK, max_operand_spad_rows) &&
+        tK > preferred_min_k_tiles)
+    {
+      tK--;
+      decreased = true;
+    }
+
+    if (!decreased &&
+        (tiled_matmul_A_spad_rows(tI, tJ, tK) > max_operand_spad_rows ||
+         tiled_matmul_total_acc_rows(tI, tJ) > max_acc_rows) &&
+        tI > preferred_min_i_tiles)
+    {
+      const size_t next_tI = tI > job->gemmini_num ? tI - job->gemmini_num : preferred_min_i_tiles;
+      tI = next_tI >= preferred_min_i_tiles ? next_tI : preferred_min_i_tiles;
+      decreased = true;
+    }
+
+    if (!decreased &&
+        !tiled_matmul_split_spad_rows_fit(tI, tJ, tK, max_operand_spad_rows) &&
+        tK > min_k_tiles)
+    {
+      tK--;
+      decreased = true;
+    }
+
+    if (!decreased &&
+        (tiled_matmul_A_spad_rows(tI, tJ, tK) > max_operand_spad_rows ||
+         tiled_matmul_total_acc_rows(tI, tJ) > max_acc_rows) &&
+        tI > min_i_tiles)
+    {
+      tI--;
       decreased = true;
     }
 
@@ -9351,32 +9657,77 @@ static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
   while (true)
   {
     bool increased = false;
+    size_t best_tI = tI;
+    size_t best_tJ = tJ;
+    size_t best_tK = tK;
+    size_t best_score = 0;
+    size_t best_tail_score = 0;
+    size_t best_sum = 0;
 
-    if (tiled_matmul_total_spad_rows(tI, tJ + 1, tK) <= max_spad_rows &&
+    if (tiled_matmul_split_spad_rows_fit(tI, tJ + 1, tK, max_operand_spad_rows) &&
         tiled_matmul_total_acc_rows(tI, tJ + 1) <= max_acc_rows &&
         (tJ + 1) * DIM <= job->dim_J_padded)
     {
-      tJ++;
+      best_tJ = tJ + 1;
+      best_score = tiled_matmul_tile_balance_score(best_tI, best_tJ, best_tK);
+      best_tail_score = tiled_matmul_tile_tail_score(max_i_tiles, max_j_tiles, max_k_tiles,
+                                                     best_tI, best_tJ, best_tK);
+      best_sum = best_tI + best_tJ + best_tK;
       increased = true;
     }
 
-    if (tiled_matmul_total_spad_rows(tI + job->gemmini_num, tJ, tK) <= max_spad_rows &&
-        tiled_matmul_total_acc_rows(tI + job->gemmini_num, tJ) <= max_acc_rows &&
-        (tI + job->gemmini_num) * DIM <= job->dim_I_padded)
+    const size_t next_tI = tI < preferred_min_i_tiles ? tI + 1 : tI + job->gemmini_num;
+    if (tiled_matmul_split_spad_rows_fit(next_tI, tJ, tK, max_operand_spad_rows) &&
+        tiled_matmul_total_acc_rows(next_tI, tJ) <= max_acc_rows &&
+        next_tI * DIM <= job->dim_I_padded)
     {
-      tI = tI + job->gemmini_num;
+      const size_t score = tiled_matmul_tile_balance_score(next_tI, tJ, tK);
+      const size_t tail_score = tiled_matmul_tile_tail_score(max_i_tiles, max_j_tiles, max_k_tiles,
+                                                             next_tI, tJ, tK);
+      const size_t sum = next_tI + tJ + tK;
+      if (!increased ||
+          score < best_score ||
+          (score == best_score && tail_score < best_tail_score) ||
+          (score == best_score && tail_score == best_tail_score && sum < best_sum))
+      {
+        best_tI = next_tI;
+        best_tJ = tJ;
+        best_tK = tK;
+        best_score = score;
+        best_tail_score = tail_score;
+        best_sum = sum;
+      }
       increased = true;
     }
 
-    if (tiled_matmul_total_spad_rows(tI, tJ, tK + job->gemmini_num) <= max_spad_rows &&
-        (tK + job->gemmini_num) * DIM <= job->dim_K_padded)
+    if (tiled_matmul_split_spad_rows_fit(tI, tJ, tK + 1, max_operand_spad_rows) &&
+        (tK + 1) * DIM <= job->dim_K_padded)
     {
-      tK = tK + job->gemmini_num;
+      const size_t score = tiled_matmul_tile_balance_score(tI, tJ, tK + 1);
+      const size_t tail_score = tiled_matmul_tile_tail_score(max_i_tiles, max_j_tiles, max_k_tiles,
+                                                             tI, tJ, tK + 1);
+      const size_t sum = tI + tJ + tK + 1;
+      if (!increased ||
+          score < best_score ||
+          (score == best_score && tail_score < best_tail_score) ||
+          (score == best_score && tail_score == best_tail_score && sum < best_sum))
+      {
+        best_tI = tI;
+        best_tJ = tJ;
+        best_tK = tK + 1;
+        best_score = score;
+        best_tail_score = tail_score;
+        best_sum = sum;
+      }
       increased = true;
     }
 
     if (!increased)
       break;
+
+    tI = best_tI;
+    tJ = best_tJ;
+    tK = best_tK;
   }
 
 #ifdef PRINT_TILE
@@ -9438,6 +9789,11 @@ void shared_multi_tiled_matmul_job_init(shared_multi_matmul_job_t *job)
   job->lastK_toggle = 1;
   job->done = false;
 
+  const size_t config_stride_A = gemmini_page_packed_a_dma_stride_bytes(job->stride_A);
+  const size_t config_stride_B = gemmini_page_packed_b_dma_stride_bytes(job->stride_B);
+  const size_t config_stride_D = gemmini_page_packed_acc_dma_stride_bytes(job->stride_D, job->sizeof_D);
+  const size_t config_stride_C = gemmini_page_packed_acc_dma_stride_bytes(job->stride_C, job->sizeof_C);
+
   // 여기부터는 기존 outer_test에서 했던 Gemmini config 부분을 그대로 가져옴
   for (int i = 0; i < total_gemmini_num; i++)
   {
@@ -9447,31 +9803,31 @@ void shared_multi_tiled_matmul_job_init(shared_multi_matmul_job_t *job)
       {
       case 3:
         gemmini_extended_config_ex(custom3, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
-        gemmini_extended_config_st(custom3, job->stride_C * job->sizeof_C, job->act & 3, job->scale);
-        gemmini_extended3_config_ld(custom3, job->stride_A * sizeof(elem_t), job->A_scale_factor, false, 0);
-        gemmini_extended3_config_ld(custom3, job->stride_B * sizeof(elem_t), job->B_scale_factor, false, 1);
-        gemmini_extended3_config_ld(custom3, job->repeating_bias ? 0 : (job->stride_D * job->sizeof_D), job->D_scale_factor, job->low_D, 2);
+        gemmini_extended_config_st(custom3, config_stride_C, job->act & 3, job->scale);
+        gemmini_extended3_config_ld(custom3, config_stride_A, job->A_scale_factor, false, 0);
+        gemmini_extended3_config_ld(custom3, config_stride_B, job->B_scale_factor, false, 1);
+        gemmini_extended3_config_ld(custom3, job->repeating_bias ? 0 : config_stride_D, job->D_scale_factor, job->low_D, 2);
         break;
       case 2:
         gemmini_extended_config_ex(custom2, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
-        gemmini_extended_config_st(custom2, job->stride_C * job->sizeof_C, job->act & 3, job->scale);
-        gemmini_extended3_config_ld(custom2, job->stride_A * sizeof(elem_t), job->A_scale_factor, false, 0);
-        gemmini_extended3_config_ld(custom2, job->stride_B * sizeof(elem_t), job->B_scale_factor, false, 1);
-        gemmini_extended3_config_ld(custom2, job->repeating_bias ? 0 : (job->stride_D * job->sizeof_D), job->D_scale_factor, job->low_D, 2);
+        gemmini_extended_config_st(custom2, config_stride_C, job->act & 3, job->scale);
+        gemmini_extended3_config_ld(custom2, config_stride_A, job->A_scale_factor, false, 0);
+        gemmini_extended3_config_ld(custom2, config_stride_B, job->B_scale_factor, false, 1);
+        gemmini_extended3_config_ld(custom2, job->repeating_bias ? 0 : config_stride_D, job->D_scale_factor, job->low_D, 2);
         break;
       case 1:
         gemmini_extended_config_ex(custom1, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
-        gemmini_extended_config_st(custom1, job->stride_C * job->sizeof_C, job->act & 3, job->scale);
-        gemmini_extended3_config_ld(custom1, job->stride_A * sizeof(elem_t), job->A_scale_factor, false, 0);
-        gemmini_extended3_config_ld(custom1, job->stride_B * sizeof(elem_t), job->B_scale_factor, false, 1);
-        gemmini_extended3_config_ld(custom1, job->repeating_bias ? 0 : (job->stride_D * job->sizeof_D), job->D_scale_factor, job->low_D, 2);
+        gemmini_extended_config_st(custom1, config_stride_C, job->act & 3, job->scale);
+        gemmini_extended3_config_ld(custom1, config_stride_A, job->A_scale_factor, false, 0);
+        gemmini_extended3_config_ld(custom1, config_stride_B, job->B_scale_factor, false, 1);
+        gemmini_extended3_config_ld(custom1, job->repeating_bias ? 0 : config_stride_D, job->D_scale_factor, job->low_D, 2);
         break;
       case 0:
         gemmini_extended_config_ex(custom0, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
-        gemmini_extended_config_st(custom0, job->stride_C * job->sizeof_C, job->act & 3, job->scale);
-        gemmini_extended3_config_ld(custom0, job->stride_A * sizeof(elem_t), job->A_scale_factor, false, 0);
-        gemmini_extended3_config_ld(custom0, job->stride_B * sizeof(elem_t), job->B_scale_factor, false, 1);
-        gemmini_extended3_config_ld(custom0, job->repeating_bias ? 0 : (job->stride_D * job->sizeof_D), job->D_scale_factor, job->low_D, 2);
+        gemmini_extended_config_st(custom0, config_stride_C, job->act & 3, job->scale);
+        gemmini_extended3_config_ld(custom0, config_stride_A, job->A_scale_factor, false, 0);
+        gemmini_extended3_config_ld(custom0, config_stride_B, job->B_scale_factor, false, 1);
+        gemmini_extended3_config_ld(custom0, job->repeating_bias ? 0 : config_stride_D, job->D_scale_factor, job->low_D, 2);
         break;
       }
     }
@@ -9609,6 +9965,19 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
   const size_t stride_D = job->stride_D;
   const size_t stride_C = job->stride_C;
 
+  const bool page_packed_A = gemmini_page_packed_stride_is_packed(stride_A);
+  const bool page_packed_B = gemmini_page_packed_stride_is_packed(stride_B);
+  const bool page_packed_D = gemmini_page_packed_stride_is_packed(stride_D);
+  const bool page_packed_C = gemmini_page_packed_stride_is_packed(stride_C);
+  const bool page_packed_A_active = page_packed_A && !job->a_transpose;
+  const bool page_packed_B_active = page_packed_B && !job->b_transpose;
+  const bool use_page_offsets =
+      page_packed_A_active || page_packed_B_active || page_packed_D || page_packed_C;
+  const size_t plain_stride_A = gemmini_page_packed_stride_payload(stride_A);
+  const size_t plain_stride_B = gemmini_page_packed_stride_payload(stride_B);
+  const size_t plain_stride_D = gemmini_page_packed_stride_payload(stride_D);
+  const size_t plain_stride_C = gemmini_page_packed_stride_payload(stride_C);
+
   const scale_t A_scale_factor = job->A_scale_factor;
   const scale_t B_scale_factor = job->B_scale_factor;
   const scale_acc_t D_scale_factor = job->D_scale_factor;
@@ -9639,12 +10008,18 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
   }
   else
   {
-    size_t bias_row = repeating_bias ? 0 : i0 * tile_I * DIM;
-    pre = (int8_t *)D + (bias_row * stride_D + j0 * tile_J * DIM) * sizeof_D;
+    const size_t bias_i_block = repeating_bias ? 0 : i0 * tile_I;
+    pre = page_packed_D
+              ? D
+              : (const void *)((const int8_t *)D +
+                               ((bias_i_block * DIM) * plain_stride_D + j0 * tile_J * DIM) * sizeof_D);
   }
 
   void *out = (k0 == K0 - 1)
-                  ? (int8_t *)C + (i0 * tile_I * DIM * stride_C + j0 * tile_J * DIM) * sizeof_C
+                  ? (page_packed_C
+                         ? C
+                         : (void *)((int8_t *)C +
+                                    (i0 * tile_I * DIM * plain_stride_C + j0 * tile_J * DIM) * sizeof_C))
                   : NULL;
 
   const size_t I = i0 < I0 - 1 ? tile_I : last_I;
@@ -9655,11 +10030,15 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
   const size_t pad_J = j0 == J0 - 1 ? padding_J : 0;
   const size_t pad_K = k0 == K0 - 1 ? padding_K : 0;
 
-  const elem_t *a = a_transpose ? (A + k0 * tile_K * DIM * stride_A + i0 * tile_I * DIM)
-                                : (A + i0 * tile_I * DIM * stride_A + k0 * tile_K * DIM);
+  const elem_t *a = page_packed_A_active
+                        ? A
+                        : (a_transpose ? (A + k0 * tile_K * DIM * plain_stride_A + i0 * tile_I * DIM)
+                                       : (A + i0 * tile_I * DIM * plain_stride_A + k0 * tile_K * DIM));
 
-  const elem_t *b = b_transpose ? (B + j0 * tile_J * DIM * stride_B + k0 * tile_K * DIM)
-                                : (B + k0 * tile_K * DIM * stride_B + j0 * tile_J * DIM);
+  const elem_t *b = page_packed_B_active
+                        ? B
+                        : (b_transpose ? (B + j0 * tile_J * DIM * plain_stride_B + k0 * tile_K * DIM)
+                                       : (B + k0 * tile_K * DIM * plain_stride_B + j0 * tile_J * DIM));
 
   // group_list 계산
   int using_gemmini_num = job->gemmini_num;
@@ -9718,28 +10097,68 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
       int ldB_gemmini_num = (using_gemmini_num < K) ? using_gemmini_num : K;
       size_t this_pad_K = (activated_gemmini_num == ldB_gemmini_num - 1) ? pad_K : 0;
 
-      (*inner)(i, group_list, tile_id << 1 | t,
-               local_sp_addr_start, local_sp_addr_end, local_acc_addr_start,
-               a_local, b_local, (k0 != 0) ? NULL : (void *)d_local, (k0 == K0 - 1) ? (void *)c_local : NULL,
-               A_scale_factor, B_scale_factor, D_scale_factor,
-               this_I, this_K, this_pad_K, laddrI_offset, laddrK_offset,
-               I, J, K,
-               this_pad_I, pad_J, pad_K,
-               stride_A, stride_B, stride_D, stride_C,
-               a_transpose, b_transpose,
-               full_C, low_D,
-               no_bias, repeating_bias,
-               act);
+      if (dataflow == WEIGHT_STATIONARY && use_page_offsets)
+      {
+        const size_t A_row_offset = i0 * tile_I;
+        const size_t A_col_offset = k0 * tile_K;
+        const size_t B_row_offset = k0 * tile_K;
+        const size_t B_col_offset = j0 * tile_J;
+        const size_t D_row_offset = repeating_bias ? 0 : A_row_offset;
+        const size_t D_col_offset = B_col_offset;
+        const size_t C_row_offset = A_row_offset;
+        const size_t C_col_offset = B_col_offset;
+
+        shared_multi_sp_tiled_matmul_ws_with_page_offsets(
+            i, group_list, tile_id << 1 | t,
+            local_sp_addr_start, local_sp_addr_end, local_acc_addr_start,
+            a_local, b_local, (k0 != 0) ? NULL : (void *)d_local,
+            (k0 == K0 - 1) ? (void *)c_local : NULL,
+            A_scale_factor, B_scale_factor, D_scale_factor,
+            this_I, this_K, this_pad_K, laddrI_offset, laddrK_offset,
+            I, J, K, this_pad_I, pad_J, pad_K,
+            stride_A, stride_B, stride_D, stride_C,
+            a_transpose, b_transpose, full_C, low_D,
+            no_bias, repeating_bias, act,
+            A_row_offset, A_col_offset, B_row_offset, B_col_offset,
+            D_row_offset, D_col_offset, C_row_offset, C_col_offset);
+      }
+      else
+      {
+        (*inner)(i, group_list, tile_id << 1 | t,
+                 local_sp_addr_start, local_sp_addr_end, local_acc_addr_start,
+                 a_local, b_local, (k0 != 0) ? NULL : (void *)d_local, (k0 == K0 - 1) ? (void *)c_local : NULL,
+                 A_scale_factor, B_scale_factor, D_scale_factor,
+                 this_I, this_K, this_pad_K, laddrI_offset, laddrK_offset,
+                 I, J, K,
+                 this_pad_I, pad_J, pad_K,
+                 stride_A, stride_B, stride_D, stride_C,
+                 a_transpose, b_transpose,
+                 full_C, low_D,
+                 no_bias, repeating_bias,
+                 act);
+      }
 
       laddrI_offset += this_I;
       laddrK_offset += this_K;
 
-      size_t local_stride_A = a_transpose ? 1 : stride_A;
-      a_local += local_stride_A * DIM * this_I;
-      size_t local_stride_B = b_transpose ? 1 : stride_B;
-      b_local += local_stride_B * DIM * this_K;
-      c_local += stride_C * DIM * this_I * sizeof_C;
-      d_local += stride_D * DIM * this_I * sizeof_D;
+      if (!page_packed_A_active)
+      {
+        size_t local_stride_A = a_transpose ? 1 : plain_stride_A;
+        a_local += local_stride_A * DIM * this_I;
+      }
+      if (!page_packed_B_active)
+      {
+        size_t local_stride_B = b_transpose ? 1 : plain_stride_B;
+        b_local += local_stride_B * DIM * this_K;
+      }
+      if (!page_packed_C)
+      {
+        c_local += plain_stride_C * DIM * this_I * sizeof_C;
+      }
+      if (!page_packed_D)
+      {
+        d_local += plain_stride_D * DIM * this_I * sizeof_D;
+      }
 
       activated_gemmini_num++;
     }
@@ -9795,6 +10214,1012 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
     }
   }
 }
+
+// // made
+// #ifndef SHARED_MULTI_MAX_CHUNKS
+// #define SHARED_MULTI_MAX_CHUNKS 256
+// #endif
+
+// #ifndef SHARED_MULTI_EDGE_MIN_PERCENT
+// #define SHARED_MULTI_EDGE_MIN_PERCENT 75
+// #endif
+
+// typedef struct
+// {
+//   size_t tile_I;
+//   size_t tile_J;
+//   size_t tile_K;
+// } shared_multi_tile_template_t;
+
+// typedef struct
+// {
+//   // 입력 인자들
+//   int gemmini_list;
+//   int tile_id;
+//   size_t sp_addr_start_stack, sp_addr_end_stack, acc_addr_start_stack;
+//   size_t sp_addr_range, acc_addr_range;
+//   size_t sp_addr_A_stacked, sp_addr_B_stacked, acc_addr_stacked;
+//   size_t dim_I, dim_J, dim_K;
+//   const elem_t *A;
+//   const elem_t *B;
+//   const void *D;
+//   void *C;
+//   size_t stride_A, stride_B, stride_D, stride_C;
+//   scale_t A_scale_factor, B_scale_factor;
+//   scale_acc_t D_scale_factor;
+//   size_t tile_I, tile_J, tile_K;
+//   int act;
+//   acc_scale_t scale, bert_scale;
+//   bool repeating_bias;
+//   bool a_transpose, b_transpose;
+//   bool full_C, low_D;
+//   uint8_t weightA;
+//   int dataflow; // OUTPUT_STATIONARY or WEIGHT_STATIONARY
+
+//   // 파생 값들 (outer_test prologue에서 계산하던 것들)
+//   size_t dim_I_padded, dim_J_padded, dim_K_padded;
+//   size_t I0, J0, K0;
+//   size_t last_I, last_J, last_K;
+
+//   // Variable tiling state. tile_I/J/K are now treated as template/max tile sizes.
+//   // I0/J0/K0 are the number of chunks in each dimension, and *_chunks[idx]
+//   // contains the actual tile size, in DIM-block units, for that iteration.
+//   size_t I_chunks[SHARED_MULTI_MAX_CHUNKS];
+//   size_t J_chunks[SHARED_MULTI_MAX_CHUNKS];
+//   size_t K_chunks[SHARED_MULTI_MAX_CHUNKS];
+//   size_t I_offsets[SHARED_MULTI_MAX_CHUNKS];
+//   size_t J_offsets[SHARED_MULTI_MAX_CHUNKS];
+//   size_t K_offsets[SHARED_MULTI_MAX_CHUNKS];
+//   int edge_rebalance_min_percent;
+//   size_t padding_I, padding_J, padding_K;
+//   bool no_bias;
+//   size_t sizeof_D, sizeof_C;
+//   int gemmini_num;
+
+//   // 루프 진행 상태
+//   size_t i0, j0, k0;
+//   int inner_call_counter;
+//   int lastK_toggle;
+
+//   // 이 job이 끝났는지 여부
+//   bool done;
+
+// } shared_multi_matmul_job_t;
+
+// static size_t shared_multi_ceil_div_size_t(size_t a, size_t b)
+// {
+//   return (a + b - 1) / b;
+// }
+
+// static void shared_multi_fail_if_too_many_chunks(size_t n, const char *name)
+// {
+//   if (n > SHARED_MULTI_MAX_CHUNKS)
+//   {
+//     printf("ERROR: too many %s chunks: %u > SHARED_MULTI_MAX_CHUNKS=%u\n",
+//            name, (unsigned)n, (unsigned)SHARED_MULTI_MAX_CHUNKS);
+//     exit(1);
+//   }
+// }
+
+// static void shared_multi_make_prefix_offsets(const size_t *chunks, size_t n, size_t *offsets)
+// {
+//   size_t off = 0;
+//   for (size_t i = 0; i < n; i++)
+//   {
+//     offsets[i] = off;
+//     off += chunks[i];
+//   }
+// }
+
+// // Build a variable chunk sequence from a max/template tile size.
+// // If the fixed-tail tile is too small, the tail is redistributed over the
+// // last m tiles. Example: B=31, T=5, min_percent=75 -> 5,5,5,4,4,4,4.
+// static void shared_multi_build_balanced_partition(size_t B, size_t T, int min_percent,
+//                                                   const char *name,
+//                                                   size_t *chunks, size_t *offsets,
+//                                                   size_t *num_chunks)
+// {
+//   if (B == 0)
+//   {
+//     *num_chunks = 0;
+//     return;
+//   }
+
+//   if (T == 0)
+//     T = 1;
+
+//   if (T >= B)
+//   {
+//     chunks[0] = B;
+//     *num_chunks = 1;
+//     offsets[0] = 0;
+//     return;
+//   }
+
+//   if (min_percent <= 0 || min_percent > 100)
+//     min_percent = SHARED_MULTI_EDGE_MIN_PERCENT;
+
+//   const size_t n = shared_multi_ceil_div_size_t(B, T);
+//   shared_multi_fail_if_too_many_chunks(n, name);
+
+//   const size_t tail = B % T;
+
+//   if (tail == 0 || tail * 100 >= (size_t)min_percent * T)
+//   {
+//     for (size_t i = 0; i < n - 1; i++)
+//       chunks[i] = T;
+//     chunks[n - 1] = (tail == 0) ? T : tail;
+//     *num_chunks = n;
+//     shared_multi_make_prefix_offsets(chunks, n, offsets);
+//     return;
+//   }
+
+//   // Keep as many full template tiles as possible, but distribute the tiny tail
+//   // across a suffix window so that all suffix chunks are at least min_percent*T.
+//   for (size_t m = 2; m <= n; m++)
+//   {
+//     const size_t prefix = n - m;
+//     const size_t rem = B - prefix * T;
+//     const size_t q = rem / m;
+//     const size_t r = rem % m;
+
+//     if (q == 0)
+//       continue;
+
+//     const size_t min_chunk = q;
+//     const size_t max_chunk = q + (r != 0);
+//     if (max_chunk <= T && min_chunk * 100 >= (size_t)min_percent * T)
+//     {
+//       size_t idx = 0;
+//       for (; idx < prefix; idx++)
+//         chunks[idx] = T;
+//       for (size_t x = 0; x < r; x++, idx++)
+//         chunks[idx] = q + 1;
+//       for (size_t x = r; x < m; x++, idx++)
+//         chunks[idx] = q;
+
+//       *num_chunks = n;
+//       shared_multi_make_prefix_offsets(chunks, n, offsets);
+//       return;
+//     }
+//   }
+
+//   // Fallback: distribute the whole dimension as evenly as possible.
+//   const size_t q = B / n;
+//   const size_t r = B % n;
+//   for (size_t i = 0; i < r; i++)
+//     chunks[i] = q + 1;
+//   for (size_t i = r; i < n; i++)
+//     chunks[i] = q;
+
+//   *num_chunks = n;
+//   shared_multi_make_prefix_offsets(chunks, n, offsets);
+// }
+
+// static uint64_t shared_multi_edge_loss_score(size_t B, size_t T, uint64_t weight)
+// {
+//   if (B == 0 || T == 0)
+//     return 0;
+//   const size_t n = shared_multi_ceil_div_size_t(B, T);
+//   const size_t capacity = n * T;
+//   const size_t waste = capacity - B;
+//   return weight * 1000ull * waste / T;
+// }
+
+// // Select one template from an overlap-good template candidate list.
+// // The list order is used as a small tie-breaker, so put empirically better
+// // full-tile templates earlier.
+// static void shared_multi_choose_tiling_factors_from_templates(
+//     shared_multi_matmul_job_t *job,
+//     const shared_multi_tile_template_t *templates,
+//     size_t num_templates)
+// {
+//   job->gemmini_num = 0;
+//   for (int i = 0; i < total_gemmini_num; i++)
+//   {
+//     if ((job->gemmini_list >> i) & 1)
+//       job->gemmini_num++;
+//   }
+
+//   job->dim_I_padded = (job->dim_I / DIM + (job->dim_I % DIM != 0)) * DIM;
+//   job->dim_J_padded = (job->dim_J / DIM + (job->dim_J % DIM != 0)) * DIM;
+//   job->dim_K_padded = (job->dim_K / DIM + (job->dim_K % DIM != 0)) * DIM;
+
+//   const bool double_buffered = job->dataflow == WEIGHT_STATIONARY;
+//   const size_t max_spad_rows = double_buffered ? job->sp_addr_range / 2 : job->sp_addr_range;
+//   const size_t max_acc_rows = double_buffered ? job->acc_addr_range / 2 : job->acc_addr_range;
+
+//   const size_t BI = job->dim_I_padded / DIM;
+//   const size_t BJ = job->dim_J_padded / DIM;
+//   const size_t BK = job->dim_K_padded / DIM;
+
+//   uint64_t best_score = (uint64_t)-1;
+//   size_t best = 0;
+
+//   for (size_t t = 0; t < num_templates; t++)
+//   {
+//     const size_t TI = templates[t].tile_I;
+//     const size_t TJ = templates[t].tile_J;
+//     const size_t TK = templates[t].tile_K;
+
+//     if (TI == 0 || TJ == 0 || TK == 0)
+//       continue;
+
+//     if (tiled_matmul_total_spad_rows(TI, TJ, TK) > max_spad_rows ||
+//         tiled_matmul_total_acc_rows(TI, TJ) > max_acc_rows)
+//       continue;
+
+//     const size_t NI = shared_multi_ceil_div_size_t(BI, TI);
+//     const size_t NJ = shared_multi_ceil_div_size_t(BJ, TJ);
+//     const size_t NK = shared_multi_ceil_div_size_t(BK, TK);
+//     const uint64_t iters = (uint64_t)NI * NJ * NK;
+
+//     // I is weighted highest because it determines per-Gemmini execution split.
+//     // K is also important because tiny K tails reduce the compute window and
+//     // expose dispatch/memory-overlap bubbles.
+//     uint64_t score = 0;
+//     score += shared_multi_edge_loss_score(BI, TI, 2000);
+//     score += shared_multi_edge_loss_score(BJ, TJ, 1000);
+//     score += shared_multi_edge_loss_score(BK, TK, 1500);
+//     score += iters;
+//     score += t; // empirical-template-order tie-breaker
+
+//     if (score < best_score)
+//     {
+//       best_score = score;
+//       best = t;
+//     }
+//   }
+
+//   job->tile_I = templates[best].tile_I;
+//   job->tile_J = templates[best].tile_J;
+//   job->tile_K = templates[best].tile_K;
+//   job->edge_rebalance_min_percent = SHARED_MULTI_EDGE_MIN_PERCENT;
+
+//   job->sp_addr_range = tiled_matmul_total_spad_rows(job->tile_I, job->tile_J, job->tile_K) * 2;
+//   job->acc_addr_range = tiled_matmul_total_acc_rows(job->tile_I, job->tile_J) * 2;
+//   job->sp_addr_A_stacked = tiled_matmul_A_spad_rows(job->tile_I, job->tile_J, job->tile_K);
+//   job->sp_addr_B_stacked = tiled_matmul_B_spad_rows(job->tile_I, job->tile_J, job->tile_K);
+//   job->acc_addr_stacked = tiled_matmul_total_acc_rows(job->tile_I, job->tile_J);
+// }
+
+// static void shared_multi_choose_tiling_factors_static(shared_multi_matmul_job_t *job, size_t tI_static, size_t tJ_static, size_t tK_static)
+// {
+
+//   job->gemmini_num = 0;
+//   for (int i = 0; i < total_gemmini_num; i++)
+//   {
+//     if ((job->gemmini_list >> i) & 1)
+//       job->gemmini_num++;
+//   }
+
+//   // 기존 auto_test 상단에 있던 partition 계산
+//   size_t partition_rows = (job->sp_addr_range / 2);
+//   size_t mats_in_partition = (partition_rows / DIM);
+//   size_t mats_in_acc = (job->acc_addr_range / DIM);
+//   size_t max_tile_i_j = ((size_t)sqrt(mats_in_acc));
+//   size_t max_tile_k = (mats_in_partition / max_tile_i_j);
+
+//   // double-buffered 기준 partition (db_*)
+//   size_t db_partition_rows_1 = ((job->sp_addr_range / 2) / 2);
+//   size_t db_mats_in_partition_1 = (db_partition_rows_1 / DIM);
+//   size_t db_mats_in_acc_1 = ((job->acc_addr_range / 2) / DIM);
+//   size_t db_max_tile_i_j_1 = ((size_t)sqrt(db_mats_in_acc_1));
+//   size_t db_max_tile_k_1 = (db_mats_in_partition_1 / db_max_tile_i_j_1);
+
+//   job->dim_I_padded = (job->dim_I / DIM + (job->dim_I % DIM != 0)) * DIM;
+//   job->dim_J_padded = (job->dim_J / DIM + (job->dim_J % DIM != 0)) * DIM;
+//   job->dim_K_padded = (job->dim_K / DIM + (job->dim_K % DIM != 0)) * DIM;
+
+//   const bool double_buffered = job->dataflow == WEIGHT_STATIONARY;
+
+//   const size_t max_spad_rows = double_buffered ? job->sp_addr_range / 2 : job->sp_addr_range;
+//   const size_t max_acc_rows = double_buffered ? job->acc_addr_range / 2 : job->acc_addr_range;
+
+//   size_t tI, tJ, tK;
+
+//   if (job->act == LAYERNORM || job->act == SOFTMAX)
+//   {
+//     tI = 1;
+//     tJ = job->dim_J_padded / DIM;
+//     tK = 1;
+//   }
+//   else if (double_buffered)
+//   {
+//     size_t max_i = (job->dim_I_padded / DIM);
+//     size_t max_j = (job->dim_J_padded / DIM);
+//     size_t max_k = (job->dim_K_padded / DIM);
+
+//     tI = max_i < db_max_tile_i_j_1 ? max_i : db_max_tile_i_j_1;
+//     tJ = max_j < db_max_tile_i_j_1 ? max_j : db_max_tile_i_j_1;
+//     tK = max_k < db_max_tile_k_1 ? max_k : db_max_tile_k_1;
+//   }
+//   else
+//   {
+//     size_t max_i = (job->dim_I_padded / DIM);
+//     size_t max_j = (job->dim_J_padded / DIM);
+//     size_t max_k = (job->dim_K_padded / DIM);
+
+//     tI = max_i < max_tile_i_j ? max_i : max_tile_i_j;
+//     tJ = max_j < max_tile_i_j ? max_j : max_tile_i_j;
+//     tK = max_k < max_tile_k ? max_k : max_tile_k;
+//   }
+
+//   if (tI >= job->gemmini_num)
+//   {
+//     if (tI % job->gemmini_num != 0)
+//     {
+//       tI = (tI / job->gemmini_num) * job->gemmini_num;
+//     }
+//   }
+//   else
+//   {
+//     if (job->gemmini_num * DIM <= job->dim_I_padded)
+//     {
+//       tI = job->gemmini_num;
+//     }
+//   }
+
+//   if (tK >= job->gemmini_num)
+//   {
+//     if (tK % job->gemmini_num != 0)
+//     {
+//       tK = (tK / job->gemmini_num) * job->gemmini_num;
+//     }
+//   }
+//   else
+//   {
+//     if (job->gemmini_num * DIM <= job->dim_K_padded)
+//     {
+//       tK = job->gemmini_num;
+//     }
+//   }
+
+//   while (true)
+//   {
+//     bool decreased = false;
+
+//     if ((tiled_matmul_total_spad_rows(tI, tJ, tK) > max_spad_rows ||
+//          tiled_matmul_total_acc_rows(tI, tJ) > max_acc_rows) &&
+//         tJ > 1)
+//     {
+//       tJ--;
+//       decreased = true;
+//     }
+
+//     if (!decreased)
+//       break;
+//   }
+
+//   // greedy하게 spad/acc를 꽉 채우도록 키우는 부분
+//   while (true)
+//   {
+//     bool increased = false;
+
+//     if (tiled_matmul_total_spad_rows(tI, tJ + 1, tK) <= max_spad_rows &&
+//         tiled_matmul_total_acc_rows(tI, tJ + 1) <= max_acc_rows &&
+//         (tJ + 1) * DIM <= job->dim_J_padded)
+//     {
+//       tJ++;
+//       increased = true;
+//     }
+
+//     if (tiled_matmul_total_spad_rows(tI + job->gemmini_num, tJ, tK) <= max_spad_rows &&
+//         tiled_matmul_total_acc_rows(tI + job->gemmini_num, tJ) <= max_acc_rows &&
+//         (tI + job->gemmini_num) * DIM <= job->dim_I_padded)
+//     {
+//       tI = tI + job->gemmini_num;
+//       increased = true;
+//     }
+
+//     if (tiled_matmul_total_spad_rows(tI, tJ, tK + job->gemmini_num) <= max_spad_rows &&
+//         (tK + job->gemmini_num) * DIM <= job->dim_K_padded)
+//     {
+//       tK = tK + job->gemmini_num;
+//       increased = true;
+//     }
+
+//     if (!increased)
+//       break;
+//   }
+
+// #ifdef PRINT_TILE
+// #if PRINT_TILE
+//   const int spad_rows = tiled_matmul_total_spad_rows(tI, tJ, tK);
+//   const int acc_rows = tiled_matmul_total_acc_rows(tI, tJ);
+
+//   printf("tile_I: %d\n", tI);
+//   printf("tile_J: %d\n", tJ);
+//   printf("tile_K: %d\n\n", tK);
+
+//   printf("spad_rows: %d\n", spad_rows);
+//   printf("acc_rows: %d\n\n", acc_rows);
+
+//   printf("spad_row utilization: %d%%\n", (spad_rows * 100) / max_spad_rows);
+//   printf("acc_row utilization: %d%%\n\n", (acc_rows * 100) / max_acc_rows);
+
+//   // exit(EXIT_SUCCESS);
+// #endif
+// #endif
+
+//   job->tile_I = tI_static;
+//   job->tile_J = tJ_static;
+//   job->tile_K = tK_static;
+//   job->edge_rebalance_min_percent = SHARED_MULTI_EDGE_MIN_PERCENT;
+//   job->sp_addr_range = tiled_matmul_total_spad_rows(tI_static, tJ_static, tK_static) * 2;
+//   job->acc_addr_range = tiled_matmul_total_acc_rows(tI_static, tJ_static) * 2;
+//   job->sp_addr_A_stacked = tiled_matmul_A_spad_rows(tI_static, tJ_static, tK_static);
+//   job->sp_addr_B_stacked = tiled_matmul_B_spad_rows(tI_static, tJ_static, tK_static);
+//   job->acc_addr_stacked = tiled_matmul_total_acc_rows(tI_static, tJ_static);
+// }
+
+// static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
+// {
+
+//   job->gemmini_num = 0;
+//   for (int i = 0; i < total_gemmini_num; i++)
+//   {
+//     if ((job->gemmini_list >> i) & 1)
+//       job->gemmini_num++;
+//   }
+
+//   // 기존 auto_test 상단에 있던 partition 계산
+//   size_t partition_rows = (job->sp_addr_range / 2);
+//   size_t mats_in_partition = (partition_rows / DIM);
+//   size_t mats_in_acc = (job->acc_addr_range / DIM);
+//   size_t max_tile_i_j = ((size_t)sqrt(mats_in_acc));
+//   size_t max_tile_k = (mats_in_partition / max_tile_i_j);
+
+//   // double-buffered 기준 partition (db_*)
+//   size_t db_partition_rows_1 = ((job->sp_addr_range / 2) / 2);
+//   size_t db_mats_in_partition_1 = (db_partition_rows_1 / DIM);
+//   size_t db_mats_in_acc_1 = ((job->acc_addr_range / 2) / DIM);
+//   size_t db_max_tile_i_j_1 = ((size_t)sqrt(db_mats_in_acc_1));
+//   size_t db_max_tile_k_1 = (db_mats_in_partition_1 / db_max_tile_i_j_1);
+
+//   job->dim_I_padded = (job->dim_I / DIM + (job->dim_I % DIM != 0)) * DIM;
+//   job->dim_J_padded = (job->dim_J / DIM + (job->dim_J % DIM != 0)) * DIM;
+//   job->dim_K_padded = (job->dim_K / DIM + (job->dim_K % DIM != 0)) * DIM;
+
+//   const bool double_buffered = job->dataflow == WEIGHT_STATIONARY;
+
+//   const size_t max_spad_rows = double_buffered ? job->sp_addr_range / 2 : job->sp_addr_range;
+//   const size_t max_acc_rows = double_buffered ? job->acc_addr_range / 2 : job->acc_addr_range;
+
+//   size_t tI, tJ, tK;
+
+//   if (job->act == LAYERNORM || job->act == SOFTMAX)
+//   {
+//     tI = 1;
+//     tJ = job->dim_J_padded / DIM;
+//     tK = 1;
+//   }
+//   else if (double_buffered)
+//   {
+//     size_t max_i = (job->dim_I_padded / DIM);
+//     size_t max_j = (job->dim_J_padded / DIM);
+//     size_t max_k = (job->dim_K_padded / DIM);
+
+//     tI = max_i < db_max_tile_i_j_1 ? max_i : db_max_tile_i_j_1;
+//     tJ = max_j < db_max_tile_i_j_1 ? max_j : db_max_tile_i_j_1;
+//     tK = max_k < db_max_tile_k_1 ? max_k : db_max_tile_k_1;
+//   }
+//   else
+//   {
+//     size_t max_i = (job->dim_I_padded / DIM);
+//     size_t max_j = (job->dim_J_padded / DIM);
+//     size_t max_k = (job->dim_K_padded / DIM);
+
+//     tI = max_i < max_tile_i_j ? max_i : max_tile_i_j;
+//     tJ = max_j < max_tile_i_j ? max_j : max_tile_i_j;
+//     tK = max_k < max_tile_k ? max_k : max_tile_k;
+//   }
+
+//   if (tI >= job->gemmini_num)
+//   {
+//     if (tI % job->gemmini_num != 0)
+//     {
+//       tI = (tI / job->gemmini_num) * job->gemmini_num;
+//     }
+//   }
+//   else
+//   {
+//     if (job->gemmini_num * DIM <= job->dim_I_padded)
+//     {
+//       tI = job->gemmini_num;
+//     }
+//   }
+
+//   if (tK >= job->gemmini_num)
+//   {
+//     if (tK % job->gemmini_num != 0)
+//     {
+//       tK = (tK / job->gemmini_num) * job->gemmini_num;
+//     }
+//   }
+//   else
+//   {
+//     if (job->gemmini_num * DIM <= job->dim_K_padded)
+//     {
+//       tK = job->gemmini_num;
+//     }
+//   }
+
+//   while (true)
+//   {
+//     bool decreased = false;
+
+//     if ((tiled_matmul_total_spad_rows(tI, tJ, tK) > max_spad_rows ||
+//          tiled_matmul_total_acc_rows(tI, tJ) > max_acc_rows) &&
+//         tJ > 1)
+//     {
+//       tJ--;
+//       decreased = true;
+//     }
+
+//     if (!decreased)
+//       break;
+//   }
+
+//   // greedy하게 spad/acc를 꽉 채우도록 키우는 부분
+//   while (true)
+//   {
+//     bool increased = false;
+
+//     if (tiled_matmul_total_spad_rows(tI, tJ + 1, tK) <= max_spad_rows &&
+//         tiled_matmul_total_acc_rows(tI, tJ + 1) <= max_acc_rows &&
+//         (tJ + 1) * DIM <= job->dim_J_padded)
+//     {
+//       tJ++;
+//       increased = true;
+//     }
+
+//     if (tiled_matmul_total_spad_rows(tI + job->gemmini_num, tJ, tK) <= max_spad_rows &&
+//         tiled_matmul_total_acc_rows(tI + job->gemmini_num, tJ) <= max_acc_rows &&
+//         (tI + job->gemmini_num) * DIM <= job->dim_I_padded)
+//     {
+//       tI = tI + job->gemmini_num;
+//       increased = true;
+//     }
+
+//     if (tiled_matmul_total_spad_rows(tI, tJ, tK + job->gemmini_num) <= max_spad_rows &&
+//         (tK + job->gemmini_num) * DIM <= job->dim_K_padded)
+//     {
+//       tK = tK + job->gemmini_num;
+//       increased = true;
+//     }
+
+//     if (!increased)
+//       break;
+//   }
+
+// #ifdef PRINT_TILE
+// #if PRINT_TILE
+//   const int spad_rows = tiled_matmul_total_spad_rows(tI, tJ, tK);
+//   const int acc_rows = tiled_matmul_total_acc_rows(tI, tJ);
+
+//   printf("tile_I: %d\n", tI);
+//   printf("tile_J: %d\n", tJ);
+//   printf("tile_K: %d\n\n", tK);
+
+//   printf("spad_rows: %d\n", spad_rows);
+//   printf("acc_rows: %d\n\n", acc_rows);
+
+//   printf("spad_row utilization: %d%%\n", (spad_rows * 100) / max_spad_rows);
+//   printf("acc_row utilization: %d%%\n\n", (acc_rows * 100) / max_acc_rows);
+
+//   // exit(EXIT_SUCCESS);
+// #endif
+// #endif
+
+//   job->tile_I = tI;
+//   job->tile_J = tJ;
+//   job->tile_K = tK;
+//   job->edge_rebalance_min_percent = SHARED_MULTI_EDGE_MIN_PERCENT;
+//   job->sp_addr_range = tiled_matmul_total_spad_rows(tI, tJ, tK) * 2;
+//   job->acc_addr_range = tiled_matmul_total_acc_rows(tI, tJ) * 2;
+//   job->sp_addr_A_stacked = tiled_matmul_A_spad_rows(tI, tJ, tK);
+//   job->sp_addr_B_stacked = tiled_matmul_B_spad_rows(tI, tJ, tK);
+//   job->acc_addr_stacked = tiled_matmul_total_acc_rows(tI, tJ);
+// }
+
+// void shared_multi_tiled_matmul_job_init(shared_multi_matmul_job_t *job)
+// {
+//   // memset(job, 0, sizeof(*job));
+
+//   const size_t I_blocks = job->dim_I_padded / DIM;
+//   const size_t J_blocks = job->dim_J_padded / DIM;
+//   const size_t K_blocks = job->dim_K_padded / DIM;
+
+//   if (job->edge_rebalance_min_percent <= 0 || job->edge_rebalance_min_percent > 100)
+//     job->edge_rebalance_min_percent = SHARED_MULTI_EDGE_MIN_PERCENT;
+
+//   shared_multi_build_balanced_partition(I_blocks, job->tile_I,
+//                                         job->edge_rebalance_min_percent, "I",
+//                                         job->I_chunks, job->I_offsets, &job->I0);
+//   shared_multi_build_balanced_partition(J_blocks, job->tile_J,
+//                                         job->edge_rebalance_min_percent, "J",
+//                                         job->J_chunks, job->J_offsets, &job->J0);
+//   shared_multi_build_balanced_partition(K_blocks, job->tile_K,
+//                                         job->edge_rebalance_min_percent, "K",
+//                                         job->K_chunks, job->K_offsets, &job->K0);
+
+//   job->last_I = job->I0 == 0 ? 0 : job->I_chunks[job->I0 - 1];
+//   job->last_J = job->J0 == 0 ? 0 : job->J_chunks[job->J0 - 1];
+//   job->last_K = job->K0 == 0 ? 0 : job->K_chunks[job->K0 - 1];
+
+//   job->padding_I = job->dim_I_padded - job->dim_I;
+//   job->padding_J = job->dim_J_padded - job->dim_J;
+//   job->padding_K = job->dim_K_padded - job->dim_K;
+
+//   job->no_bias = (job->D == NULL);
+//   if (job->no_bias)
+//   {
+//     job->D = (void *)1; // dummy
+//   }
+
+//   job->sizeof_D = job->low_D ? sizeof(elem_t) : sizeof(acc_t);
+//   job->sizeof_C = job->full_C ? sizeof(acc_t) : sizeof(elem_t);
+
+//   job->i0 = job->j0 = job->k0 = 0;
+//   job->inner_call_counter = 0;
+//   job->lastK_toggle = 1;
+//   job->done = false;
+
+//   // 여기부터는 기존 outer_test에서 했던 Gemmini config 부분을 그대로 가져옴
+//   for (int i = 0; i < total_gemmini_num; i++)
+//   {
+//     if ((job->gemmini_list >> i) & 1)
+//     {
+//       switch (i)
+//       {
+//       case 3:
+//         gemmini_extended_config_ex(custom3, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
+//         gemmini_extended_config_st(custom3, job->stride_C * job->sizeof_C, job->act & 3, job->scale);
+//         gemmini_extended3_config_ld(custom3, job->stride_A * sizeof(elem_t), job->A_scale_factor, false, 0);
+//         gemmini_extended3_config_ld(custom3, job->stride_B * sizeof(elem_t), job->B_scale_factor, false, 1);
+//         gemmini_extended3_config_ld(custom3, job->repeating_bias ? 0 : (job->stride_D * job->sizeof_D), job->D_scale_factor, job->low_D, 2);
+//         break;
+//       case 2:
+//         gemmini_extended_config_ex(custom2, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
+//         gemmini_extended_config_st(custom2, job->stride_C * job->sizeof_C, job->act & 3, job->scale);
+//         gemmini_extended3_config_ld(custom2, job->stride_A * sizeof(elem_t), job->A_scale_factor, false, 0);
+//         gemmini_extended3_config_ld(custom2, job->stride_B * sizeof(elem_t), job->B_scale_factor, false, 1);
+//         gemmini_extended3_config_ld(custom2, job->repeating_bias ? 0 : (job->stride_D * job->sizeof_D), job->D_scale_factor, job->low_D, 2);
+//         break;
+//       case 1:
+//         gemmini_extended_config_ex(custom1, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
+//         gemmini_extended_config_st(custom1, job->stride_C * job->sizeof_C, job->act & 3, job->scale);
+//         gemmini_extended3_config_ld(custom1, job->stride_A * sizeof(elem_t), job->A_scale_factor, false, 0);
+//         gemmini_extended3_config_ld(custom1, job->stride_B * sizeof(elem_t), job->B_scale_factor, false, 1);
+//         gemmini_extended3_config_ld(custom1, job->repeating_bias ? 0 : (job->stride_D * job->sizeof_D), job->D_scale_factor, job->low_D, 2);
+//         break;
+//       case 0:
+//         gemmini_extended_config_ex(custom0, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
+//         gemmini_extended_config_st(custom0, job->stride_C * job->sizeof_C, job->act & 3, job->scale);
+//         gemmini_extended3_config_ld(custom0, job->stride_A * sizeof(elem_t), job->A_scale_factor, false, 0);
+//         gemmini_extended3_config_ld(custom0, job->stride_B * sizeof(elem_t), job->B_scale_factor, false, 1);
+//         gemmini_extended3_config_ld(custom0, job->repeating_bias ? 0 : (job->stride_D * job->sizeof_D), job->D_scale_factor, job->low_D, 2);
+//         break;
+//       }
+//     }
+//   }
+
+//   // IGELU / SOFTMAX norm 설정도 그대로
+//   if (job->act == IGELU)
+//   {
+//     const acc_scale_t sqrt_2 = 1.41421356237;
+//     const acc_scale_t S = job->bert_scale;
+//     const acc_scale_t S_erf = (-0.2888 * ((S * S) / 2));
+
+//     const acc_t qb = -1.769 / (S / sqrt_2);
+//     const acc_t qc = 1.0 / S_erf;
+
+//     for (int i = 0; i < total_gemmini_num; i++)
+//     {
+//       if ((job->gemmini_list >> i) & 1)
+//       {
+//         switch (i)
+//         {
+//         case 3:
+//           gemmini_config_norm(custom3, 0, 0, 0, 0, 0, qb, qc);
+//           break;
+//         case 2:
+//           gemmini_config_norm(custom2, 0, 0, 0, 0, 0, qb, qc);
+//           break;
+//         case 1:
+//           gemmini_config_norm(custom1, 0, 0, 0, 0, 0, qb, qc);
+//           break;
+//         case 0:
+//           gemmini_config_norm(custom0, 0, 0, 0, 0, 0, qb, qc);
+//           break;
+//         }
+//       }
+//     }
+//   }
+
+//   if (job->act == SOFTMAX)
+//   {
+//     const scale_t a = 0.3585;
+//     const scale_t b = 1.353;
+//     const scale_t c = 0.344;
+
+//     const acc_t qln2 = (int)(0.693147 / job->bert_scale);
+//     const acc_t qln2_inv = 65536 / qln2;
+//     const acc_t qb = b / job->bert_scale;
+//     const acc_t qc = c / (a * job->bert_scale * job->bert_scale);
+
+//     for (int i = 0; i < total_gemmini_num; i++)
+//     {
+//       if ((job->gemmini_list >> i) & 1)
+//       {
+//         switch (i)
+//         {
+//         case 3:
+//           gemmini_config_norm(custom3, qln2, 0, 0, 1, 0, qb, qc);
+//           gemmini_config_norm(custom3, qln2_inv, 1, 0, 1, 0, qb, qc);
+//           break;
+//         case 2:
+//           gemmini_config_norm(custom2, qln2, 0, 0, 1, 0, qb, qc);
+//           gemmini_config_norm(custom2, qln2_inv, 1, 0, 1, 0, qb, qc);
+//           break;
+//         case 1:
+//           gemmini_config_norm(custom1, qln2, 0, 0, 1, 0, qb, qc);
+//           gemmini_config_norm(custom1, qln2_inv, 1, 0, 1, 0, qb, qc);
+//           break;
+//         case 0:
+//           gemmini_config_norm(custom0, qln2, 0, 0, 1, 0, qb, qc);
+//           gemmini_config_norm(custom0, qln2_inv, 1, 0, 1, 0, qb, qc);
+//           break;
+//         }
+//       }
+//     }
+//   }
+// }
+
+// static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
+// {
+//   if (job->done)
+//     return;
+
+//   const size_t i0 = job->i0;
+//   const size_t j0 = job->j0;
+//   const size_t k0 = job->k0;
+
+//   const bool no_bias = job->no_bias;
+//   const size_t sizeof_D = job->sizeof_D;
+//   const size_t sizeof_C = job->sizeof_C;
+
+//   void (*inner)(int, int, int,
+//                 size_t, size_t, size_t,
+//                 const elem_t *, const elem_t *, const void *, void *,
+//                 scale_t, scale_t, scale_acc_t,
+//                 size_t, size_t, size_t, size_t, size_t,
+//                 size_t, size_t, size_t, size_t, size_t, size_t,
+//                 size_t, size_t, size_t, size_t,
+//                 bool, bool,
+//                 bool, bool,
+//                 bool, bool,
+//                 int);
+
+//   if (job->dataflow == OUTPUT_STATIONARY)
+//     inner = &shared_multi_sp_tiled_matmul_os;
+//   else
+//     inner = &shared_multi_sp_tiled_matmul_ws;
+
+//   const size_t I0 = job->I0;
+//   const size_t J0 = job->J0;
+//   const size_t K0 = job->K0;
+
+//   // Variable tiling: i0/j0/k0 are chunk indices, not fixed-tile indices.
+//   const size_t i_block = job->I_offsets[i0];
+//   const size_t j_block = job->J_offsets[j0];
+//   const size_t k_block = job->K_offsets[k0];
+
+//   const size_t padding_I = job->padding_I;
+//   const size_t padding_J = job->padding_J;
+//   const size_t padding_K = job->padding_K;
+
+//   const size_t dim_I_padded = job->dim_I_padded;
+//   const size_t dim_J_padded = job->dim_J_padded;
+//   const size_t dim_K_padded = job->dim_K_padded;
+
+//   const elem_t *A = job->A;
+//   const elem_t *B = job->B;
+//   const void *D = job->D;
+//   void *C = job->C;
+
+//   const size_t stride_A = job->stride_A;
+//   const size_t stride_B = job->stride_B;
+//   const size_t stride_D = job->stride_D;
+//   const size_t stride_C = job->stride_C;
+
+//   const scale_t A_scale_factor = job->A_scale_factor;
+//   const scale_t B_scale_factor = job->B_scale_factor;
+//   const scale_acc_t D_scale_factor = job->D_scale_factor;
+
+//   const int act = job->act;
+//   const acc_scale_t scale = job->scale;
+//   const acc_scale_t bert_scale = job->bert_scale;
+//   const bool repeating_bias = job->repeating_bias;
+//   const bool a_transpose = job->a_transpose;
+//   const bool b_transpose = job->b_transpose;
+//   const bool full_C = job->full_C;
+//   const bool low_D = job->low_D;
+//   const uint8_t weightA = job->weightA;
+//   const int dataflow = job->dataflow;
+
+//   const size_t sp_addr_start_stack = job->sp_addr_start_stack;
+//   const size_t sp_addr_end_stack = job->sp_addr_end_stack;
+//   const size_t acc_addr_start_stack = job->acc_addr_start_stack;
+//   const size_t sp_addr_range = job->sp_addr_range;
+//   const size_t acc_addr_range = job->acc_addr_range;
+//   const int tile_id = job->tile_id;
+//   const int gemmini_list = job->gemmini_list;
+
+//   const void *pre;
+//   if (k0 != 0)
+//   {
+//     pre = NULL;
+//   }
+//   else
+//   {
+//     size_t bias_row = repeating_bias ? 0 : i_block * DIM;
+//     pre = (int8_t *)D + (bias_row * stride_D + j_block * DIM) * sizeof_D;
+//   }
+
+//   void *out = (k0 == K0 - 1)
+//                   ? (int8_t *)C + (i_block * DIM * stride_C + j_block * DIM) * sizeof_C
+//                   : NULL;
+
+//   const size_t I = job->I_chunks[i0];
+//   const size_t J = job->J_chunks[j0];
+//   const size_t K = job->K_chunks[k0];
+
+//   const size_t pad_I = i0 == I0 - 1 ? padding_I : 0;
+//   const size_t pad_J = j0 == J0 - 1 ? padding_J : 0;
+//   const size_t pad_K = k0 == K0 - 1 ? padding_K : 0;
+
+//   const elem_t *a = a_transpose ? (A + k_block * DIM * stride_A + i_block * DIM)
+//                                 : (A + i_block * DIM * stride_A + k_block * DIM);
+
+//   const elem_t *b = b_transpose ? (B + j_block * DIM * stride_B + k_block * DIM)
+//                                 : (B + k_block * DIM * stride_B + j_block * DIM);
+
+//   // group_list 계산
+//   int using_gemmini_num = job->gemmini_num;
+//   if (I < job->gemmini_num && K < job->gemmini_num)
+//   {
+//     using_gemmini_num = (I < K) ? K : I;
+//   }
+
+//   size_t group_list = gemmini_list;
+//   int shift_num = 0;
+//   for (int i = 0; i < total_gemmini_num; i++)
+//   {
+//     size_t shifted_list = (gemmini_list >> i);
+//     if (shift_num == using_gemmini_num)
+//     {
+//       group_list = group_list & ~(shifted_list << i);
+//       break;
+//     }
+//     if (shifted_list & 1)
+//     {
+//       shift_num++;
+//     }
+//   }
+
+//   const size_t I_div = I / using_gemmini_num;
+//   const size_t I_div_added = I_div + 1;
+//   const size_t I_added_gemmini_num = I % using_gemmini_num;
+
+//   const size_t K_div = K / using_gemmini_num;
+//   const size_t K_div_added = K_div + 1;
+//   const size_t K_added_gemmini_num = K % using_gemmini_num;
+
+//   const elem_t *a_local = a;
+//   const elem_t *b_local = b;
+//   const int8_t *c_local = (int8_t *)out;
+//   const int8_t *d_local = (int8_t *)pre;
+
+//   size_t laddrI_offset = 0;
+//   size_t laddrK_offset = 0;
+
+//   const int t = (job->inner_call_counter & 1);
+//   const size_t local_sp_addr_start = (t == 0) ? sp_addr_start_stack : sp_addr_start_stack + BANK_NUM * BANK_ROWS / 2;
+//   const size_t local_sp_addr_end = (t == 0) ? BANK_NUM * BANK_ROWS / 2 - sp_addr_end_stack : BANK_NUM * BANK_ROWS - sp_addr_end_stack;
+//   const size_t local_acc_addr_start = job->lastK_toggle ? acc_addr_start_stack : acc_addr_start_stack + ACC_ROWS / 2;
+
+//   int activated_gemmini_num = 0;
+//   for (int i = 0; i < total_gemmini_num; i++)
+//   {
+//     if ((group_list >> i) & 1)
+//     {
+//       size_t this_I = (activated_gemmini_num < I_added_gemmini_num) ? I_div_added : I_div;
+//       int ex_gemmini_num = (using_gemmini_num < I) ? using_gemmini_num : I;
+//       size_t this_pad_I = (activated_gemmini_num == ex_gemmini_num - 1) ? pad_I : 0;
+
+//       size_t this_K = (activated_gemmini_num < K_added_gemmini_num) ? K_div_added : K_div;
+//       int ldB_gemmini_num = (using_gemmini_num < K) ? using_gemmini_num : K;
+//       size_t this_pad_K = (activated_gemmini_num == ldB_gemmini_num - 1) ? pad_K : 0;
+
+//       (*inner)(i, group_list, tile_id << 1 | t,
+//                local_sp_addr_start, local_sp_addr_end, local_acc_addr_start,
+//                a_local, b_local, (k0 != 0) ? NULL : (void *)d_local, (k0 == K0 - 1) ? (void *)c_local : NULL,
+//                A_scale_factor, B_scale_factor, D_scale_factor,
+//                this_I, this_K, this_pad_K, laddrI_offset, laddrK_offset,
+//                I, J, K,
+//                this_pad_I, pad_J, pad_K,
+//                stride_A, stride_B, stride_D, stride_C,
+//                a_transpose, b_transpose,
+//                full_C, low_D,
+//                no_bias, repeating_bias,
+//                act);
+
+//       laddrI_offset += this_I;
+//       laddrK_offset += this_K;
+
+//       size_t local_stride_A = a_transpose ? 1 : stride_A;
+//       a_local += local_stride_A * DIM * this_I;
+//       size_t local_stride_B = b_transpose ? 1 : stride_B;
+//       b_local += local_stride_B * DIM * this_K;
+//       c_local += stride_C * DIM * this_I * sizeof_C;
+//       d_local += stride_D * DIM * this_I * sizeof_D;
+
+//       activated_gemmini_num++;
+//     }
+//   }
+
+//   // for (int i = 0; i < total_gemmini_num; i++)
+//   // {
+//   //   if ((group_list >> i) & 1)
+//   //   {
+//   //     switch (i)
+//   //     {
+//   //     case 3:
+//   //       ROCC_INSTRUCTION_RS1_RS2(custom3, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)),
+//   //                                ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+//   //       break;
+//   //     case 2:
+//   //       ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)),
+//   //                                ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+//   //       break;
+//   //     case 1:
+//   //       ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)),
+//   //                                ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+//   //       break;
+//   //     case 0:
+//   //       ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)),
+//   //                                ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
+//   //       break;
+//   //     }
+//   //   }
+//   // }
+
+//   job->inner_call_counter++;
+//   if (k0 == K0 - 1)
+//     job->lastK_toggle ^= 1;
+
+//   // ---- 여기까지가 원래 한 (i0,j0,k0) 타일에 대해 하던 일 ----
+//   // 이제 (i0, j0, k0) 인덱스를 다음 타일로 증가시킴
+
+//   // k0 증가
+//   job->k0++;
+//   if (job->k0 >= K0)
+//   {
+//     job->k0 = 0;
+//     job->j0++;
+//     if (job->j0 >= J0)
+//     {
+//       job->j0 = 0;
+//       job->i0++;
+//       if (job->i0 >= I0)
+//       {
+//         job->done = true; // 모든 타일 완료
+//       }
+//     }
+//   }
+// }
 
 typedef struct
 {
@@ -10789,6 +12214,467 @@ static void shared_multi_tiled_conv_job_step(shared_multi_conv_job_t *job)
   }
 }
 // made end
+
+
+
+// FOR SINGLE GEMMINI
+typedef struct
+{
+  size_t tile_I;
+  size_t tile_J;
+  size_t tile_K;
+} tiled_matmul_auto_factors_t;
+
+static tiled_matmul_auto_factors_t tiled_matmul_auto_reduced_bank_conflict_factors(
+    size_t dim_I, size_t dim_J, size_t dim_K,
+    int act,
+    enum tiled_matmul_type_t tiled_matmul_type)
+{
+  const size_t rb_partition_rows = BANK_NUM * BANK_ROWS / 2;
+  const size_t rb_mats_in_partition = rb_partition_rows / DIM;
+  const size_t rb_mats_in_acc = ACC_ROWS / DIM;
+  const size_t rb_max_tile_i_j = (size_t)sqrt(rb_mats_in_acc);
+  const size_t rb_max_tile_k = rb_mats_in_partition / rb_max_tile_i_j;
+
+  const size_t rb_db_partition_rows = (BANK_NUM * BANK_ROWS / 2) / 2;
+  const size_t rb_db_mats_in_partition = rb_db_partition_rows / DIM;
+  const size_t rb_db_mats_in_acc = (ACC_ROWS / 2) / DIM;
+  const size_t rb_db_max_tile_i_j = (size_t)sqrt(rb_db_mats_in_acc);
+  const size_t rb_db_max_tile_k = rb_db_mats_in_partition / rb_db_max_tile_i_j;
+
+  const size_t dim_I_padded = (dim_I / DIM + (dim_I % DIM != 0)) * DIM;
+  const size_t dim_J_padded = (dim_J / DIM + (dim_J % DIM != 0)) * DIM;
+  const size_t dim_K_padded = (dim_K / DIM + (dim_K % DIM != 0)) * DIM;
+
+  const bool double_buffered = tiled_matmul_type == WS;
+  const size_t max_spad_rows = double_buffered ? BANK_NUM * BANK_ROWS / 2 : BANK_NUM * BANK_ROWS;
+  const size_t max_operand_spad_rows = max_spad_rows / 2;
+  const size_t max_acc_rows = double_buffered ? ACC_ROWS / 2 : ACC_ROWS;
+
+  tiled_matmul_auto_factors_t factors;
+  if (act == LAYERNORM || act == SOFTMAX)
+  {
+    factors.tile_I = 1;
+    factors.tile_J = dim_J_padded / DIM;
+    factors.tile_K = 1;
+  }
+  else if (double_buffered)
+  {
+    factors.tile_I = dim_I_padded / DIM < rb_db_max_tile_i_j ? dim_I_padded / DIM : rb_db_max_tile_i_j;
+    factors.tile_J = dim_J_padded / DIM < rb_db_max_tile_i_j ? dim_J_padded / DIM : rb_db_max_tile_i_j;
+    factors.tile_K = dim_K_padded / DIM < rb_db_max_tile_k ? dim_K_padded / DIM : rb_db_max_tile_k;
+  }
+  else
+  {
+    factors.tile_I = dim_I_padded / DIM < rb_max_tile_i_j ? dim_I_padded / DIM : rb_max_tile_i_j;
+    factors.tile_J = dim_J_padded / DIM < rb_max_tile_i_j ? dim_J_padded / DIM : rb_max_tile_i_j;
+    factors.tile_K = dim_K_padded / DIM < rb_max_tile_k ? dim_K_padded / DIM : rb_max_tile_k;
+  }
+
+  // Fill scratchpad as much as possible while keeping A and B in separate halves.
+  while (true)
+  {
+    bool increased = false;
+
+    if (tiled_matmul_A_spad_rows(factors.tile_I, factors.tile_J + 1, factors.tile_K) <= max_operand_spad_rows &&
+        tiled_matmul_B_spad_rows(factors.tile_I, factors.tile_J + 1, factors.tile_K) <= max_operand_spad_rows &&
+        tiled_matmul_total_acc_rows(factors.tile_I, factors.tile_J + 1) <= max_acc_rows &&
+        (factors.tile_J + 1) * DIM <= dim_J_padded)
+    {
+      factors.tile_J++;
+      increased = true;
+    }
+
+    if (tiled_matmul_A_spad_rows(factors.tile_I + 1, factors.tile_J, factors.tile_K) <= max_operand_spad_rows &&
+        tiled_matmul_B_spad_rows(factors.tile_I + 1, factors.tile_J, factors.tile_K) <= max_operand_spad_rows &&
+        tiled_matmul_total_acc_rows(factors.tile_I + 1, factors.tile_J) <= max_acc_rows &&
+        (factors.tile_I + 1) * DIM <= dim_I_padded)
+    {
+      factors.tile_I++;
+      increased = true;
+    }
+
+    if (tiled_matmul_A_spad_rows(factors.tile_I, factors.tile_J, factors.tile_K + 1) <= max_operand_spad_rows &&
+        tiled_matmul_B_spad_rows(factors.tile_I, factors.tile_J, factors.tile_K + 1) <= max_operand_spad_rows &&
+        (factors.tile_K + 1) * DIM <= dim_K_padded)
+    {
+      factors.tile_K++;
+      increased = true;
+    }
+
+    if (!increased)
+      break;
+  }
+
+  if (tiled_matmul_auto_override_enabled)
+  {
+    factors.tile_I = tiled_matmul_auto_override_tile_I;
+    factors.tile_J = tiled_matmul_auto_override_tile_J;
+    factors.tile_K = tiled_matmul_auto_override_tile_K;
+  }
+
+  return factors;
+}
+
+typedef struct
+{
+  int custom_num;
+  size_t dim_I;
+  size_t dim_J;
+  size_t dim_K;
+  const elem_t *A;
+  const elem_t *B;
+  const void *D;
+  void *C;
+  size_t stride_A;
+  size_t stride_B;
+  size_t stride_D;
+  size_t stride_C;
+  scale_t A_scale_factor;
+  scale_t B_scale_factor;
+  scale_acc_t D_scale_factor;
+  int act;
+  acc_scale_t scale;
+  acc_scale_t bert_scale;
+  bool repeating_bias;
+  bool a_transpose;
+  bool b_transpose;
+  bool full_C;
+  bool low_D;
+  uint8_t weightA;
+  int dataflow;
+  size_t tile_I;
+  size_t tile_J;
+  size_t tile_K;
+  size_t I0;
+  size_t J0;
+  size_t K0;
+  size_t last_I;
+  size_t last_J;
+  size_t last_K;
+  size_t padding_I;
+  size_t padding_J;
+  size_t padding_K;
+  bool no_bias;
+  size_t sizeof_D;
+  size_t sizeof_C;
+  size_t i0;
+  size_t j0;
+  size_t k0;
+  bool done;
+  void (*inner)(int, const elem_t *, const elem_t *, const void *, void *,
+                scale_t, scale_t, scale_acc_t,
+                size_t, size_t, size_t, size_t, size_t, size_t,
+                size_t, size_t, size_t, size_t,
+                bool, bool,
+                bool, bool,
+                bool, bool,
+                int);
+} tiled_matmul_single_job_t;
+
+static void tiled_matmul_single_job_init(tiled_matmul_single_job_t *job)
+{
+  const size_t dim_I_padded = (job->dim_I / DIM + (job->dim_I % DIM != 0)) * DIM;
+  const size_t dim_J_padded = (job->dim_J / DIM + (job->dim_J % DIM != 0)) * DIM;
+  const size_t dim_K_padded = (job->dim_K / DIM + (job->dim_K % DIM != 0)) * DIM;
+
+  job->I0 = dim_I_padded / (job->tile_I * DIM) + (dim_I_padded % (job->tile_I * DIM) != 0);
+  job->J0 = dim_J_padded / (job->tile_J * DIM) + (dim_J_padded % (job->tile_J * DIM) != 0);
+  job->K0 = dim_K_padded / (job->tile_K * DIM) + (dim_K_padded % (job->tile_K * DIM) != 0);
+
+  job->last_I = dim_I_padded % (job->tile_I * DIM) == 0 ? job->tile_I : (dim_I_padded / DIM) % job->tile_I;
+  job->last_J = dim_J_padded % (job->tile_J * DIM) == 0 ? job->tile_J : (dim_J_padded / DIM) % job->tile_J;
+  job->last_K = dim_K_padded % (job->tile_K * DIM) == 0 ? job->tile_K : (dim_K_padded / DIM) % job->tile_K;
+
+  job->padding_I = dim_I_padded - job->dim_I;
+  job->padding_J = dim_J_padded - job->dim_J;
+  job->padding_K = dim_K_padded - job->dim_K;
+
+  job->no_bias = job->D == NULL;
+  if (job->no_bias)
+  {
+    job->D = (void *)1;
+  }
+
+  job->sizeof_D = job->low_D ? sizeof(elem_t) : sizeof(acc_t);
+  job->sizeof_C = job->full_C ? sizeof(acc_t) : sizeof(elem_t);
+
+  const size_t config_stride_A = gemmini_page_packed_a_dma_stride_bytes(job->stride_A);
+  const size_t config_stride_B = gemmini_page_packed_b_dma_stride_bytes(job->stride_B);
+  const size_t config_stride_D = gemmini_page_packed_acc_dma_stride_bytes(job->stride_D, job->sizeof_D);
+  const size_t config_stride_C = gemmini_page_packed_acc_dma_stride_bytes(job->stride_C, job->sizeof_C);
+
+  switch (job->custom_num)
+  {
+  case 0:
+    gemmini_extended_config_ex(custom0, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
+    gemmini_extended_config_st(custom0, config_stride_C, job->act & 3, job->scale);
+    gemmini_extended3_config_ld(custom0, config_stride_A, job->A_scale_factor, false, 0);
+    gemmini_extended3_config_ld(custom0, config_stride_B, job->B_scale_factor, false, 1)
+        gemmini_extended3_config_ld(custom0, job->repeating_bias ? 0 : config_stride_D, job->D_scale_factor, job->low_D, 2);
+    break;
+  case 1:
+    gemmini_extended_config_ex(custom1, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
+    gemmini_extended_config_st(custom1, config_stride_C, job->act & 3, job->scale);
+    gemmini_extended3_config_ld(custom1, config_stride_A, job->A_scale_factor, false, 0);
+    gemmini_extended3_config_ld(custom1, config_stride_B, job->B_scale_factor, false, 1)
+        gemmini_extended3_config_ld(custom1, job->repeating_bias ? 0 : config_stride_D, job->D_scale_factor, job->low_D, 2);
+    break;
+  case 2:
+    gemmini_extended_config_ex(custom2, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
+    gemmini_extended_config_st(custom2, config_stride_C, job->act & 3, job->scale);
+    gemmini_extended3_config_ld(custom2, config_stride_A, job->A_scale_factor, false, 0);
+    gemmini_extended3_config_ld(custom2, config_stride_B, job->B_scale_factor, false, 1)
+        gemmini_extended3_config_ld(custom2, job->repeating_bias ? 0 : config_stride_D, job->D_scale_factor, job->low_D, 2);
+    break;
+  case 3:
+    gemmini_extended_config_ex(custom3, job->dataflow, job->act & 3, 0, 1, job->a_transpose, job->b_transpose);
+    gemmini_extended_config_st(custom3, config_stride_C, job->act & 3, job->scale);
+    gemmini_extended3_config_ld(custom3, config_stride_A, job->A_scale_factor, false, 0);
+    gemmini_extended3_config_ld(custom3, config_stride_B, job->B_scale_factor, false, 1)
+        gemmini_extended3_config_ld(custom3, job->repeating_bias ? 0 : config_stride_D, job->D_scale_factor, job->low_D, 2);
+    break;
+  }
+
+  if (job->act == IGELU)
+  {
+    const acc_scale_t sqrt_2 = 1.41421356237;
+    const acc_scale_t S = job->bert_scale;
+    const acc_scale_t S_erf = (-0.2888 * ((S * S) / 2));
+
+    const acc_t qb = -1.769 / (S / sqrt_2);
+    const acc_t qc = 1.0 / S_erf;
+    switch (job->custom_num)
+    {
+    case 0:
+      gemmini_config_norm(custom0, 0, 0, 0, 0, 0, qb, qc);
+      break;
+    case 1:
+      gemmini_config_norm(custom1, 0, 0, 0, 0, 0, qb, qc);
+      break;
+    case 2:
+      gemmini_config_norm(custom2, 0, 0, 0, 0, 0, qb, qc);
+      break;
+    case 3:
+      gemmini_config_norm(custom3, 0, 0, 0, 0, 0, qb, qc);
+      break;
+    }
+  }
+
+  if (job->act == SOFTMAX)
+  {
+    const scale_t a = 0.3585;
+    const scale_t b = 1.353;
+    const scale_t c = 0.344;
+
+    const acc_t qln2 = (int)(0.693147 / job->bert_scale);
+    const acc_t qln2_inv = 65536 / qln2;
+    const acc_t qb = b / job->bert_scale;
+    const acc_t qc = c / (a * job->bert_scale * job->bert_scale);
+
+    switch (job->custom_num)
+    {
+    case 0:
+      gemmini_config_norm(custom0, qln2, 0, 0, 1, 0, qb, qc);
+      gemmini_config_norm(custom0, qln2_inv, 1, 0, 1, 0, qb, qc);
+      break;
+    case 1:
+      gemmini_config_norm(custom1, qln2, 0, 0, 1, 0, qb, qc);
+      gemmini_config_norm(custom1, qln2_inv, 1, 0, 1, 0, qb, qc);
+      break;
+    case 2:
+      gemmini_config_norm(custom2, qln2, 0, 0, 1, 0, qb, qc);
+      gemmini_config_norm(custom2, qln2_inv, 1, 0, 1, 0, qb, qc);
+      break;
+    case 3:
+      gemmini_config_norm(custom3, qln2, 0, 0, 1, 0, qb, qc);
+      gemmini_config_norm(custom3, qln2_inv, 1, 0, 1, 0, qb, qc);
+      break;
+    }
+  }
+
+  if (job->dataflow == OUTPUT_STATIONARY)
+  {
+    job->inner = &sp_tiled_matmul_os;
+  }
+  else
+  {
+    job->inner = &sp_tiled_matmul_ws;
+  }
+
+  job->i0 = 0;
+  job->j0 = 0;
+  job->k0 = 0;
+  job->done = job->I0 == 0 || job->J0 == 0 || job->K0 == 0;
+}
+
+static void tiled_matmul_single_job_step(tiled_matmul_single_job_t *job)
+{
+  if (job->done)
+  {
+    return;
+  }
+
+  const size_t i0 = job->i0;
+  const size_t j0 = job->j0;
+  const size_t k0 = job->k0;
+  const bool page_packed_A = gemmini_page_packed_stride_is_packed(job->stride_A);
+  const bool page_packed_B = gemmini_page_packed_stride_is_packed(job->stride_B);
+  const bool page_packed_D = gemmini_page_packed_stride_is_packed(job->stride_D);
+  const bool page_packed_C = gemmini_page_packed_stride_is_packed(job->stride_C);
+  const bool use_page_offsets =
+      (page_packed_A && !job->a_transpose) ||
+      (page_packed_B && !job->b_transpose) || page_packed_D || page_packed_C;
+  const size_t plain_stride_A = gemmini_page_packed_stride_payload(job->stride_A);
+  const size_t plain_stride_B = gemmini_page_packed_stride_payload(job->stride_B);
+  const size_t plain_stride_D = gemmini_page_packed_stride_payload(job->stride_D);
+  const size_t plain_stride_C = gemmini_page_packed_stride_payload(job->stride_C);
+
+  const void *pre;
+  if (k0 != 0)
+  {
+    pre = NULL;
+  }
+  else
+  {
+    const size_t bias_i_block = job->repeating_bias ? 0 : i0 * job->tile_I;
+    pre = page_packed_D
+              ? job->D
+              : (const void *)((const int8_t *)job->D +
+                               ((bias_i_block * DIM) * plain_stride_D + j0 * job->tile_J * DIM) * job->sizeof_D);
+  }
+
+  void *out = k0 == job->K0 - 1
+                  ? (page_packed_C
+                         ? job->C
+                         : (void *)((int8_t *)job->C +
+                                    (i0 * job->tile_I * DIM * plain_stride_C + j0 * job->tile_J * DIM) * job->sizeof_C))
+                  : NULL;
+
+  const size_t I = i0 < job->I0 - 1 ? job->tile_I : job->last_I;
+  const size_t J = j0 < job->J0 - 1 ? job->tile_J : job->last_J;
+  const size_t K = k0 < job->K0 - 1 ? job->tile_K : job->last_K;
+
+  const size_t pad_I = i0 == job->I0 - 1 ? job->padding_I : 0;
+  const size_t pad_J = j0 == job->J0 - 1 ? job->padding_J : 0;
+  const size_t pad_K = k0 == job->K0 - 1 ? job->padding_K : 0;
+
+  const elem_t *a = page_packed_A && !job->a_transpose
+                        ? job->A
+                        : (job->a_transpose
+                               ? (job->A + k0 * job->tile_K * DIM * plain_stride_A + i0 * job->tile_I * DIM)
+                               : (job->A + i0 * job->tile_I * DIM * plain_stride_A + k0 * job->tile_K * DIM));
+
+  const elem_t *b = page_packed_B && !job->b_transpose
+                        ? job->B
+                        : (job->b_transpose
+                               ? (job->B + j0 * job->tile_J * DIM * plain_stride_B + k0 * job->tile_K * DIM)
+                               : (job->B + k0 * job->tile_K * DIM * plain_stride_B + j0 * job->tile_J * DIM));
+
+  if (job->dataflow == WEIGHT_STATIONARY && use_page_offsets)
+  {
+    const size_t A_row_offset = i0 * job->tile_I;
+    const size_t A_col_offset = k0 * job->tile_K;
+    const size_t B_row_offset = k0 * job->tile_K;
+    const size_t B_col_offset = j0 * job->tile_J;
+    const size_t D_row_offset = job->repeating_bias ? 0 : A_row_offset;
+    const size_t D_col_offset = B_col_offset;
+    const size_t C_row_offset = A_row_offset;
+    const size_t C_col_offset = B_col_offset;
+
+    sp_tiled_matmul_ws_with_page_offsets(
+        job->custom_num, a, b, pre, out,
+        job->A_scale_factor, job->B_scale_factor, job->D_scale_factor,
+        I, J, K, pad_I, pad_J, pad_K,
+        job->stride_A, job->stride_B, job->stride_D, job->stride_C,
+        job->a_transpose, job->b_transpose,
+        job->full_C, job->low_D,
+        job->no_bias, job->repeating_bias, job->act,
+        A_row_offset, A_col_offset, B_row_offset, B_col_offset,
+        D_row_offset, D_col_offset, C_row_offset, C_col_offset);
+  }
+  else
+  {
+    (*job->inner)(job->custom_num, a, b, pre, out,
+                  job->A_scale_factor, job->B_scale_factor, job->D_scale_factor,
+                  I, J, K,
+                  pad_I, pad_J, pad_K,
+                  job->stride_A, job->stride_B, job->stride_D, job->stride_C,
+                  job->a_transpose, job->b_transpose,
+                  job->full_C, job->low_D,
+                  job->no_bias, job->repeating_bias,
+                  job->act);
+  }
+
+  job->k0++;
+  if (job->k0 >= job->K0)
+  {
+    job->k0 = 0;
+    job->j0++;
+    if (job->j0 >= job->J0)
+    {
+      job->j0 = 0;
+      job->i0++;
+      if (job->i0 >= job->I0)
+      {
+        job->done = true;
+      }
+    }
+  }
+}
+
+static void tiled_matmul_auto_reduced_bank_conflict(int custom_num, size_t dim_I, size_t dim_J, size_t dim_K,
+                                                    const elem_t *A, const elem_t *B,
+                                                    const void *D, void *C,
+                                                    size_t stride_A, size_t stride_B, size_t stride_D, size_t stride_C,
+                                                    scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+                                                    int act, acc_scale_t scale, acc_scale_t bert_scale,
+                                                    bool repeating_bias,
+                                                    bool transpose_A, bool transpose_B,
+                                                    bool full_C, bool low_D,
+                                                    uint8_t weightA,
+                                                    enum tiled_matmul_type_t tiled_matmul_type)
+{
+
+  const bool double_buffered = tiled_matmul_type == WS;
+  const size_t max_spad_rows = double_buffered ? BANK_NUM * BANK_ROWS / 2 : BANK_NUM * BANK_ROWS;
+  const size_t max_acc_rows = double_buffered ? ACC_ROWS / 2 : ACC_ROWS;
+  const tiled_matmul_auto_factors_t factors =
+      tiled_matmul_auto_reduced_bank_conflict_factors(dim_I, dim_J, dim_K, act, tiled_matmul_type);
+  const size_t tile_I = factors.tile_I;
+  const size_t tile_J = factors.tile_J;
+  const size_t tile_K = factors.tile_K;
+
+#ifdef PRINT_TILE
+#if PRINT_TILE
+  const int spad_rows = tiled_matmul_total_spad_rows(tile_I, tile_J, tile_K);
+  const int acc_rows = tiled_matmul_total_acc_rows(tile_I, tile_J);
+
+  printf("tile_I: %d\n", tile_I);
+  printf("tile_J: %d\n", tile_J);
+  printf("tile_K: %d\n\n", tile_K);
+
+  printf("spad_rows: %d\n", spad_rows);
+  printf("acc_rows: %d\n\n", acc_rows);
+
+  printf("spad_row utilization: %d%%\n", (spad_rows * 100) / max_spad_rows);
+  printf("acc_row utilization: %d%%\n\n", (acc_rows * 100) / max_acc_rows);
+
+  // exit(EXIT_SUCCESS);
+#endif
+#endif
+
+  tiled_matmul(custom_num, dim_I, dim_J, dim_K,
+               A, B, D, C,
+               stride_A, stride_B, stride_D, stride_C,
+               A_scale_factor, B_scale_factor, D_scale_factor,
+               act, scale, bert_scale, repeating_bias,
+               tile_I, tile_J, tile_K,
+               transpose_A, transpose_B,
+               full_C, low_D,
+               weightA,
+               tiled_matmul_type);
+}
 
 #undef abs
 

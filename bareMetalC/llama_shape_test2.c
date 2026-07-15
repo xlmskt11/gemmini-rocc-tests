@@ -15,8 +15,8 @@
 #define PROFILE false
 #define profile_data_num 20000
 
-#define MULTI false
-#define gemmini_configuration 15
+#define MULTI true
+#define gemmini_configuration 1
 
 #define MAT_DIM_I 192
 #define MAT_DIM_J 512

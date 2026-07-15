@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #ifndef BAREMETAL
 #include <sys/mman.h>
 #endif
@@ -12,17 +13,18 @@
 // #include "include/gemmini_nn.h"
 
 #define PROFILE false
-#define profile_data_num 30
+#define profile_data_num 5000
 
 #define MULTI true
-#define gemmini_configuration 1
+#define gemmini_configuration 15
 
-#define MAT_DIM_I 1024
-#define MAT_DIM_J 1024
-#define MAT_DIM_K 1024
+#define MAT_DIM_I 256
+#define MAT_DIM_J 256
+#define MAT_DIM_K 256
+#define L2_CACHE_BLOCK_BYTES 64
 #define RAND rand()
 #define FAST false
-#define NO_BIAS true
+#define NO_BIAS false
 #define FULL_BIAS_WIDTH true
 #define REPEATING_BIAS false
 #define CHECK false
@@ -36,6 +38,12 @@ typedef acc_t ACC_T;
 #else
 typedef elem_t ACC_T;
 #endif
+
+#define ELEM_ROW_PADDING ((L2_CACHE_BLOCK_BYTES) / sizeof(elem_t))
+#define ACC_ROW_PADDING ((L2_CACHE_BLOCK_BYTES) / sizeof(ACC_T))
+#define MAT_DIM_K_PAD (MAT_DIM_K + ELEM_ROW_PADDING)
+#define MAT_DIM_J_PAD (MAT_DIM_J + ELEM_ROW_PADDING)
+#define MAT_DIM_J_PAD_ACC (MAT_DIM_J + ACC_ROW_PADDING)
 
 void print_gemmini_use(unsigned mask)
 {
@@ -60,7 +68,7 @@ void print_gemmini_use(unsigned mask)
   printf(" with DIM: %d\n", DIM);
 }
 
-void full_matmul(elem_t A[MAT_DIM_I][MAT_DIM_K], elem_t B[MAT_DIM_K][MAT_DIM_J], ACC_T D[MAT_DIM_I][MAT_DIM_J], full_t C_full[MAT_DIM_I][MAT_DIM_J]) {
+void full_matmul(elem_t A[MAT_DIM_I][MAT_DIM_K_PAD], elem_t B[MAT_DIM_K][MAT_DIM_J_PAD], ACC_T D[MAT_DIM_I][MAT_DIM_J_PAD_ACC], full_t C_full[MAT_DIM_I][MAT_DIM_J]) {
   for (size_t r = 0; r < MAT_DIM_I; r++)
     for (size_t c = 0; c < MAT_DIM_J; c++) {
       C_full[r][c] = D[r][c];
@@ -69,18 +77,18 @@ void full_matmul(elem_t A[MAT_DIM_I][MAT_DIM_K], elem_t B[MAT_DIM_K][MAT_DIM_J],
     }
 }
 
-void full_printMatrix(elem_t m[MAT_DIM_I][MAT_DIM_J]) {
-  for (size_t i = 0; i < MAT_DIM_I; ++i) {
-    for (size_t j = 0; j < MAT_DIM_J; ++j)
-      printf("%d ", m[i][j]);
+void printMatrix_stride(const elem_t *m, size_t rows, size_t cols, size_t stride) {
+  for (size_t i = 0; i < rows; ++i) {
+    for (size_t j = 0; j < cols; ++j)
+      printf("%d ", m[i * stride + j]);
     printf("\n");
   }
 }
 
-int full_is_equal(elem_t x[MAT_DIM_I][MAT_DIM_J], elem_t y[MAT_DIM_I][MAT_DIM_J]) {
-  for (size_t i = 0; i < MAT_DIM_I; ++i)
-    for (size_t j = 0; j < MAT_DIM_J; ++j)
-      if (x[i][j] != y[i][j])
+int is_equal_stride(const elem_t *x, const elem_t *y, size_t rows, size_t cols, size_t stride_x, size_t stride_y) {
+  for (size_t i = 0; i < rows; ++i)
+    for (size_t j = 0; j < cols; ++j)
+      if (x[i * stride_x + j] != y[i * stride_y + j])
         return 0;
   return 1;
 }
@@ -129,6 +137,9 @@ int main() {
     printf("MAT_DIM_I: %d\n", MAT_DIM_I);
     printf("MAT_DIM_J: %d\n", MAT_DIM_J);
     printf("MAT_DIM_K: %d\n", MAT_DIM_K);
+    printf("MAT_DIM_K_PAD: %d\n", (int)MAT_DIM_K_PAD);
+    printf("MAT_DIM_J_PAD: %d\n", (int)MAT_DIM_J_PAD);
+    printf("MAT_DIM_J_PAD_ACC: %d\n", (int)MAT_DIM_J_PAD_ACC);
 
     printf("Flush All Gemmini TLB of stale virtual addresses\n");
 #if MULTI
@@ -139,15 +150,20 @@ int main() {
     gemmini_flush(custom3, 0);
 
     printf("Initialize our input and output matrices in main memory\n");
-    static elem_t full_A[MAT_DIM_I][MAT_DIM_K] row_align(MAX_BLOCK_LEN);
-    static elem_t full_B[MAT_DIM_K][MAT_DIM_J] row_align(MAX_BLOCK_LEN);
-    static elem_t full_C[MAT_DIM_I][MAT_DIM_J] row_align(MAX_BLOCK_LEN);
-    static ACC_T full_D[MAT_DIM_I][MAT_DIM_J] row_align_acc(MAX_BLOCK_LEN_ACC);
+    static elem_t full_A[MAT_DIM_I][MAT_DIM_K_PAD] row_align(MAX_BLOCK_LEN);
+    static elem_t full_B[MAT_DIM_K][MAT_DIM_J_PAD] row_align(MAX_BLOCK_LEN);
+    static elem_t full_C[MAT_DIM_I][MAT_DIM_J_PAD] row_align(MAX_BLOCK_LEN);
+    static ACC_T full_D[MAT_DIM_I][MAT_DIM_J_PAD_ACC] row_align_acc(MAX_BLOCK_LEN_ACC);
 
 #if !FAST && CHECK
     static full_t gold_full[MAT_DIM_I][MAT_DIM_J];
     static elem_t gold[MAT_DIM_I][MAT_DIM_J];
 #endif
+
+    memset(full_A, 0, sizeof(full_A));
+    memset(full_B, 0, sizeof(full_B));
+    memset(full_C, 0, sizeof(full_C));
+    memset(full_D, 0, sizeof(full_D));
 
     printf("Init A\n");
     for (size_t i = 0; i < MAT_DIM_I; ++i)
@@ -190,111 +206,91 @@ int main() {
   int total_cycles = 0;
   printf("Do Gemmini tiled matmul process\n");
 #if MULTI
-  const size_t sp_addr_range = BANK_NUM * BANK_ROWS;
-  const size_t acc_addr_range = ACC_ROWS;
-  const size_t max_spad_rows = sp_addr_range / 2;
-  const size_t max_acc_rows = acc_addr_range / 2;
 
-  for (size_t tile_I = 1; tile_I <= MAT_DIM_I / DIM; ++tile_I) {
-    for (size_t tile_J = 1; tile_J <= MAT_DIM_J / DIM; ++tile_J)
-    {
-      for (size_t tile_K = 1; tile_K <= MAT_DIM_K / DIM; ++tile_K)
-      {
-        if (tiled_matmul_total_spad_rows(tile_I, tile_J, tile_K) <= max_spad_rows &&
-            tiled_matmul_total_acc_rows(tile_I, tile_J) <= max_acc_rows) {
-      
-          gemmini_flush(custom0, 0);
-          gemmini_flush(custom1, 0);
-          gemmini_flush(custom2, 0);
-          gemmini_flush(custom3, 0);
+  int tile_I = 8;
+  int tile_J = 4;
+  int tile_K = 16;
 
-          memset(&j0, 0, sizeof(shared_multi_matmul_job_t));
-          j0.tile_id = 1;
-          j0.gemmini_list = gemmini_configuration;
-          j0.sp_addr_start_stack = 0;
-          j0.sp_addr_end_stack = 0;
-          j0.acc_addr_start_stack = 0;
-          j0.sp_addr_range = TOTAL_SPAD_ROWS;
-          j0.acc_addr_range = TOTAL_ACC_ROWS;
-          j0.dim_I = MAT_DIM_I;
-          j0.dim_J = MAT_DIM_J;
-          j0.dim_K = MAT_DIM_K;
-          j0.A = (elem_t *)full_A;
-          j0.B = (elem_t *)full_B;
-          j0.D = NO_BIAS ? NULL : &full_D[0][0];
-          j0.C = (elem_t *)full_C;
-          j0.stride_A = MAT_DIM_K;
-          j0.stride_B = MAT_DIM_J;
-          j0.stride_D = MAT_DIM_J;
-          j0.stride_C = MAT_DIM_J;
-          j0.A_scale_factor = MVIN_SCALE_IDENTITY;
-          j0.B_scale_factor = MVIN_SCALE_IDENTITY;
-          j0.D_scale_factor = MVIN_SCALE_IDENTITY;
-          j0.act = NO_ACTIVATION;
-          j0.scale = ACC_SCALE_IDENTITY;
-          j0.bert_scale = 0;
-          j0.repeating_bias = REPEATING_BIAS;
-          j0.a_transpose = false;
-          j0.b_transpose = false;
-          j0.full_C = false;
-          j0.low_D = !FULL_BIAS_WIDTH;
-          j0.weightA = 1;
-          j0.dataflow = WEIGHT_STATIONARY;
+  memset(&j0, 0, sizeof(shared_multi_matmul_job_t));
+  j0.tile_id = 1;
+  j0.gemmini_list = gemmini_configuration;
+  j0.sp_addr_start_stack = 0;
+  j0.sp_addr_end_stack = 0;
+  j0.acc_addr_start_stack = 0;
+  j0.sp_addr_range = TOTAL_SPAD_ROWS;
+  j0.acc_addr_range = TOTAL_ACC_ROWS;
+  j0.dim_I = MAT_DIM_I;
+  j0.dim_J = MAT_DIM_J;
+  j0.dim_K = MAT_DIM_K;
+  j0.A = (elem_t *)full_A;
+  j0.B = (elem_t *)full_B;
+  j0.D = NO_BIAS ? NULL : &full_D[0][0];
+  j0.C = (elem_t *)full_C;
+  j0.stride_A = MAT_DIM_K_PAD;
+  j0.stride_B = MAT_DIM_J_PAD;
+  j0.stride_D = MAT_DIM_J_PAD_ACC;
+  j0.stride_C = MAT_DIM_J_PAD;
+  j0.A_scale_factor = MVIN_SCALE_IDENTITY;
+  j0.B_scale_factor = MVIN_SCALE_IDENTITY;
+  j0.D_scale_factor = MVIN_SCALE_IDENTITY;
+  j0.act = NO_ACTIVATION;
+  j0.scale = ACC_SCALE_IDENTITY;
+  j0.bert_scale = 0;
+  j0.repeating_bias = REPEATING_BIAS;
+  j0.a_transpose = false;
+  j0.b_transpose = false;
+  j0.full_C = false;
+  j0.low_D = !FULL_BIAS_WIDTH;
+  j0.weightA = 1;
+  j0.dataflow = WEIGHT_STATIONARY;
 
-          uint64_t matmul_start = read_cycles();
+  shared_multi_choose_tiling_factors_static(&j0, tile_I, tile_J, tile_K);
+  shared_multi_tiled_matmul_job_init(&j0);
+  uint64_t matmul_start = read_cycles();
+  while (!j0.done)
+  {
+    shared_multi_tiled_matmul_job_step(&j0);
+  }
 
-          shared_multi_choose_tiling_factors_static(&j0, tile_I, tile_J, tile_K);
-          shared_multi_tiled_matmul_job_init(&j0);
-          while (!j0.done)
-          {
-            shared_multi_tiled_matmul_job_step(&j0);
-          }
+  gemmini_fence();
 
-          gemmini_fence();
-
-          uint64_t matmul_end = read_cycles();
+  uint64_t matmul_end = read_cycles();
 
 #if CHECK
-          printf("Check \"Out\" matrix\n");
+  printf("Check \"Out\" matrix\n");
 
 #if FAST
-          if (!is_equal_dynamic(full_C, full_A, MAT_DIM_I, MAT_DIM_J))
-          {
-            printf("Incorrect output matrix!\n");
-            printf("C:\n");
-            printMatrix_dynamic(full_C, MAT_DIM_I, MAT_DIM_J);
-            printf("A:\n");
-            printMatrix_dynamic(full_A, MAT_DIM_I, MAT_DIM_J);
-            printf("\n");
+  if (!is_equal_stride((elem_t *)full_C, (elem_t *)full_A, MAT_DIM_I, MAT_DIM_J, MAT_DIM_J_PAD, MAT_DIM_K_PAD))
+  {
+    printf("Incorrect output matrix!\n");
+    printf("C:\n");
+    printMatrix_stride((elem_t *)full_C, MAT_DIM_I, MAT_DIM_J, MAT_DIM_J_PAD);
+    printf("A:\n");
+    printMatrix_stride((elem_t *)full_A, MAT_DIM_I, MAT_DIM_J, MAT_DIM_K_PAD);
+    printf("\n");
 
-            exit(1);
-          }
-#else
-          if (!is_equal_dynamic(full_C, gold, MAT_DIM_I, MAT_DIM_J))
-          {
-            printf("Incorrect output matrix!\n");
-            printf("C:\n");
-            printMatrix_dynamic(full_C, MAT_DIM_I, MAT_DIM_J);
-            printf("Gold:\n");
-            printMatrix_dynamic(gold, MAT_DIM_I, MAT_DIM_J);
-            printf("\n");
-
-            exit(1);
-          }
-#endif
-          printf("Output matrix came out as expected\n");
-#endif
-
-          printf("tile_I: %d, tile_J: %d, tile_K: %d Matmul cycle: %d\n", tile_I, tile_J, tile_K, matmul_end - matmul_start);
-          total_cycles = total_cycles + (matmul_end - matmul_start);
-        }
-      }
-    }
+    exit(1);
   }
 #else
+  if (!is_equal_stride((elem_t *)full_C, (elem_t *)gold, MAT_DIM_I, MAT_DIM_J, MAT_DIM_J_PAD, MAT_DIM_J))
+  {
+    printf("Incorrect output matrix!\n");
+    printf("C:\n");
+    printMatrix_stride((elem_t *)full_C, MAT_DIM_I, MAT_DIM_J, MAT_DIM_J_PAD);
+    printf("Gold:\n");
+    printMatrix_stride((elem_t *)gold, MAT_DIM_I, MAT_DIM_J, MAT_DIM_J);
+    printf("\n");
+
+    exit(1);
+  }
+#endif
+  printf("Output matrix came out as expected\n");
+#endif
+
+#else
   tiled_matmul_auto(custom3, MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
-                    (elem_t *)full_A, (elem_t *)full_B, NO_BIAS ? NULL : &full_D[0][0], (elem_t *)full_C,
-                    MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
+                    (elem_t *)0, (elem_t *)0, NO_BIAS ? NULL : 0, 0,
+                    MAT_DIM_K_PAD, MAT_DIM_J_PAD, MAT_DIM_J_PAD_ACC, MAT_DIM_J_PAD,
                     MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
                     NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, REPEATING_BIAS,
                     false, false,
@@ -303,7 +299,7 @@ int main() {
                     WS);
 #endif
 
-  printf("Total Matmul cycle: %d\n", total_cycles);
+  printf("Total Matmul cycle: %d\n", matmul_end - matmul_start);
 
 #if PROFILE
   for (int i = 0; i < total_gemmini_num; i++)

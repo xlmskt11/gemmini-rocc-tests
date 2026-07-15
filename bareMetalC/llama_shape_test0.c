@@ -15,8 +15,8 @@
 #define PROFILE false
 #define profile_data_num 20000
 
-#define MULTI false
-#define gemmini_configuration 15
+#define MULTI true
+#define gemmini_configuration 7
 
 #define MAT_DIM_I 192
 #define MAT_DIM_J 512
@@ -73,24 +73,29 @@ void print_gemmini_use(unsigned mask)
   printf(" with DIM: %d\n", DIM);
 }
 
-void full_matmul(elem_t A[MAT_DIM_I][MAT_DIM_K], elem_t B[MAT_DIM_K][MAT_DIM_J], ACC_T D[MAT_DIM_I][MAT_DIM_J], full_t C_full[MAT_DIM_I][MAT_DIM_J]) {
+void full_matmul(elem_t A[MAT_DIM_I][MAT_DIM_K], elem_t B[MAT_DIM_K][MAT_DIM_J], ACC_T D[MAT_DIM_I][MAT_DIM_J], full_t C_full[MAT_DIM_I][MAT_DIM_J])
+{
   for (size_t r = 0; r < MAT_DIM_I; r++)
-    for (size_t c = 0; c < MAT_DIM_J; c++) {
+    for (size_t c = 0; c < MAT_DIM_J; c++)
+    {
       C_full[r][c] = D[r][c];
       for (size_t k = 0; k < MAT_DIM_K; k++)
-        C_full[r][c] += A[r][k]*B[k][c];
+        C_full[r][c] += A[r][k] * B[k][c];
     }
 }
 
-void full_printMatrix(elem_t m[MAT_DIM_I][MAT_DIM_J]) {
-  for (size_t i = 0; i < MAT_DIM_I; ++i) {
+void full_printMatrix(elem_t m[MAT_DIM_I][MAT_DIM_J])
+{
+  for (size_t i = 0; i < MAT_DIM_I; ++i)
+  {
     for (size_t j = 0; j < MAT_DIM_J; ++j)
       printf("%d ", m[i][j]);
     printf("\n");
   }
 }
 
-int full_is_equal(elem_t x[MAT_DIM_I][MAT_DIM_J], elem_t y[MAT_DIM_I][MAT_DIM_J]) {
+int full_is_equal(elem_t x[MAT_DIM_I][MAT_DIM_J], elem_t y[MAT_DIM_I][MAT_DIM_J])
+{
   for (size_t i = 0; i < MAT_DIM_I; ++i)
     for (size_t j = 0; j < MAT_DIM_J; ++j)
       if (x[i][j] != y[i][j])
@@ -98,13 +103,15 @@ int full_is_equal(elem_t x[MAT_DIM_I][MAT_DIM_J], elem_t y[MAT_DIM_I][MAT_DIM_J]
   return 1;
 }
 
-void full_matscale(full_t full[MAT_DIM_I][MAT_DIM_J], elem_t out[MAT_DIM_I][MAT_DIM_J], acc_scale_t scale) {
-  for (size_t r = 0; r < MAT_DIM_I; r++)                             
-    for (size_t c = 0; c < MAT_DIM_J; c++) {
+void full_matscale(full_t full[MAT_DIM_I][MAT_DIM_J], elem_t out[MAT_DIM_I][MAT_DIM_J], acc_scale_t scale)
+{
+  for (size_t r = 0; r < MAT_DIM_I; r++)
+    for (size_t c = 0; c < MAT_DIM_J; c++)
+    {
       // Scale element
       full_t scaled = ACC_SCALE(full[r][c], scale);
 
-      // Saturate and cast element
+    // Saturate and cast element
 #ifndef ELEM_T_IS_FLOAT
       full_t elem = scaled > elem_t_max ? elem_t_max : (scaled < elem_t_min ? elem_t_min : scaled);
       out[r][c] = elem;
@@ -112,26 +119,27 @@ void full_matscale(full_t full[MAT_DIM_I][MAT_DIM_J], elem_t out[MAT_DIM_I][MAT_
       out[r][c] = scaled; // TODO should we also saturate when using floats?
 #endif
     }
-} 
+}
 
-
-int main() {
+int main()
+{
 #ifndef BAREMETAL
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-      perror("mlockall failed");
-      exit(1);
-    }
+  if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+  {
+    perror("mlockall failed");
+    exit(1);
+  }
 #endif
 
 #if PROFILE
-    printf("Set profiler address\n");
-    static uint64_t P[total_gemmini_num][profile_data_num] row_align(1);
+  printf("Set profiler address\n");
+  static uint64_t P[total_gemmini_num][profile_data_num] row_align(1);
 #if MULTI
-    gemmini_profiler(custom0, (uint64_t *)P[0]);
-    gemmini_profiler(custom1, (uint64_t *)P[1]);
-    gemmini_profiler(custom2, (uint64_t *)P[2]);
+  gemmini_profiler(custom0, (uint64_t *)P[0]);
+  gemmini_profiler(custom1, (uint64_t *)P[1]);
+  gemmini_profiler(custom2, (uint64_t *)P[2]);
 #endif
-    gemmini_profiler(custom3, (uint64_t *)P[3]);
+  gemmini_profiler(custom3, (uint64_t *)P[3]);
 #endif
 
 #if MULTI
@@ -139,44 +147,44 @@ int main() {
 #else
   printf("Use Single Gemmini: %d\n", DIM);
 #endif
-    printf("MAT_DIM_I: %d\n", MAT_DIM_I);
-    printf("MAT_DIM_J: %d\n", MAT_DIM_J);
-    printf("MAT_DIM_K: %d\n", MAT_DIM_K);
+  printf("MAT_DIM_I: %d\n", MAT_DIM_I);
+  printf("MAT_DIM_J: %d\n", MAT_DIM_J);
+  printf("MAT_DIM_K: %d\n", MAT_DIM_K);
 
-    printf("Flush All Gemmini TLB of stale virtual addresses\n");
+  printf("Flush All Gemmini TLB of stale virtual addresses\n");
 #if MULTI
-    gemmini_flush(custom0, 0);
-    gemmini_flush(custom1, 0);
-    gemmini_flush(custom2, 0);
+  gemmini_flush(custom0, 0);
+  gemmini_flush(custom1, 0);
+  gemmini_flush(custom2, 0);
 #endif
-    gemmini_flush(custom3, 0);
+  gemmini_flush(custom3, 0);
 
-    printf("Initialize our input and output matrices in main memory\n");
-    static elem_t full_A[MAT_DIM_I][MAT_DIM_K] row_align(MAX_BLOCK_LEN);
-    static elem_t full_B[MAT_DIM_K][MAT_DIM_J] row_align(MAX_BLOCK_LEN);
-    static CACC_T full_C[MAT_DIM_I][MAT_DIM_J] row_align(MAX_BLOCK_LEN);
-    static ACC_T full_D[MAT_DIM_I][MAT_DIM_J] row_align_acc(MAX_BLOCK_LEN_ACC);
+  printf("Initialize our input and output matrices in main memory\n");
+  static elem_t full_A[MAT_DIM_I][MAT_DIM_K] row_align(MAX_BLOCK_LEN);
+  static elem_t full_B[MAT_DIM_K][MAT_DIM_J] row_align(MAX_BLOCK_LEN);
+  static CACC_T full_C[MAT_DIM_I][MAT_DIM_J] row_align(MAX_BLOCK_LEN);
+  static ACC_T full_D[MAT_DIM_I][MAT_DIM_J] row_align_acc(MAX_BLOCK_LEN_ACC);
 
 #if !FAST && CHECK
-    static full_t gold_full[MAT_DIM_I][MAT_DIM_J];
-    static elem_t gold[MAT_DIM_I][MAT_DIM_J];
+  static full_t gold_full[MAT_DIM_I][MAT_DIM_J];
+  static elem_t gold[MAT_DIM_I][MAT_DIM_J];
 #endif
 
-    // printf("Init A\n");
-    // for (size_t i = 0; i < MAT_DIM_I; ++i)
-    // {
-    //   for (size_t j = 0; j < MAT_DIM_K; ++j)
-    //   {
-    //     full_A[i][j] = RAND % 2;
-    //   }
-    // }
+  // printf("Init A\n");
+  // for (size_t i = 0; i < MAT_DIM_I; ++i)
+  // {
+  //   for (size_t j = 0; j < MAT_DIM_K; ++j)
+  //   {
+  //     full_A[i][j] = RAND % 2;
+  //   }
+  // }
 
-    // printf("Init D\n");
-    // for (size_t i = 0; i < MAT_DIM_I; ++i) {
-    //   for (size_t j = 0; j < MAT_DIM_J; ++j) {
-    //     full_D[i][j] = NO_BIAS ? 0 : RAND % 2;
-    //   }
-    // }
+  // printf("Init D\n");
+  // for (size_t i = 0; i < MAT_DIM_I; ++i) {
+  //   for (size_t j = 0; j < MAT_DIM_J; ++j) {
+  //     full_D[i][j] = NO_BIAS ? 0 : RAND % 2;
+  //   }
+  // }
 
 #if FAST
   // identity matrix
@@ -188,8 +196,10 @@ int main() {
   // }
 #else
   printf("Init B\n");
-  for (size_t i = 0; i < MAT_DIM_K; ++i) {
-    for (size_t j = 0; j < MAT_DIM_J; ++j) {
+  for (size_t i = 0; i < MAT_DIM_K; ++i)
+  {
+    for (size_t j = 0; j < MAT_DIM_J; ++j)
+    {
       full_B[i][j] = RAND % 2;
     }
   }
