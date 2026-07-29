@@ -28,6 +28,13 @@ tests = \
 
 tests_baremetal = $(tests:=-baremetal)
 
+# VPU programs require the custom0/funct64 RTL model and are intentionally not
+# added to the default Spike-backed test list.
+vpu_tests = vpu_dma vpu_nonlinear vpu_interleave vpu_mask_rearrange \
+	vpu_strided_dma
+vpu_tests_baremetal = $(vpu_tests:=-baremetal)
+vpu_tests_pk = $(vpu_tests:=-pk)
+
 ifeq ($(findstring spike,$(RUNNER)),spike)
 # Currently don't support conv or conv-with-pool on spike
 runs_baremetal = $(addsuffix .run,$(filter-out conv-baremetal conv_with_pool-baremetal,$(tests_baremetal)))
@@ -46,6 +53,9 @@ endif
 
 BENCH_COMMON = $(abs_top_srcdir)/riscv-tests/benchmarks/common
 GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h $(abs_top_srcdir)/include/gemmini_testutils_all.h $(abs_top_srcdir)/include/gemmini_all.h
+VPU_GENERATED_HEADER ?= vpu_params_generated.h
+VPU_GENERATED_HEADER_DEP = $(if $(filter /%,$(VPU_GENERATED_HEADER)),$(VPU_GENERATED_HEADER),$(abs_top_srcdir)/include/$(VPU_GENERATED_HEADER))
+VPU_HEADERS = $(abs_top_srcdir)/include/vpu.h $(abs_top_srcdir)/include/vpu_params.h $(abs_top_srcdir)/include/vpu_kernels.h $(abs_top_srcdir)/include/vpu_testutils.h $(VPU_GENERATED_HEADER_DEP)
 
 CFLAGS := $(CFLAGS) \
 	-DPREALLOCATE=1 \
@@ -82,6 +92,10 @@ CFLAGS_BAREMETAL := \
 
 all: $(tests_baremetal) $(tests_linux) $(tests_pk)
 
+.PHONY: vpu-baremetal vpu-pk
+vpu-baremetal: $(vpu_tests_baremetal)
+vpu-pk: $(vpu_tests_pk)
+
 vpath %.c $(src_dir)
 
 %-baremetal: %.c $(GEMMINI_HEADERS)
@@ -92,11 +106,16 @@ vpath %.c $(src_dir)
 	$(CC_LINUX) $(CFLAGS) $< $(LFLAGS) -o $@
 
 %-pk: %.c $(GEMMINI_HEADERS)
-	$(CC_LINUX) $(CFLAGS_PK) $< $(LFLAGS) -o $@
+	$(CC_LINUX) $(CFLAGS_PK) $< $(LFLAGS) -o $@ $(LIBS)
+
+$(vpu_tests_baremetal) $(vpu_tests_pk): LIBS += -lm -lc -lgcc
+$(vpu_tests_baremetal): CFLAGS_BAREMETAL += -fno-fast-math -DVPU_PARAMS_GENERATED_HEADER='"$(VPU_GENERATED_HEADER)"'
+$(vpu_tests_pk): CFLAGS_PK += -fno-fast-math -DVPU_PARAMS_GENERATED_HEADER='"$(VPU_GENERATED_HEADER)"'
+$(vpu_tests_baremetal) $(vpu_tests_pk): $(VPU_HEADERS)
 
 run-baremetal: $(runs_baremetal)
 
 %-baremetal.run: %-baremetal
 	$(RUNNER)$(abs_top_srcdir)/build/bareMetalC/$^
 
-junk += $(tests_baremetal) $(tests_linux) $(tests_pk)
+junk += $(tests_baremetal) $(tests_linux) $(tests_pk) $(vpu_tests_baremetal) $(vpu_tests_pk)

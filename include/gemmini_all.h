@@ -3104,28 +3104,11 @@ static void shared_multi_tiled_matmul_outer(int gemmini_list, int tile_id,
           }
         }
         
-        for (int i = 0; i < total_gemmini_num; i++)
-        {
-          if ((group_list >> i) & 1)
-          {
-            switch (i)
-            {
-            case 3:
-              // printf("delay");
-              ROCC_INSTRUCTION_RS1_RS2(custom3, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-              break;
-            case 2:
-              ROCC_INSTRUCTION_RS1_RS2(custom2, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-              break;
-            case 1:
-              ROCC_INSTRUCTION_RS1_RS2(custom1, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-              break;
-            case 0:
-              ROCC_INSTRUCTION_RS1_RS2(custom0, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (!no_bias || (k0 != 0)), ((b_transpose) << 1) | (a_transpose), k_LOOP_WS);
-              break;
-            }
-          }
-        }
+        /* shared_gemmini_loop_ws() emits one funct8 command from the last
+         * selected member with group_list in rs1[51:48].  The RoCC router
+         * delivers that transaction exactly once to every selected Gemmini;
+         * issuing legacy per-member LOOP_WS commands here would launch each
+         * configured loop a second time. */
 
         inner_call_counter++;
         if (k0 == K0 - 1)

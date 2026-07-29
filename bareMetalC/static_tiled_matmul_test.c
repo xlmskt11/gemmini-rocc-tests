@@ -15,19 +15,19 @@
 #define PROFILE false
 #define profile_data_num 20000
 
-#define MULTI false
+#define MULTI true
 #define gemmini_configuration 15
 
-#define MAT_DIM_I 192
-#define MAT_DIM_J 512
-#define MAT_DIM_K 2048
+#define MAT_DIM_I 128
+#define MAT_DIM_J 128
+#define MAT_DIM_K 128
 #define RAND rand()
 #define FAST true
 #define NO_BIAS true
 #define FULL_BIAS_WIDTH true
 #define FULL_C_WIDTH true
 #define REPEATING_BIAS false
-#define CHECK false
+#define CHECK true
 
 #define PACKED_A false
 #define PACKED_B false
@@ -162,30 +162,30 @@ int main() {
     static elem_t gold[MAT_DIM_I][MAT_DIM_J];
 #endif
 
-    // printf("Init A\n");
-    // for (size_t i = 0; i < MAT_DIM_I; ++i)
-    // {
-    //   for (size_t j = 0; j < MAT_DIM_K; ++j)
-    //   {
-    //     full_A[i][j] = RAND % 2;
-    //   }
-    // }
+    printf("Init A\n");
+    for (size_t i = 0; i < MAT_DIM_I; ++i)
+    {
+      for (size_t j = 0; j < MAT_DIM_K; ++j)
+      {
+        full_A[i][j] = RAND % 2;
+      }
+    }
 
-    // printf("Init D\n");
-    // for (size_t i = 0; i < MAT_DIM_I; ++i) {
-    //   for (size_t j = 0; j < MAT_DIM_J; ++j) {
-    //     full_D[i][j] = NO_BIAS ? 0 : RAND % 2;
-    //   }
-    // }
+    printf("Init D\n");
+    for (size_t i = 0; i < MAT_DIM_I; ++i) {
+      for (size_t j = 0; j < MAT_DIM_J; ++j) {
+        full_D[i][j] = NO_BIAS ? 0 : RAND % 2;
+      }
+    }
 
 #if FAST
   // identity matrix
-  // printf("Init B\n");
-  // for (size_t i = 0; i < MAT_DIM_K; ++i) {
-  //   for (size_t j = 0; j < MAT_DIM_J; ++j) {
-  //     full_B[i][j] = i == j;
-  //   }
-  // }
+  printf("Init B\n");
+  for (size_t i = 0; i < MAT_DIM_K; ++i) {
+    for (size_t j = 0; j < MAT_DIM_J; ++j) {
+      full_B[i][j] = i == j;
+    }
+  }
 #else
   printf("Init B\n");
   for (size_t i = 0; i < MAT_DIM_K; ++i) {

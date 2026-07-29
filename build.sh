@@ -10,6 +10,10 @@ if [ ! -d "build" ] ; then
         echo $0 failed
         exit 1
     fi
+elif [ "Makefile.in" -nt "build/Makefile" ] ; then
+    # Keep forwarding targets in an existing out-of-tree build synchronized
+    # with their canonical Makefile.in definition.
+    (cd build && ../configure) || exit 1
 fi
 
 cd build
@@ -19,4 +23,3 @@ if [[ $(which riscv64-unknown-linux-gnu-gcc) ]] ; then
 else
     make -j BAREMETAL_ONLY=1 $@
 fi
-
