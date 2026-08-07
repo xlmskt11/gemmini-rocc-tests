@@ -1054,10 +1054,25 @@ static void matmul_cpu(bool transA, bool transB, size_t DIM_I, size_t DIM_J, siz
         acc_t sum_exp = 0;
         for (size_t j = 0; j < DIM_J; j++) {
           acc_t q = c_buffer[j] - max_q;
+#ifdef ELEM_T_IS_FLOAT
+          // The original I-BERT approximation expresses both operations as
+          // integer right shifts.  For FP accumulators, perform the same
+          // divide-by-2^z scaling arithmetically instead of applying an
+          // invalid C bit-shift to a float.
+          int z = (int) (-q * qln2_inv / 65536);
+#else
           acc_t z = (acc_t) (-q * qln2_inv) >> 16;
+#endif
           acc_t qp = q + z * qln2;
           acc_t q_exp = (qp + qb)*(qp + qb) + qc;
+#ifdef ELEM_T_IS_FLOAT
+          acc_t pow2_z = 1;
+          for (int shift = 0; shift < z; shift++)
+            pow2_z *= 2;
+          c_buffer[j] = q_exp / pow2_z;
+#else
           c_buffer[j] = q_exp >> z;
+#endif
           sum_exp += c_buffer[j];
         }
 
@@ -3289,4 +3304,3 @@ static void tiled_global_average_auto(const elem_t * input, elem_t * output,
 #undef abs
 
 #endif // SRC_MAIN_C_GEMMINI_H
-

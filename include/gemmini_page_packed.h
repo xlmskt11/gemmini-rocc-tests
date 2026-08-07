@@ -12,6 +12,8 @@
 #define GEMMINI_PAGE_PACKED_PAGE_BYTES ((size_t)4096)
 #define GEMMINI_PAGE_PACKED_STRIDE_FLAG ((size_t)UINT64_C(1) << 31)
 #define GEMMINI_PAGE_PACKED_STRIDE_MASK (GEMMINI_PAGE_PACKED_STRIDE_FLAG - 1)
+// When LOOP_WS transposes an operand, page-pack its original source layout
+// before the transpose and encode that source layout's row width here.
 #define GEMMINI_PAGE_PACKED_STRIDE(stride) \
   (GEMMINI_PAGE_PACKED_STRIDE_FLAG | ((size_t)(stride) & GEMMINI_PAGE_PACKED_STRIDE_MASK))
 

@@ -27,6 +27,12 @@
 #define FULL_BIAS_WIDTH true
 #define REPEATING_BIAS false
 
+#define CEIL_DIV_CONST(numerator, denominator) \
+  (((numerator) + (denominator) - 1) / (denominator))
+#define PACKED_STORAGE_BYTES(rows, cols) \
+  (CEIL_DIV_CONST((rows), DIM) * CEIL_DIV_CONST((cols), DIM) * \
+   GEMMINI_PAGE_PACKED_PAGE_BYTES)
+
 #if FULL_BIAS_WIDTH
 typedef acc_t ACC_T;
 #else
@@ -37,6 +43,10 @@ static elem_t full_A[MAT_DIM_I][MAT_DIM_K] row_align(MAX_BLOCK_LEN);
 static elem_t full_At[MAT_DIM_K][MAT_DIM_I] row_align(MAX_BLOCK_LEN);
 static elem_t full_B[MAT_DIM_K][MAT_DIM_J] row_align(MAX_BLOCK_LEN);
 static elem_t full_Bt[MAT_DIM_J][MAT_DIM_K] row_align(MAX_BLOCK_LEN);
+static elem_t packed_At[PACKED_STORAGE_BYTES(MAT_DIM_K, MAT_DIM_I) / sizeof(elem_t)]
+    __attribute__((aligned(GEMMINI_PAGE_PACKED_PAGE_BYTES)));
+static elem_t packed_Bt[PACKED_STORAGE_BYTES(MAT_DIM_J, MAT_DIM_K) / sizeof(elem_t)]
+    __attribute__((aligned(GEMMINI_PAGE_PACKED_PAGE_BYTES)));
 static elem_t full_C[MAT_DIM_I][MAT_DIM_J] row_align(MAX_BLOCK_LEN);
 static ACC_T full_D[MAT_DIM_I][MAT_DIM_J] row_align_acc(MAX_BLOCK_LEN_ACC);
 static full_t gold_full[MAT_DIM_I][MAT_DIM_J];
@@ -97,6 +107,58 @@ static void init_matrices(void)
   for (size_t i = 0; i < MAT_DIM_I; ++i)
     for (size_t j = 0; j < MAT_DIM_J; ++j)
       full_D[i][j] = NO_BIAS ? 0 : (ACC_T)(((i + j) % 3) - 1);
+}
+
+static void pack_a_matrix(elem_t *packed, size_t packed_bytes,
+                          const elem_t *source, size_t rows, size_t cols,
+                          size_t source_stride)
+{
+  const size_t used_bytes =
+      gemmini_page_packed_a_page_count(rows, cols) * GEMMINI_PAGE_PACKED_PAGE_BYTES;
+  const size_t packed_row_stride =
+      gemmini_page_packed_a_dma_stride_bytes(GEMMINI_PAGE_PACKED_STRIDE(cols)) /
+      sizeof(elem_t);
+
+  assert(((uintptr_t)packed % GEMMINI_PAGE_PACKED_PAGE_BYTES) == 0);
+  assert(used_bytes <= packed_bytes);
+  memset(packed, 0, packed_bytes);
+
+  for (size_t row = 0; row < rows; ++row)
+  {
+    for (size_t col = 0; col < cols; ++col)
+    {
+      elem_t *block = gemmini_page_packed_a_block_addr_mut(
+          packed, row / DIM, col / DIM, cols);
+      block[(row % DIM) * packed_row_stride + col % DIM] =
+          source[row * source_stride + col];
+    }
+  }
+}
+
+static void pack_b_matrix(elem_t *packed, size_t packed_bytes,
+                          const elem_t *source, size_t rows, size_t cols,
+                          size_t source_stride)
+{
+  const size_t used_bytes =
+      gemmini_page_packed_b_page_count(rows, cols) * GEMMINI_PAGE_PACKED_PAGE_BYTES;
+  const size_t packed_row_stride =
+      gemmini_page_packed_b_dma_stride_bytes(GEMMINI_PAGE_PACKED_STRIDE(cols)) /
+      sizeof(elem_t);
+
+  assert(((uintptr_t)packed % GEMMINI_PAGE_PACKED_PAGE_BYTES) == 0);
+  assert(used_bytes <= packed_bytes);
+  memset(packed, 0, packed_bytes);
+
+  for (size_t row = 0; row < rows; ++row)
+  {
+    for (size_t col = 0; col < cols; ++col)
+    {
+      elem_t *block = gemmini_page_packed_b_block_addr_mut(
+          packed, row / DIM, col / DIM, cols);
+      block[(row % DIM) * packed_row_stride + col % DIM] =
+          source[row * source_stride + col];
+    }
+  }
 }
 
 static void reference_matmul(void)
@@ -248,6 +310,10 @@ int main(void)
   printf("MAT_DIM_K: %d\n", MAT_DIM_K);
 
   init_matrices();
+  pack_a_matrix(packed_At, sizeof(packed_At), (elem_t *)full_At,
+                MAT_DIM_K, MAT_DIM_I, MAT_DIM_I);
+  pack_b_matrix(packed_Bt, sizeof(packed_Bt), (elem_t *)full_Bt,
+                MAT_DIM_J, MAT_DIM_K, MAT_DIM_K);
   reference_matmul();
   full_matscale(gold_full, gold, ACC_SCALE_IDENTITY);
 
@@ -260,6 +326,16 @@ int main(void)
   total_cycles += run_case("matmul_b_transpose",
                            (elem_t *)full_A, (elem_t *)full_Bt,
                            MAT_DIM_K, MAT_DIM_K,
+                           false, true, 2);
+
+  total_cycles += run_case("matmul_page_packed_a_transpose",
+                           packed_At, (elem_t *)full_B,
+                           GEMMINI_PAGE_PACKED_STRIDE(MAT_DIM_I), MAT_DIM_J,
+                           true, false, 1);
+
+  total_cycles += run_case("matmul_page_packed_b_transpose",
+                           (elem_t *)full_A, packed_Bt,
+                           MAT_DIM_K, GEMMINI_PAGE_PACKED_STRIDE(MAT_DIM_K),
                            false, true, 2);
 
   printf("All transpose matmul cases passed\n");

@@ -13,7 +13,7 @@ tests = \
 
 tests_baremetal = $(tests:=-baremetal)
 runs_baremetal = $(addsuffix .run,$(tests_baremetal))
-ifdef BAREMETAL_ONLY
+ifeq ($(BAREMETAL_ONLY),1)
 	tests_linux =
 	tests_pk =
 else
@@ -75,5 +75,4 @@ run-baremetal: $(runs_baremetal)
 %-baremetal.run: %-baremetal
 	$(RUNNER)$^
 
-junk += $(tests_baremetal) $(tests_linux) $(tests_pk)
-
+junk += $(tests_baremetal) $(tests:=-linux) $(tests:=-pk)

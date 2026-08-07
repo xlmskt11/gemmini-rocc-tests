@@ -13,6 +13,7 @@
 #include <stdbool.h>
 
 #include "include/gemmini_params.h"
+#include "include/gemmini_tiling.h"
 
 #define GEMMINI_ASSERTIONS
 
@@ -37,56 +38,25 @@
 #define custom2 2
 #define custom3 3
 
-static size_t tiled_matmul_total_spad_rows(size_t I, size_t J, size_t K)
-{
-  return (I * K + K * J) * DIM;
-}
-
-// made
-static size_t tiled_matmul_A_spad_rows(size_t I, size_t J, size_t K)
-{
-  return (I * K) * DIM;
-}
-
-// made
-static size_t tiled_matmul_B_spad_rows(size_t I, size_t J, size_t K)
-{
-  return (K * J) * DIM;
-}
-
-static size_t tiled_matmul_total_acc_rows(size_t I, size_t J)
-{
-  return (I * J) * DIM;
-}
-
-static bool tiled_matmul_split_spad_rows_fit(size_t I, size_t J, size_t K, size_t max_operand_spad_rows)
-{
-  return tiled_matmul_A_spad_rows(I, J, K) <= max_operand_spad_rows &&
-         tiled_matmul_B_spad_rows(I, J, K) <= max_operand_spad_rows;
-}
-
-static size_t tiled_matmul_tile_balance_score(size_t I, size_t J, size_t K)
-{
-  const size_t max_IJ = I > J ? I : J;
-  const size_t max_IJK = max_IJ > K ? max_IJ : K;
-  const size_t min_IJ = I < J ? I : J;
-  const size_t min_IJK = min_IJ < K ? min_IJ : K;
-  return max_IJK - min_IJK;
-}
-
-static size_t tiled_matmul_tile_tail_gap(size_t total_tiles, size_t tile)
-{
-  const size_t remainder = total_tiles % tile;
-  return remainder == 0 ? 0 : tile - remainder;
-}
-
-static size_t tiled_matmul_tile_tail_score(size_t total_I, size_t total_J, size_t total_K,
-                                           size_t I, size_t J, size_t K)
-{
-  return tiled_matmul_tile_tail_gap(total_I, I) +
-         tiled_matmul_tile_tail_gap(total_J, J) +
-         tiled_matmul_tile_tail_gap(total_K, K);
-}
+/* Compatibility names used by the existing Gemmini software. The arithmetic
+ * lives in gemmini_tiling.h so standalone users such as the fused VPU tests can
+ * use the exact same capacity model without depending on elem_t or RoCC. */
+#define tiled_matmul_total_spad_rows(I, J, K) \
+  gemmini_tiling_total_spad_rows((I), (J), (K), DIM)
+#define tiled_matmul_A_spad_rows(I, J, K) \
+  gemmini_tiling_A_spad_rows((I), (J), (K), DIM)
+#define tiled_matmul_B_spad_rows(I, J, K) \
+  gemmini_tiling_B_spad_rows((I), (J), (K), DIM)
+#define tiled_matmul_total_acc_rows(I, J) \
+  gemmini_tiling_total_acc_rows((I), (J), DIM)
+#define tiled_matmul_split_spad_rows_fit(I, J, K, max_rows) \
+  gemmini_tiling_split_spad_rows_fit((I), (J), (K), DIM, (max_rows))
+#define tiled_matmul_tile_balance_score(I, J, K) \
+  gemmini_tiling_balance_score((I), (J), (K))
+#define tiled_matmul_tile_tail_gap(total, tile) \
+  gemmini_tiling_tail_gap((total), (tile))
+#define tiled_matmul_tile_tail_score(total_I, total_J, total_K, I, J, K) \
+  gemmini_tiling_tail_score((total_I), (total_J), (total_K), (I), (J), (K))
 
 static inline uint64_t gemmini_timing_read_cycles(void)
 {
@@ -3706,10 +3676,23 @@ static void matmul_cpu(bool transA, bool transB, size_t DIM_I, size_t DIM_J, siz
         acc_t sum_exp = 0;
         for (size_t j = 0; j < DIM_J; j++) {
           acc_t q = c_buffer[j] - max_q;
+#ifdef ELEM_T_IS_FLOAT
+          // Match the integer I-BERT divide-by-2^z approximation without
+          // applying C's bit-shift operator to an FP accumulator.
+          int z = (int) (-q * qln2_inv / 65536);
+#else
           acc_t z = (acc_t) (-q * qln2_inv) >> 16;
+#endif
           acc_t qp = q + z * qln2;
           acc_t q_exp = (qp + qb)*(qp + qb) + qc;
+#ifdef ELEM_T_IS_FLOAT
+          acc_t pow2_z = 1;
+          for (int shift = 0; shift < z; shift++)
+            pow2_z *= 2;
+          c_buffer[j] = q_exp / pow2_z;
+#else
           c_buffer[j] = q_exp >> z;
+#endif
           sum_exp += c_buffer[j];
         }
 
@@ -9501,7 +9484,6 @@ static void shared_multi_choose_tiling_factors_static(shared_multi_matmul_job_t 
 
 static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
 {
-
   job->gemmini_num = 0;
   for (int i = 0; i < total_gemmini_num; i++)
   {
@@ -9509,218 +9491,39 @@ static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
       job->gemmini_num++;
   }
 
-  // 기존 auto_test 상단에 있던 partition 계산
-  size_t partition_rows = (job->sp_addr_range / 2);
-  size_t mats_in_partition = (partition_rows / DIM);
-  size_t mats_in_acc = (job->acc_addr_range / DIM);
-  size_t max_tile_i_j = ((size_t)sqrt(mats_in_acc));
-  size_t max_tile_k = (mats_in_partition / max_tile_i_j);
-
-  // double-buffered 기준 partition (db_*)
-  size_t db_partition_rows_1 = ((job->sp_addr_range / 2) / 2);
-  size_t db_mats_in_partition_1 = (db_partition_rows_1 / DIM);
-  size_t db_mats_in_acc_1 = ((job->acc_addr_range / 2) / DIM);
-  size_t db_max_tile_i_j_1 = ((size_t)sqrt(db_mats_in_acc_1));
-  size_t db_max_tile_k_1 = (db_mats_in_partition_1 / db_max_tile_i_j_1);
-
-  job->dim_I_padded = (job->dim_I / DIM + (job->dim_I % DIM != 0)) * DIM;
-  job->dim_J_padded = (job->dim_J / DIM + (job->dim_J % DIM != 0)) * DIM;
-  job->dim_K_padded = (job->dim_K / DIM + (job->dim_K % DIM != 0)) * DIM;
-
   const bool double_buffered = job->dataflow == WEIGHT_STATIONARY;
+  gemmini_tiling_request_t request;
+  request.dim_I = job->dim_I;
+  request.dim_J = job->dim_J;
+  request.dim_K = job->dim_K;
+  request.dim = DIM;
+  request.gemmini_count = (size_t)job->gemmini_num;
+  request.sp_addr_range = job->sp_addr_range;
+  request.acc_addr_range = job->acc_addr_range;
+  request.double_buffered = double_buffered;
+  request.act = job->act;
 
-  const size_t max_spad_rows = double_buffered ? job->sp_addr_range / 2 : job->sp_addr_range;
-  const size_t max_operand_spad_rows = max_spad_rows / 2;
-  const size_t max_acc_rows = double_buffered ? job->acc_addr_range / 2 : job->acc_addr_range;
+  const gemmini_tiling_factors_t factors =
+      gemmini_shared_multi_choose_tiling(&request);
 
-  size_t tI, tJ, tK;
-
-  if (job->act == LAYERNORM || job->act == SOFTMAX)
-  {
-    tI = 1;
-    tJ = job->dim_J_padded / DIM;
-    tK = 1;
-  }
-  else if (double_buffered)
-  {
-    size_t max_i = (job->dim_I_padded / DIM);
-    size_t max_j = (job->dim_J_padded / DIM);
-    size_t max_k = (job->dim_K_padded / DIM);
-
-    tI = max_i < db_max_tile_i_j_1 ? max_i : db_max_tile_i_j_1;
-    tJ = max_j < db_max_tile_i_j_1 ? max_j : db_max_tile_i_j_1;
-    tK = max_k < db_max_tile_k_1 ? max_k : db_max_tile_k_1;
-  }
-  else
-  {
-    size_t max_i = (job->dim_I_padded / DIM);
-    size_t max_j = (job->dim_J_padded / DIM);
-    size_t max_k = (job->dim_K_padded / DIM);
-
-    tI = max_i < max_tile_i_j ? max_i : max_tile_i_j;
-    tJ = max_j < max_tile_i_j ? max_j : max_tile_i_j;
-    tK = max_k < max_tile_k ? max_k : max_tile_k;
-  }
-
-  const size_t max_i_tiles = job->dim_I_padded / DIM;
-  const size_t max_j_tiles = job->dim_J_padded / DIM;
-  const size_t max_k_tiles = job->dim_K_padded / DIM;
-  const size_t min_i_tiles = 1;
-  const size_t min_k_tiles = 1;
-  const size_t preferred_min_i_tiles = job->gemmini_num <= max_i_tiles ? job->gemmini_num : max_i_tiles;
-  const size_t preferred_min_k_tiles = job->gemmini_num <= max_k_tiles ? job->gemmini_num : max_k_tiles;
-
-  if (tI < preferred_min_i_tiles)
-  {
-    tI = preferred_min_i_tiles;
-  }
-  else if (tI >= job->gemmini_num && tI % job->gemmini_num != 0)
-  {
-    tI = (tI / job->gemmini_num) * job->gemmini_num;
-  }
-
-  if (tK < preferred_min_k_tiles)
-  {
-    tK = preferred_min_k_tiles;
-  }
-
-  while (true)
-  {
-    bool decreased = false;
-
-    if ((tiled_matmul_B_spad_rows(tI, tJ, tK) > max_operand_spad_rows ||
-         tiled_matmul_total_acc_rows(tI, tJ) > max_acc_rows) &&
-        tJ > 1)
-    {
-      tJ--;
-      decreased = true;
-    }
-
-    // Prefer the gemmini_num lower bounds, then fall back to 1 if capacity still cannot fit.
-    if (!decreased &&
-        !tiled_matmul_split_spad_rows_fit(tI, tJ, tK, max_operand_spad_rows) &&
-        tK > preferred_min_k_tiles)
-    {
-      tK--;
-      decreased = true;
-    }
-
-    if (!decreased &&
-        (tiled_matmul_A_spad_rows(tI, tJ, tK) > max_operand_spad_rows ||
-         tiled_matmul_total_acc_rows(tI, tJ) > max_acc_rows) &&
-        tI > preferred_min_i_tiles)
-    {
-      const size_t next_tI = tI > job->gemmini_num ? tI - job->gemmini_num : preferred_min_i_tiles;
-      tI = next_tI >= preferred_min_i_tiles ? next_tI : preferred_min_i_tiles;
-      decreased = true;
-    }
-
-    if (!decreased &&
-        !tiled_matmul_split_spad_rows_fit(tI, tJ, tK, max_operand_spad_rows) &&
-        tK > min_k_tiles)
-    {
-      tK--;
-      decreased = true;
-    }
-
-    if (!decreased &&
-        (tiled_matmul_A_spad_rows(tI, tJ, tK) > max_operand_spad_rows ||
-         tiled_matmul_total_acc_rows(tI, tJ) > max_acc_rows) &&
-        tI > min_i_tiles)
-    {
-      tI--;
-      decreased = true;
-    }
-
-    if (!decreased)
-      break;
-  }
-
-  // greedy하게 spad/acc를 꽉 채우도록 키우는 부분
-  while (true)
-  {
-    bool increased = false;
-    size_t best_tI = tI;
-    size_t best_tJ = tJ;
-    size_t best_tK = tK;
-    size_t best_score = 0;
-    size_t best_tail_score = 0;
-    size_t best_sum = 0;
-
-    if (tiled_matmul_split_spad_rows_fit(tI, tJ + 1, tK, max_operand_spad_rows) &&
-        tiled_matmul_total_acc_rows(tI, tJ + 1) <= max_acc_rows &&
-        (tJ + 1) * DIM <= job->dim_J_padded)
-    {
-      best_tJ = tJ + 1;
-      best_score = tiled_matmul_tile_balance_score(best_tI, best_tJ, best_tK);
-      best_tail_score = tiled_matmul_tile_tail_score(max_i_tiles, max_j_tiles, max_k_tiles,
-                                                     best_tI, best_tJ, best_tK);
-      best_sum = best_tI + best_tJ + best_tK;
-      increased = true;
-    }
-
-    const size_t next_tI = tI < preferred_min_i_tiles ? tI + 1 : tI + job->gemmini_num;
-    if (tiled_matmul_split_spad_rows_fit(next_tI, tJ, tK, max_operand_spad_rows) &&
-        tiled_matmul_total_acc_rows(next_tI, tJ) <= max_acc_rows &&
-        next_tI * DIM <= job->dim_I_padded)
-    {
-      const size_t score = tiled_matmul_tile_balance_score(next_tI, tJ, tK);
-      const size_t tail_score = tiled_matmul_tile_tail_score(max_i_tiles, max_j_tiles, max_k_tiles,
-                                                             next_tI, tJ, tK);
-      const size_t sum = next_tI + tJ + tK;
-      if (!increased ||
-          score < best_score ||
-          (score == best_score && tail_score < best_tail_score) ||
-          (score == best_score && tail_score == best_tail_score && sum < best_sum))
-      {
-        best_tI = next_tI;
-        best_tJ = tJ;
-        best_tK = tK;
-        best_score = score;
-        best_tail_score = tail_score;
-        best_sum = sum;
-      }
-      increased = true;
-    }
-
-    if (tiled_matmul_split_spad_rows_fit(tI, tJ, tK + 1, max_operand_spad_rows) &&
-        (tK + 1) * DIM <= job->dim_K_padded)
-    {
-      const size_t score = tiled_matmul_tile_balance_score(tI, tJ, tK + 1);
-      const size_t tail_score = tiled_matmul_tile_tail_score(max_i_tiles, max_j_tiles, max_k_tiles,
-                                                             tI, tJ, tK + 1);
-      const size_t sum = tI + tJ + tK + 1;
-      if (!increased ||
-          score < best_score ||
-          (score == best_score && tail_score < best_tail_score) ||
-          (score == best_score && tail_score == best_tail_score && sum < best_sum))
-      {
-        best_tI = tI;
-        best_tJ = tJ;
-        best_tK = tK + 1;
-        best_score = score;
-        best_tail_score = tail_score;
-        best_sum = sum;
-      }
-      increased = true;
-    }
-
-    if (!increased)
-      break;
-
-    tI = best_tI;
-    tJ = best_tJ;
-    tK = best_tK;
-  }
+  job->dim_I_padded = factors.dim_I_padded;
+  job->dim_J_padded = factors.dim_J_padded;
+  job->dim_K_padded = factors.dim_K_padded;
 
 #ifdef PRINT_TILE
 #if PRINT_TILE
-  const int spad_rows = tiled_matmul_total_spad_rows(tI, tJ, tK);
-  const int acc_rows = tiled_matmul_total_acc_rows(tI, tJ);
+  const size_t max_spad_rows =
+      double_buffered ? request.sp_addr_range / 2 : request.sp_addr_range;
+  const size_t max_acc_rows =
+      double_buffered ? request.acc_addr_range / 2 : request.acc_addr_range;
+  const int spad_rows = tiled_matmul_total_spad_rows(
+      factors.tile_I, factors.tile_J, factors.tile_K);
+  const int acc_rows = tiled_matmul_total_acc_rows(
+      factors.tile_I, factors.tile_J);
 
-  printf("tile_I: %d\n", tI);
-  printf("tile_J: %d\n", tJ);
-  printf("tile_K: %d\n\n", tK);
+  printf("tile_I: %d\n", factors.tile_I);
+  printf("tile_J: %d\n", factors.tile_J);
+  printf("tile_K: %d\n\n", factors.tile_K);
 
   printf("spad_rows: %d\n", spad_rows);
   printf("acc_rows: %d\n\n", acc_rows);
@@ -9732,14 +9535,19 @@ static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
 #endif
 #endif
 
-  job->tile_I = tI;
-  job->tile_J = tJ;
-  job->tile_K = tK;
-  job->sp_addr_range = tiled_matmul_total_spad_rows(tI, tJ, tK) * 2;
-  job->acc_addr_range = tiled_matmul_total_acc_rows(tI, tJ) * 2;
-  job->sp_addr_A_stacked = tiled_matmul_A_spad_rows(tI, tJ, tK);
-  job->sp_addr_B_stacked = tiled_matmul_B_spad_rows(tI, tJ, tK);
-  job->acc_addr_stacked = tiled_matmul_total_acc_rows(tI, tJ);
+  job->tile_I = factors.tile_I;
+  job->tile_J = factors.tile_J;
+  job->tile_K = factors.tile_K;
+  job->sp_addr_range = tiled_matmul_total_spad_rows(
+      factors.tile_I, factors.tile_J, factors.tile_K) * 2;
+  job->acc_addr_range = tiled_matmul_total_acc_rows(
+      factors.tile_I, factors.tile_J) * 2;
+  job->sp_addr_A_stacked = tiled_matmul_A_spad_rows(
+      factors.tile_I, factors.tile_J, factors.tile_K);
+  job->sp_addr_B_stacked = tiled_matmul_B_spad_rows(
+      factors.tile_I, factors.tile_J, factors.tile_K);
+  job->acc_addr_stacked = tiled_matmul_total_acc_rows(
+      factors.tile_I, factors.tile_J);
 }
 
 void shared_multi_tiled_matmul_job_init(shared_multi_matmul_job_t *job)
@@ -9952,8 +9760,10 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
   const bool page_packed_B = gemmini_page_packed_stride_is_packed(stride_B);
   const bool page_packed_D = gemmini_page_packed_stride_is_packed(stride_D);
   const bool page_packed_C = gemmini_page_packed_stride_is_packed(stride_C);
-  const bool page_packed_A_active = page_packed_A && !job->a_transpose;
-  const bool page_packed_B_active = page_packed_B && !job->b_transpose;
+  // Packed operands keep their full-buffer base for either orientation;
+  // LoopMatmul maps the logical page offsets to the transposed physical axes.
+  const bool page_packed_A_active = page_packed_A;
+  const bool page_packed_B_active = page_packed_B;
   const bool use_page_offsets =
       page_packed_A_active || page_packed_B_active || page_packed_D || page_packed_C;
   const size_t plain_stride_A = gemmini_page_packed_stride_payload(stride_A);
@@ -12506,8 +12316,7 @@ static void tiled_matmul_single_job_step(tiled_matmul_single_job_t *job)
   const bool page_packed_D = gemmini_page_packed_stride_is_packed(job->stride_D);
   const bool page_packed_C = gemmini_page_packed_stride_is_packed(job->stride_C);
   const bool use_page_offsets =
-      (page_packed_A && !job->a_transpose) ||
-      (page_packed_B && !job->b_transpose) || page_packed_D || page_packed_C;
+      page_packed_A || page_packed_B || page_packed_D || page_packed_C;
   const size_t plain_stride_A = gemmini_page_packed_stride_payload(job->stride_A);
   const size_t plain_stride_B = gemmini_page_packed_stride_payload(job->stride_B);
   const size_t plain_stride_D = gemmini_page_packed_stride_payload(job->stride_D);
@@ -12542,13 +12351,13 @@ static void tiled_matmul_single_job_step(tiled_matmul_single_job_t *job)
   const size_t pad_J = j0 == job->J0 - 1 ? job->padding_J : 0;
   const size_t pad_K = k0 == job->K0 - 1 ? job->padding_K : 0;
 
-  const elem_t *a = page_packed_A && !job->a_transpose
+  const elem_t *a = page_packed_A
                         ? job->A
                         : (job->a_transpose
                                ? (job->A + k0 * job->tile_K * DIM * plain_stride_A + i0 * job->tile_I * DIM)
                                : (job->A + i0 * job->tile_I * DIM * plain_stride_A + k0 * job->tile_K * DIM));
 
-  const elem_t *b = page_packed_B && !job->b_transpose
+  const elem_t *b = page_packed_B
                         ? job->B
                         : (job->b_transpose
                                ? (job->B + j0 * job->tile_J * DIM * plain_stride_B + k0 * job->tile_K * DIM)

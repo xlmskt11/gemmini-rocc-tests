@@ -8,11 +8,25 @@
 #include "include/vpu_kernels.h"
 #include "include/vpu_testutils.h"
 
-#define VPU_TEST_MAX_ELEMENTS 2048u
+#ifndef VPU_TEST_MAX_ELEMENTS
+#ifdef VPU_NONLINEAR_MAX_ELEMENTS
+#define VPU_TEST_MAX_ELEMENTS VPU_NONLINEAR_MAX_ELEMENTS
+#else
+#define VPU_TEST_MAX_ELEMENTS 20000u
+#endif
+#endif
 #define VPU_TEST_STORAGE_ELEMENTS (VPU_TEST_MAX_ELEMENTS + 2u)
+#define VPU_TEST_GUARD_ELEMENTS \
+  (VPU_VLEN + (VPU_DMA_MAX_BYTES / VPU_STORAGE_BYTES))
 
 #ifndef VPU_BENCHMARK_LENGTH
+#ifdef VPU_NONLINEAR_BENCHMARK_LENGTH
+#define VPU_BENCHMARK_LENGTH VPU_NONLINEAR_BENCHMARK_LENGTH
+#elif VPU_TEST_MAX_ELEMENTS >= 2048u
+#define VPU_BENCHMARK_LENGTH 2048u
+#else
 #define VPU_BENCHMARK_LENGTH VPU_TEST_MAX_ELEMENTS
+#endif
 #endif
 
 #if VPU_BENCHMARK_LENGTH > VPU_TEST_MAX_ELEMENTS
@@ -35,6 +49,12 @@ static float input_reference[VPU_TEST_MAX_ELEMENTS]
 static float aux_reference[VPU_TEST_MAX_ELEMENTS]
     __attribute__((aligned(64)));
 static float expected[VPU_TEST_MAX_ELEMENTS] __attribute__((aligned(64)));
+
+/* RoPE tables and a local gather map are reused by every streamed row. */
+static vpu_storage_t rope_sin_storage[VPU_VLEN + 2u]
+    __attribute__((aligned(64)));
+static float rope_sin_reference[VPU_VLEN] __attribute__((aligned(64)));
+static vpu_index_t permute_indices[VPU_VLEN] __attribute__((aligned(64)));
 
 /*
  * The FP32 correctness reference is also the scalar CPU baseline.  Keep the
@@ -303,11 +323,12 @@ static void prepare_benchmark_output(void) {
 
 static void prepare_vectors(size_t n) {
   const vpu_storage_t guard = guard_value();
-  for (size_t i = 0; i < VPU_TEST_STORAGE_ELEMENTS; ++i) {
-    input_storage[i] = guard;
-    aux_storage[i] = guard;
-    output_storage[i] = guard;
-  }
+  input_storage[0] = guard;
+  aux_storage[0] = guard;
+  output_storage[0] = guard;
+  input_storage[VPU_TEST_MAX_ELEMENTS + 1u] = guard;
+  aux_storage[VPU_TEST_MAX_ELEMENTS + 1u] = guard;
+  output_storage[VPU_TEST_MAX_ELEMENTS + 1u] = guard;
   for (size_t i = 0; i < n; ++i) {
     const float input = ((int)(i % 29u) - 14) * 0.125f;
     const float auxiliary = 0.75f + (float)(i % 11u) * 0.03125f;
@@ -315,6 +336,16 @@ static void prepare_vectors(size_t n) {
     aux_storage[i + 1u] = vpu_float_to_storage(auxiliary);
     input_reference[i] = vpu_storage_to_float(input_storage[i + 1u]);
     aux_reference[i] = vpu_storage_to_float(aux_storage[i + 1u]);
+    output_storage[i + 1u] = guard;
+  }
+  size_t guard_end = n + VPU_TEST_GUARD_ELEMENTS;
+  if (guard_end < n || guard_end > VPU_TEST_MAX_ELEMENTS) {
+    guard_end = VPU_TEST_MAX_ELEMENTS;
+  }
+  for (size_t i = n; i < guard_end; ++i) {
+    input_storage[i + 1u] = guard;
+    aux_storage[i + 1u] = guard;
+    output_storage[i + 1u] = guard;
   }
 }
 
@@ -335,7 +366,11 @@ static int check_guards(const char *name, size_t n) {
     printf("%s[%u] corrupted a surrounding guard\n", name, (unsigned)n);
     return 1;
   }
-  for (size_t i = n; i < VPU_TEST_MAX_ELEMENTS; ++i) {
+  size_t guard_end = n + VPU_TEST_GUARD_ELEMENTS;
+  if (guard_end < n || guard_end > VPU_TEST_MAX_ELEMENTS) {
+    guard_end = VPU_TEST_MAX_ELEMENTS;
+  }
+  for (size_t i = n; i < guard_end; ++i) {
     if (input_storage[i + 1u] != guard ||
         aux_storage[i + 1u] != guard ||
         output_storage[i + 1u] != guard) {
@@ -427,9 +462,9 @@ static int test_rmsnorm(size_t n, int final_norm) {
   }
   vpu_clear_status(VPU_CLEAR_ERRORS);
   const uint64_t status = final_norm
-      ? vpu_tiled_final_norm_auto(&input_storage[1], &aux_storage[1],
+      ? vpu_final_norm_auto(&input_storage[1], &aux_storage[1],
                                   &output_storage[1], n, epsilon)
-      : vpu_tiled_rmsnorm_auto(&input_storage[1], &aux_storage[1],
+      : vpu_rmsnorm_auto(&input_storage[1], &aux_storage[1],
                                &output_storage[1], n, epsilon);
   if (finish_and_check(name, n, status)) {
     return 1;
@@ -446,9 +481,9 @@ static int test_rmsnorm(size_t n, int final_norm) {
     vpu_clear_status(VPU_CLEAR_ALL);
     const uint64_t vpu_start = benchmark_read_cycles();
     const uint64_t benchmark_status = final_norm
-        ? vpu_tiled_final_norm_auto(input_reference, aux_reference,
+        ? vpu_final_norm_auto(input_reference, aux_reference,
                                     benchmark_output, n, epsilon)
-        : vpu_tiled_rmsnorm_auto(input_reference, aux_reference,
+        : vpu_rmsnorm_auto(input_reference, aux_reference,
                                  benchmark_output, n, epsilon);
     const uint64_t vpu_e2e_cycles = benchmark_read_cycles() - vpu_start;
     const struct benchmark_perf perf = benchmark_read_perf_counters();
@@ -480,7 +515,7 @@ static int test_silu(size_t n) {
 #endif
   }
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  const uint64_t status = vpu_tiled_silu_auto(
+  const uint64_t status = vpu_silu_auto(
       &input_storage[1], &output_storage[1], n);
   if (finish_and_check("silu", n, status)) {
     return 1;
@@ -492,7 +527,7 @@ static int test_silu(size_t n) {
     prepare_benchmark_output();
     vpu_clear_status(VPU_CLEAR_ALL);
     const uint64_t vpu_start = benchmark_read_cycles();
-    const uint64_t benchmark_status = vpu_tiled_silu_auto(
+    const uint64_t benchmark_status = vpu_silu_auto(
         input_reference, benchmark_output, n);
     const uint64_t vpu_e2e_cycles = benchmark_read_cycles() - vpu_start;
     const struct benchmark_perf perf = benchmark_read_perf_counters();
@@ -507,6 +542,72 @@ static int test_silu(size_t n) {
   }
 #endif
   return 0;
+}
+
+enum test_unary_activation {
+  TEST_ACT_RELU = 0,
+  TEST_ACT_SIGMOID = 1,
+  TEST_ACT_TANH = 2,
+  TEST_ACT_GELU = 3,
+};
+
+static int test_unary_activation(size_t n,
+                                 enum test_unary_activation activation) {
+  const char *name = "relu";
+  prepare_vectors(n);
+  switch (activation) {
+    case TEST_ACT_SIGMOID:
+      name = "sigmoid";
+      vpu_ref_sigmoid(input_reference, expected, n);
+      break;
+    case TEST_ACT_TANH:
+      name = "tanh";
+      vpu_ref_tanh(input_reference, expected, n);
+      break;
+    case TEST_ACT_GELU:
+      name = "gelu_sigmoid_approx";
+      vpu_ref_gelu(input_reference, expected, n);
+      break;
+    case TEST_ACT_RELU:
+    default:
+      vpu_ref_relu(input_reference, expected, n);
+      break;
+  }
+
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  uint64_t status;
+  switch (activation) {
+    case TEST_ACT_SIGMOID:
+      status = vpu_sigmoid_auto(
+          &input_storage[1], &output_storage[1], n);
+      break;
+    case TEST_ACT_TANH:
+      status = vpu_tanh_auto(&input_storage[1], &output_storage[1], n);
+      break;
+    case TEST_ACT_GELU:
+      status = vpu_gelu_auto(&input_storage[1], &output_storage[1], n);
+      break;
+    case TEST_ACT_RELU:
+    default:
+      status = vpu_relu_auto(&input_storage[1], &output_storage[1], n);
+      break;
+  }
+  return finish_and_check(name, n, status);
+}
+
+static int test_unary_activation_multibatch(void) {
+  const size_t capacity = vpu_stream_batch_capacity();
+  /* Two complete batches plus a two-row ping reuse ensure all three batches
+   * replay a captured body; the extra 17 elements exercise tail peeling. */
+  const size_t n = (2u * capacity + 2u) * (size_t)VPU_VLEN + 17u;
+  if (n > VPU_TEST_MAX_ELEMENTS) {
+    return 0;
+  }
+  printf("VPU unary activation ping/pong reuse length %u\n", (unsigned)n);
+  return test_unary_activation(n, TEST_ACT_RELU) ||
+         test_unary_activation(n, TEST_ACT_SIGMOID) ||
+         test_unary_activation(n, TEST_ACT_TANH) ||
+         test_unary_activation(n, TEST_ACT_GELU);
 }
 
 static int test_swiglu(size_t n) {
@@ -524,7 +625,7 @@ static int test_swiglu(size_t n) {
 #endif
   }
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  const uint64_t status = vpu_tiled_swiglu_auto(
+  const uint64_t status = vpu_swiglu_auto(
       &input_storage[1], &aux_storage[1], &output_storage[1], n);
   if (finish_and_check("swiglu", n, status)) {
     return 1;
@@ -536,7 +637,7 @@ static int test_swiglu(size_t n) {
     prepare_benchmark_output();
     vpu_clear_status(VPU_CLEAR_ALL);
     const uint64_t vpu_start = benchmark_read_cycles();
-    const uint64_t benchmark_status = vpu_tiled_swiglu_auto(
+    const uint64_t benchmark_status = vpu_swiglu_auto(
         input_reference, aux_reference, benchmark_output, n);
     const uint64_t vpu_e2e_cycles = benchmark_read_cycles() - vpu_start;
     const struct benchmark_perf perf = benchmark_read_perf_counters();
@@ -568,7 +669,7 @@ static int test_softmax(size_t n) {
 #endif
   }
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  const uint64_t status = vpu_tiled_softmax_auto(
+  const uint64_t status = vpu_softmax_auto(
       &input_storage[1], &output_storage[1], n);
   if (finish_and_check("softmax", n, status)) {
     return 1;
@@ -584,7 +685,7 @@ static int test_softmax(size_t n) {
     prepare_benchmark_output();
     vpu_clear_status(VPU_CLEAR_ALL);
     const uint64_t vpu_start = benchmark_read_cycles();
-    const uint64_t benchmark_status = vpu_tiled_softmax_auto(
+    const uint64_t benchmark_status = vpu_softmax_auto(
         input_reference, benchmark_output, n);
     const uint64_t vpu_e2e_cycles = benchmark_read_cycles() - vpu_start;
     const struct benchmark_perf perf = benchmark_read_perf_counters();
@@ -604,6 +705,177 @@ static int test_softmax(size_t n) {
   }
 #endif
   return 0;
+}
+
+static void prepare_rope_tables(size_t rotary_dim,
+                                enum vpu_rope_layout layout) {
+  const vpu_storage_t guard = guard_value();
+  for (size_t i = 0; i < VPU_VLEN + 2u; ++i) {
+    rope_sin_storage[i] = guard;
+  }
+  const size_t half = rotary_dim / 2u;
+  for (size_t i = 0; i < rotary_dim; ++i) {
+    const size_t frequency = layout == VPU_ROPE_INTERLEAVED ? i / 2u
+                                                            : i % half;
+    const float angle = ((int)(frequency % 23u) - 11) * 0.03125f;
+    aux_storage[i + 1u] = vpu_float_to_storage(cosf(angle));
+    rope_sin_storage[i + 1u] = vpu_float_to_storage(sinf(angle));
+    aux_reference[i] = vpu_storage_to_float(aux_storage[i + 1u]);
+    rope_sin_reference[i] =
+        vpu_storage_to_float(rope_sin_storage[i + 1u]);
+  }
+}
+
+static int check_rope_table_guards(const char *name, size_t rotary_dim) {
+  const vpu_storage_t guard = guard_value();
+  if (rope_sin_storage[0] != guard ||
+      rope_sin_storage[VPU_VLEN + 1u] != guard) {
+    printf("%s corrupted a RoPE table guard\n", name);
+    return 1;
+  }
+  for (size_t i = rotary_dim; i < VPU_VLEN; ++i) {
+    if (rope_sin_storage[i + 1u] != guard) {
+      printf("%s touched RoPE sine tail at %u\n", name, (unsigned)i);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int test_rope(size_t rows, size_t rotary_dim,
+                     enum vpu_rope_layout layout, int in_place) {
+  const char *name = layout == VPU_ROPE_INTERLEAVED
+      ? (in_place ? "rope_interleaved_in_place" : "rope_interleaved")
+      : (in_place ? "rope_neox_in_place" : "rope_neox");
+  if (rotary_dim > VPU_VLEN || (rotary_dim & 1u) != 0 ||
+      (rotary_dim != 0 && rows > VPU_TEST_MAX_ELEMENTS / rotary_dim)) {
+    printf("%s test shape is invalid: rows=%u rotary_dim=%u\n", name,
+           (unsigned)rows, (unsigned)rotary_dim);
+    return 1;
+  }
+  const size_t elements = rows * rotary_dim;
+  prepare_vectors(elements);
+  prepare_rope_tables(rotary_dim, layout);
+  vpu_ref_rope(input_reference, aux_reference, rope_sin_reference, expected,
+               rows, rotary_dim, layout);
+
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  const uint64_t status = vpu_rope_auto(
+      &input_storage[1], &aux_storage[1], &rope_sin_storage[1],
+      in_place ? &input_storage[1] : &output_storage[1], rows, rotary_dim,
+      layout);
+  if ((status & VPU_STATUS_ERROR_MASK) != 0) {
+    printf("%s[%u]: VPU status error 0x%llx\n", name, (unsigned)elements,
+           (unsigned long long)status);
+    return 1;
+  }
+  if (check_guards(name, elements) ||
+      check_rope_table_guards(name, rotary_dim)) {
+    return 1;
+  }
+  return check_output_values(
+      name, elements, in_place ? &input_storage[1] : &output_storage[1]);
+}
+
+static int test_permute(size_t groups, size_t group_elements,
+                        int in_place) {
+  const char *name = in_place ? "permute_local_in_place" : "permute_local";
+  if (group_elements > VPU_VLEN ||
+      (group_elements != 0 &&
+       groups > VPU_TEST_MAX_ELEMENTS / group_elements)) {
+    printf("%s test shape is invalid: groups=%u group_elements=%u\n", name,
+           (unsigned)groups, (unsigned)group_elements);
+    return 1;
+  }
+  const size_t elements = groups * group_elements;
+  prepare_vectors(elements);
+  for (size_t i = 0; i < group_elements; ++i) {
+    size_t index = group_elements - 1u - i;
+    if ((i % 17u) == 0u) {
+      /* `group_elements` is representable for every tested VL below VLEN and
+       * is already out of the current gather window. */
+      index = group_elements;  /* Gather contract: out of range -> +0. */
+    } else if ((i % 13u) == 0u) {
+      index = group_elements > 3u ? 3u : 0u;  /* Duplicate selection. */
+    }
+    permute_indices[i] = (vpu_index_t)index;
+  }
+  vpu_ref_permute(input_reference, permute_indices, expected, groups,
+                  group_elements);
+
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  const uint64_t status = vpu_permute_auto(
+      &input_storage[1], permute_indices,
+      in_place ? &input_storage[1] : &output_storage[1], groups,
+      group_elements);
+  if ((status & VPU_STATUS_ERROR_MASK) != 0) {
+    printf("%s[%u]: VPU status error 0x%llx\n", name, (unsigned)elements,
+           (unsigned long long)status);
+    return 1;
+  }
+  if (check_guards(name, elements)) {
+    return 1;
+  }
+  return check_output_values(
+      name, elements, in_place ? &input_storage[1] : &output_storage[1]);
+}
+
+static int test_rearrangement_kernels(void) {
+  /* Keep every shape legal for the elaborated VLEN. The default VLEN=128
+   * retains the original 100-element 10k/20k cases; smaller configurations
+   * use their largest even rotary dimension instead. */
+  printf("VPU RoPE/local-permute auto-layout tests\n");
+  const size_t large_rotary_dim = VPU_VLEN >= 100u
+      ? 100u : ((size_t)VPU_VLEN & ~(size_t)1u);
+  const size_t rows_10k = large_rotary_dim == 0u
+      ? 0u : 10000u / large_rotary_dim;
+  const size_t rows_20k = large_rotary_dim == 0u
+      ? 0u : 20000u / large_rotary_dim;
+  if (VPU_TEST_MAX_ELEMENTS >= rows_10k * large_rotary_dim &&
+      rows_10k != 0u &&
+      test_rope(rows_10k, large_rotary_dim,
+                VPU_ROPE_INTERLEAVED, 0)) {
+    return 1;
+  }
+  if (VPU_TEST_MAX_ELEMENTS >= rows_20k * large_rotary_dim &&
+      rows_20k != 0u &&
+      test_rope(rows_20k, large_rotary_dim, VPU_ROPE_NEOX, 0)) {
+    return 1;
+  }
+  const size_t inplace_rotary_dim = VPU_VLEN >= 64u
+      ? 64u : ((size_t)VPU_VLEN & ~(size_t)1u);
+  if (inplace_rotary_dim != 0u &&
+      VPU_TEST_MAX_ELEMENTS >= 3u * inplace_rotary_dim &&
+      (test_rope(3u, inplace_rotary_dim, VPU_ROPE_INTERLEAVED, 1) ||
+       test_rope(3u, inplace_rotary_dim, VPU_ROPE_NEOX, 1))) {
+    return 1;
+  }
+  /* Cross full ping, full pong, and then reuse ping for any configured bank
+   * geometry. Keep this focused regression because stale row-address GPs can
+   * otherwise make the third batch silently consume the old slot. */
+  const size_t boundary_rows =
+      2u * vpu_rearrange_batch_capacity() + 1u;
+  if (boundary_rows <= VPU_TEST_MAX_ELEMENTS / 16u &&
+      (test_rope(boundary_rows, 16u, VPU_ROPE_INTERLEAVED, 0) ||
+       test_rope(boundary_rows, 16u, VPU_ROPE_NEOX, 1) ||
+       test_permute(boundary_rows, 16u, 0) ||
+       test_permute(boundary_rows, 16u, 1))) {
+      return 1;
+  }
+  const size_t large_permute_dim = VPU_VLEN >= 100u
+      ? 100u : (size_t)VPU_VLEN;
+  const size_t large_permute_rows = large_permute_dim == 0u
+      ? 0u : 20000u / large_permute_dim;
+  if (large_permute_rows != 0u &&
+      VPU_TEST_MAX_ELEMENTS >= large_permute_rows * large_permute_dim &&
+      test_permute(large_permute_rows, large_permute_dim, 0)) {
+    return 1;
+  }
+  const size_t odd_permute_dim = VPU_VLEN >= 127u
+      ? 127u : (size_t)VPU_VLEN - 1u;
+  return odd_permute_dim != 0u &&
+      VPU_TEST_MAX_ELEMENTS >= 3u * odd_permute_dim
+      ? test_permute(3u, odd_permute_dim, 1) : 0;
 }
 
 static int check_finite_outputs(const char *name, size_t n) {
@@ -705,9 +977,9 @@ static int test_finite_rmsnorm_stress(int final_norm) {
   vpu_ref_rmsnorm(input_reference, aux_reference, expected, n, epsilon);
   vpu_clear_status(VPU_CLEAR_ERRORS);
   const uint64_t status = final_norm
-      ? vpu_tiled_final_norm_auto(&input_storage[1], &aux_storage[1],
+      ? vpu_final_norm_auto(&input_storage[1], &aux_storage[1],
                                   &output_storage[1], n, epsilon)
-      : vpu_tiled_rmsnorm_auto(&input_storage[1], &aux_storage[1],
+      : vpu_rmsnorm_auto(&input_storage[1], &aux_storage[1],
                                &output_storage[1], n, epsilon);
   if (finish_and_check(name, n, status) || check_finite_outputs(name, n)) {
     return 1;
@@ -760,7 +1032,7 @@ static int test_finite_silu_stress(void) {
   prepare_activation_stress(n);
   vpu_ref_silu(input_reference, expected, n);
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  const uint64_t status = vpu_tiled_silu_auto(
+  const uint64_t status = vpu_silu_auto(
       &input_storage[1], &output_storage[1], n);
   if (finish_and_check(name, n, status) || check_finite_outputs(name, n)) {
     return 1;
@@ -778,7 +1050,7 @@ static int test_finite_swiglu_stress(void) {
   prepare_activation_stress(n);
   vpu_ref_swiglu(input_reference, aux_reference, expected, n);
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  const uint64_t status = vpu_tiled_swiglu_auto(
+  const uint64_t status = vpu_swiglu_auto(
       &input_storage[1], &aux_storage[1], &output_storage[1], n);
   if (finish_and_check(name, n, status) || check_finite_outputs(name, n)) {
     return 1;
@@ -802,7 +1074,7 @@ static int test_finite_softmax_stress(void) {
   refresh_references(n);
   vpu_ref_softmax(input_reference, expected, n);
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  const uint64_t status = vpu_tiled_softmax_auto(
+  const uint64_t status = vpu_softmax_auto(
       &input_storage[1], &output_storage[1], n);
   if (finish_and_check(name, n, status)) {
     return 1;
@@ -827,7 +1099,7 @@ static int test_rmsnorm_nonfinite(void) {
   refresh_references(COUNT);
   vpu_ref_rmsnorm(input_reference, aux_reference, expected, COUNT, 1.0e-5f);
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  uint64_t status = vpu_tiled_rmsnorm_auto(
+  uint64_t status = vpu_rmsnorm_auto(
       &input_storage[1], &aux_storage[1], &output_storage[1], COUNT, 1.0e-5f);
   if (finish_and_check(name, COUNT, status) ||
       check_canonical_nan_outputs(name, COUNT)) {
@@ -844,7 +1116,7 @@ static int test_rmsnorm_nonfinite(void) {
   refresh_references(COUNT);
   vpu_ref_rmsnorm(input_reference, aux_reference, expected, COUNT, 1.0e-6f);
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  status = vpu_tiled_final_norm_auto(
+  status = vpu_final_norm_auto(
       &input_storage[1], &aux_storage[1], &output_storage[1], COUNT, 1.0e-6f);
   if (finish_and_check(name, COUNT, status)) {
     return 1;
@@ -880,7 +1152,7 @@ static int test_silu_nonfinite(void) {
   refresh_references(COUNT);
   vpu_ref_silu(input_reference, expected, COUNT);
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  const uint64_t status = vpu_tiled_silu_auto(
+  const uint64_t status = vpu_silu_auto(
       &input_storage[1], &output_storage[1], COUNT);
   if (finish_and_check(name, COUNT, status)) {
     return 1;
@@ -928,7 +1200,7 @@ static int test_swiglu_nonfinite(void) {
   refresh_references(COUNT);
   vpu_ref_swiglu(input_reference, aux_reference, expected, COUNT);
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  const uint64_t status = vpu_tiled_swiglu_auto(
+  const uint64_t status = vpu_swiglu_auto(
       &input_storage[1], &aux_storage[1], &output_storage[1], COUNT);
   if (finish_and_check(name, COUNT, status)) {
     return 1;
@@ -974,7 +1246,7 @@ static int test_softmax_special(void) {
   refresh_references(COUNT);
   vpu_ref_softmax(input_reference, expected, COUNT);
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  uint64_t status = vpu_tiled_softmax_auto(
+  uint64_t status = vpu_softmax_auto(
       &input_storage[1], &output_storage[1], COUNT);
   if (finish_and_check(name, COUNT, status) ||
       check_softmax_distribution(name, COUNT, &output_storage[1])) {
@@ -992,7 +1264,7 @@ static int test_softmax_special(void) {
   refresh_references(COUNT);
   vpu_ref_softmax(input_reference, expected, COUNT);
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  status = vpu_tiled_softmax_auto(
+  status = vpu_softmax_auto(
       &input_storage[1], &output_storage[1], COUNT);
   if (finish_and_check(name, COUNT, status) ||
       check_canonical_nan_outputs(name, COUNT)) {
@@ -1010,7 +1282,7 @@ static int test_softmax_special(void) {
   refresh_references(COUNT);
   vpu_ref_softmax(input_reference, expected, COUNT);
   vpu_clear_status(VPU_CLEAR_ERRORS);
-  status = vpu_tiled_softmax_auto(
+  status = vpu_softmax_auto(
       &input_storage[1], &output_storage[1], COUNT);
   if (finish_and_check(name, COUNT, status) ||
       check_canonical_nan_outputs(name, COUNT)) {
@@ -1228,10 +1500,113 @@ static int test_tiled_planner(void) {
                         VPU_VSPAD_BANKS);
 }
 
+/* Large rows validate the real resident/partial/streaming schedules without
+ * spending most RTL-simulation time in Rocket's scalar libm reference. Small
+ * and benchmark rows above retain varied data and full CPU references. These
+ * analytically simple vectors still exercise every VPU arithmetic pipeline:
+ * EXP/RECI see zero and two, reductions span the whole row, and all DMA passes
+ * cover the requested element count. */
+static void prepare_large_constant_case(size_t n, float input, float aux,
+                                        float expected_value) {
+  prepare_vectors(n);
+  const vpu_storage_t stored_input = vpu_float_to_storage(input);
+  const vpu_storage_t stored_aux = vpu_float_to_storage(aux);
+  for (size_t i = 0; i < n; ++i) {
+    input_storage[i + 1u] = stored_input;
+    aux_storage[i + 1u] = stored_aux;
+    expected[i] = expected_value;
+  }
+}
+
+static int test_large_length(size_t n) {
+  const struct vpu_tiled_plan rms_plan =
+      vpu_tiled_plan_for(VPU_TILED_KERNEL_RMSNORM, n);
+  const struct vpu_tiled_plan softmax_plan =
+      vpu_tiled_plan_for(VPU_TILED_KERNEL_SOFTMAX, n);
+  printf("VPU nonlinear large schedule length %u rms=%s softmax=%s\n",
+         (unsigned)n, vpu_tiled_schedule_name(rms_plan.schedule),
+         vpu_tiled_schedule_name(softmax_plan.schedule));
+
+  const float rms_epsilon = 1.0e-5f;
+  prepare_large_constant_case(
+      n, 1.0f, 1.0f, 1.0f / sqrtf(1.0f + rms_epsilon));
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  uint64_t status = vpu_rmsnorm_auto(
+      &input_storage[1], &aux_storage[1], &output_storage[1], n,
+      rms_epsilon);
+  if (finish_and_check("rmsnorm_large", n, status)) return 1;
+
+  const float final_epsilon = 1.0e-6f;
+  prepare_large_constant_case(
+      n, 1.0f, 1.0f, 1.0f / sqrtf(1.0f + final_epsilon));
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_final_norm_auto(
+      &input_storage[1], &aux_storage[1], &output_storage[1], n,
+      final_epsilon);
+  if (finish_and_check("final_norm_large", n, status)) return 1;
+
+  prepare_large_constant_case(n, 0.0f, 1.0f, 0.0f);
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_silu_auto(&input_storage[1], &output_storage[1], n);
+  if (finish_and_check("silu_large", n, status)) return 1;
+
+  prepare_large_constant_case(n, -1.0f, 0.0f, 0.0f);
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_relu_auto(&input_storage[1], &output_storage[1], n);
+  if (finish_and_check("relu_large", n, status)) return 1;
+
+  prepare_large_constant_case(n, 0.0f, 0.0f, 0.5f);
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_sigmoid_auto(&input_storage[1], &output_storage[1], n);
+  if (finish_and_check("sigmoid_large", n, status)) return 1;
+
+  prepare_large_constant_case(n, 0.0f, 0.0f, 0.0f);
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_tanh_auto(&input_storage[1], &output_storage[1], n);
+  if (finish_and_check("tanh_large", n, status)) return 1;
+
+  prepare_large_constant_case(n, 0.0f, 0.0f, 0.0f);
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_gelu_auto(&input_storage[1], &output_storage[1], n);
+  if (finish_and_check("gelu_large", n, status)) return 1;
+
+  prepare_large_constant_case(n, 0.0f, 1.0f, 0.0f);
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_swiglu_auto(
+      &input_storage[1], &aux_storage[1], &output_storage[1], n);
+  if (finish_and_check("swiglu_large", n, status)) return 1;
+
+  prepare_large_constant_case(n, 0.0f, 0.0f, 1.0f / (float)n);
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_softmax_auto(&input_storage[1], &output_storage[1], n);
+  if (finish_and_check("softmax_large", n, status)) return 1;
+  return check_softmax_distribution(
+      "softmax_large", n, &output_storage[1]);
+}
+
 static int test_length(size_t n) {
-  printf("VPU nonlinear length %u\n", (unsigned)n);
-  return test_rmsnorm(n, 0) || test_rmsnorm(n, 1) || test_silu(n) ||
-         test_swiglu(n) || test_softmax(n);
+  const struct vpu_tiled_plan rms_plan =
+      vpu_tiled_plan_for(VPU_TILED_KERNEL_RMSNORM, n);
+  const struct vpu_tiled_plan softmax_plan =
+      vpu_tiled_plan_for(VPU_TILED_KERNEL_SOFTMAX, n);
+  printf("VPU nonlinear length %u rms=%s softmax=%s\n", (unsigned)n,
+         vpu_tiled_schedule_name(rms_plan.schedule),
+         vpu_tiled_schedule_name(softmax_plan.schedule));
+  printf("  RMSNorm\n");
+  if (test_rmsnorm(n, 0)) return 1;
+  printf("  final RMSNorm\n");
+  if (test_rmsnorm(n, 1)) return 1;
+  printf("  SiLU\n");
+  if (test_silu(n)) return 1;
+  printf("  ReLU/sigmoid/tanh/GELU\n");
+  if (test_unary_activation(n, TEST_ACT_RELU) ||
+      test_unary_activation(n, TEST_ACT_SIGMOID) ||
+      test_unary_activation(n, TEST_ACT_TANH) ||
+      test_unary_activation(n, TEST_ACT_GELU)) return 1;
+  printf("  SwiGLU\n");
+  if (test_swiglu(n)) return 1;
+  printf("  softmax\n");
+  return test_softmax(n);
 }
 
 int main(void) {
@@ -1246,20 +1621,50 @@ int main(void) {
          "vpu=e2e_config_dma_execute_store_fence buffers=aligned64\n");
   printf("VPU_BENCH ideal_model=useful_arithmetic_issue_lower_bound "
          "length=%u nlanes=%u exp_lanes=%u reciprocal_lanes=%u "
+         "nonlinear_chunk_rows=%u physical_batch_rows=%u "
          "excludes=pipeline_dependency_reduction_fold_scalar_latency_"
          "tail_padding_sram_dma_tlb_rocc_fence\n",
          (unsigned)VPU_BENCHMARK_LENGTH, (unsigned)VPU_NLANES,
-         (unsigned)VPU_SFU_LANES, (unsigned)VPU_RECIPROCAL_LANES);
+         (unsigned)VPU_SFU_LANES, (unsigned)VPU_RECIPROCAL_LANES,
+         (unsigned)vpu_stream_batch_capacity(),
+         (unsigned)vpu_stream_physical_batch_capacity());
 #endif
+  /* Keep edge/tail cases and execute real rows on both sides of the default
+   * FP32 resident-to-hybrid transition. Values larger than a user-selected
+   * test allocation are skipped, and duplicate macro-selected lengths run
+   * only once. */
   static const size_t required_lengths[] = {
-      0, 1, 15, 16, 17, 127, 128, 129, 2048,
-      2048
+      0, 1, 15, 16, 17, 127, 128, 129, 2048, 10000, 20000,
+      VPU_BENCHMARK_LENGTH, VPU_TEST_MAX_ELEMENTS,
   };
   for (size_t i = 0;
        i < sizeof(required_lengths) / sizeof(required_lengths[0]); ++i) {
-    if (test_length(required_lengths[i])) {
+    if (required_lengths[i] > VPU_TEST_MAX_ELEMENTS) {
+      continue;
+    }
+    int duplicate = 0;
+    for (size_t previous = 0; previous < i; ++previous) {
+      duplicate |= required_lengths[previous] == required_lengths[i];
+    }
+    if (duplicate) {
+      continue;
+    }
+    /* A non-benchmark 2048 row does not need to pay Rocket libm cost merely
+     * to validate the same tiled data path.  The default benchmark remains
+     * 2048; smaller benchmark overrides make a fast full RTL regression. */
+    const int use_analytic_large_case = required_lengths[i] >= 2048u &&
+        required_lengths[i] != VPU_BENCHMARK_LENGTH;
+    if ((use_analytic_large_case
+             ? test_large_length(required_lengths[i])
+             : test_length(required_lengths[i]))) {
       return 1;
     }
+  }
+  if (test_rearrangement_kernels()) {
+    return 1;
+  }
+  if (test_unary_activation_multibatch()) {
+    return 1;
   }
   if (test_finite_stress()) {
     return 1;
@@ -1271,7 +1676,8 @@ int main(void) {
     return 1;
   }
 
-  printf("VPU multi-tile RMSNorm/final-norm, SiLU, SwiGLU, and softmax "
-         "finite-stress and kernel/SFU special-value tests passed\n");
+  printf("VPU auto RMSNorm/final-norm, ReLU, sigmoid, tanh, GELU, SiLU, "
+         "SwiGLU, softmax, RoPE, and local-permute large/edge, "
+         "finite-stress, and special-value tests passed\n");
   return 0;
 }

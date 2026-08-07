@@ -37,12 +37,18 @@ enum vpu_opcode {
   VPU_OP_S_EXP_FP = 0x1b,
   VPU_OP_S_RECI_FP = 0x1c,
   VPU_OP_S_SQRT_FP = 0x1d,
+  VPU_OP_S_LOAD_STATE = 0x1e,
+  VPU_OP_S_STORE_STATE = 0x1f,
+
+  VPU_OP_S_ADDI_INT = 0x22,
 
   VPU_OP_H_PREFETCH_V = 0x29,
   VPU_OP_H_STORE_V = 0x2a,
 
   VPU_OP_C_SET_STRIDE = 0x2d,
   VPU_OP_C_WRITE_VMASK = 0x2e,
+  VPU_OP_C_LOOP_START = 0x2f,
+  VPU_OP_C_LOOP_END = 0x30,
 
   VPU_OP_V_GATHER_VV = 0x31,
   VPU_OP_V_SLIDE_V = 0x32,
@@ -112,6 +118,7 @@ enum vpu_status_bits {
   VPU_STATUS_ILLEGAL_COMMAND = 1ull << 0,
   VPU_STATUS_DMA_FAULT = 1ull << 1,
   VPU_STATUS_DMA_HALTED = 1ull << 2,
+  VPU_STATUS_FUSION_FAULT = 1ull << 3,
   VPU_STATUS_FFLAG_NX = 1ull << 8,
   VPU_STATUS_FFLAG_UF = 1ull << 9,
   VPU_STATUS_FFLAG_OF = 1ull << 10,
@@ -121,7 +128,8 @@ enum vpu_status_bits {
 };
 
 #define VPU_STATUS_ERROR_MASK \
-  (VPU_STATUS_ILLEGAL_COMMAND | VPU_STATUS_DMA_FAULT)
+  (VPU_STATUS_ILLEGAL_COMMAND | VPU_STATUS_DMA_FAULT | \
+   VPU_STATUS_FUSION_FAULT)
 #define VPU_STATUS_FFLAGS_MASK (0x1full << 8)
 
 /*
@@ -164,6 +172,34 @@ static inline unsigned vpu_micro_rs3(uint32_t uop) {
 
 static inline unsigned vpu_micro_funct1(uint32_t uop) {
   return (unsigned)((uop >> 22) & 0x0fu);
+}
+
+/* PLENA-compatible alternate instruction formats used by address induction
+ * and the capture/replay hardware-loop frontend.  Loop counts are positive;
+ * callers should software-peel a zero-trip loop instead of emitting one. */
+#define VPU_ADDI_INT_IMM_BITS 18u
+#define VPU_LOOP_COUNT_BITS 22u
+#define VPU_ADDI_INT_IMM_MAX ((UINT32_C(1) << VPU_ADDI_INT_IMM_BITS) - 1u)
+#define VPU_LOOP_COUNT_MAX ((UINT32_C(1) << VPU_LOOP_COUNT_BITS) - 1u)
+
+static inline uint32_t vpu_s_addi_int_uop(unsigned rd, unsigned rs1,
+                                          uint32_t immediate) {
+  return ((uint32_t)VPU_OP_S_ADDI_INT) |
+      (((uint32_t)rd & 0x0fu) << 6) |
+      (((uint32_t)rs1 & 0x0fu) << 10) |
+      ((immediate & VPU_ADDI_INT_IMM_MAX) << 14);
+}
+
+static inline uint32_t vpu_loop_start_uop(unsigned loop_reg,
+                                           uint32_t iterations) {
+  return ((uint32_t)VPU_OP_C_LOOP_START) |
+      (((uint32_t)loop_reg & 0x0fu) << 6) |
+      ((iterations & VPU_LOOP_COUNT_MAX) << 10);
+}
+
+static inline uint32_t vpu_loop_end_uop(unsigned loop_reg) {
+  return ((uint32_t)VPU_OP_C_LOOP_END) |
+      (((uint32_t)loop_reg & 0x0fu) << 6);
 }
 
 static inline uint32_t vpu_float_to_bits(float value) {
@@ -216,47 +252,74 @@ static inline float vpu_storage_to_float(vpu_storage_t value) {
 }
 #endif
 
+static inline void vpu_cpu_memory_fence(void) {
+#if defined(__riscv)
+  __asm__ volatile("fence rw, rw" ::: "memory");
+#else
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
 #if defined(__riscv)
 #include "rocc-software/src/xcustom.h"
 
-static inline void vpu_cpu_memory_fence(void) {
-  __asm__ volatile("fence rw, rw" ::: "memory");
-}
-
-static inline void vpu_rocc_issue(uint32_t uop, uint64_t payload) {
+static inline void vpu_rocc_issue(uint64_t transport, uint64_t payload) {
   __asm__ volatile("" ::: "memory");
-  ROCC_INSTRUCTION_0_R_R(VPU_XCUSTOM, (uint64_t)uop, payload,
+  ROCC_INSTRUCTION_0_R_R(VPU_XCUSTOM, transport, payload,
                          VPU_ROCC_FUNCT);
   __asm__ volatile("" ::: "memory");
 }
 
-static inline uint64_t vpu_rocc_issue_result(uint32_t uop,
+static inline uint64_t vpu_rocc_issue_result(uint64_t transport,
                                              uint64_t payload) {
   uint64_t result;
   __asm__ volatile("" ::: "memory");
-  ROCC_INSTRUCTION_R_R_R(VPU_XCUSTOM, result, (uint64_t)uop, payload,
+  ROCC_INSTRUCTION_R_R_R(VPU_XCUSTOM, result, transport, payload,
                          VPU_ROCC_FUNCT);
   __asm__ volatile("" ::: "memory");
   return result;
 }
+
 #else
 /* Host-side encoders can provide these hooks to emulate or trace commands. */
-void vpu_host_issue(uint32_t uop, uint64_t payload);
-uint64_t vpu_host_issue_result(uint32_t uop, uint64_t payload);
+void vpu_host_issue(uint64_t transport, uint64_t payload);
+uint64_t vpu_host_issue_result(uint64_t transport, uint64_t payload);
 
-static inline void vpu_cpu_memory_fence(void) {
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+static inline void vpu_rocc_issue(uint64_t transport, uint64_t payload) {
+  vpu_host_issue(transport, payload);
 }
 
-static inline void vpu_rocc_issue(uint32_t uop, uint64_t payload) {
-  vpu_host_issue(uop, payload);
-}
-
-static inline uint64_t vpu_rocc_issue_result(uint32_t uop,
+static inline uint64_t vpu_rocc_issue_result(uint64_t transport,
                                              uint64_t payload) {
-  return vpu_host_issue_result(uop, payload);
+  return vpu_host_issue_result(transport, payload);
 }
 #endif
+
+/* Group metadata occupies the formerly reserved upper half of rs1. */
+#ifndef VPU_GROUP_ID_BITS
+#define VPU_GROUP_ID_BITS 3u
+#endif
+#define VPU_GROUP_ID_SHIFT 32u
+#define VPU_GROUPED_SHIFT 35u
+#define VPU_GROUP_LAST_SHIFT 36u
+
+static inline uint64_t vpu_grouped_transport(unsigned group_id,
+                                              bool is_last,
+                                              uint32_t uop) {
+  const uint64_t group_mask =
+      (UINT64_C(1) << VPU_GROUP_ID_BITS) - UINT64_C(1);
+  return (uint64_t)uop |
+      (((uint64_t)group_id & group_mask) << VPU_GROUP_ID_SHIFT) |
+      (UINT64_C(1) << VPU_GROUPED_SHIFT) |
+      ((uint64_t)is_last << VPU_GROUP_LAST_SHIFT);
+}
+
+/* The group is released only when this command is atomically admitted to
+ * both the VPU reservation station and the shared dependency table. */
+static inline void vpu_issue_grouped(unsigned group_id, bool is_last,
+                                     uint32_t uop, uint64_t payload) {
+  vpu_rocc_issue(vpu_grouped_transport(group_id, is_last, uop), payload);
+}
 
 /*
  * Publish host/CPU stores before enqueueing a batch of VPU DMA reads.  Call
@@ -272,6 +335,56 @@ static inline void vpu_write_gp(unsigned index, uint32_t value) {
   vpu_rocc_issue(vpu_micro_op(VPU_OP_C_WRITE_GP, index, 0, 0, 0, 0),
                  value);
 }
+
+/* GP[rd] = GP[rs1] + unsigned imm18, with ordinary 32-bit wraparound. */
+static inline void vpu_s_addi_int(unsigned rd, unsigned rs1,
+                                  uint32_t immediate) {
+  vpu_rocc_issue(vpu_s_addi_int_uop(rd, rs1, immediate), 0);
+}
+
+/* Capture every command through the matching END once, then replay the body
+ * internally. Nested loops are supported up to VPU_LOOP_STACK_DEPTH. An
+ * invalid trip count is encoded as zero so hardware reports illegalCommand
+ * instead of silently executing a truncated count. */
+static inline void vpu_loop_start(unsigned loop_reg, uint32_t iterations) {
+  const uint32_t checked =
+      iterations > 0u && iterations <= VPU_LOOP_COUNT_MAX ? iterations : 0u;
+  vpu_rocc_issue(vpu_loop_start_uop(loop_reg, checked), 0);
+}
+
+static inline void vpu_loop_end(unsigned loop_reg) {
+  vpu_rocc_issue(vpu_loop_end_uop(loop_reg), 0);
+}
+
+/* If a standalone loop produces data for a different RoCC accelerator, issue
+ * vpu_wait()/vpu_fence() before that accelerator's command. The RoCC router
+ * does not globally stall other routes merely because loop replay is busy. */
+
+static inline void vpu_group_s_addi_int(unsigned group_id, unsigned rd,
+                                        unsigned rs1,
+                                        uint32_t immediate) {
+  vpu_issue_grouped(group_id, false,
+                    vpu_s_addi_int_uop(rd, rs1, immediate), 0);
+}
+
+static inline void vpu_group_loop_start(unsigned group_id,
+                                        unsigned loop_reg,
+                                        uint32_t iterations) {
+  const uint32_t checked =
+      iterations > 0u && iterations <= VPU_LOOP_COUNT_MAX ? iterations : 0u;
+  vpu_issue_grouped(group_id, false,
+                    vpu_loop_start_uop(loop_reg, checked), 0);
+}
+
+static inline void vpu_group_loop_end(unsigned group_id,
+                                      unsigned loop_reg) {
+  vpu_issue_grouped(group_id, false,
+                    vpu_loop_end_uop(loop_reg), 0);
+}
+
+/* A grouped group_last command must be issued after vpu_group_loop_end().
+ * It is illegal inside the captured body; peel the final iteration so group
+ * release remains tied to actual RS + SharedDeps admission. */
 
 static inline void vpu_write_fp_bits(unsigned index, uint32_t bits) {
   vpu_rocc_issue(vpu_micro_op(VPU_OP_C_WRITE_FP, index, 0, 0, 0, 0),
@@ -616,6 +729,20 @@ VPU_DEFINE_S(vpu_s_sqrt, VPU_OP_S_SQRT_FP)
 
 #undef VPU_DEFINE_SS
 #undef VPU_DEFINE_S
+
+/* FP[dst_fp] <- state[GP[state_index_gp]]. */
+static inline void vpu_s_load_state(unsigned dst_fp,
+                                    unsigned state_index_gp) {
+  vpu_rocc_issue(vpu_micro_op(VPU_OP_S_LOAD_STATE, dst_fp,
+                              state_index_gp, 0, 0, 0), 0);
+}
+
+/* state[GP[state_index_gp]] <- FP[src_fp]. */
+static inline void vpu_s_store_state(unsigned state_index_gp,
+                                     unsigned src_fp) {
+  vpu_rocc_issue(vpu_micro_op(VPU_OP_S_STORE_STATE, state_index_gp,
+                              src_fp, 0, 0, 0), 0);
+}
 
 #ifdef __cplusplus
 }  // extern "C"

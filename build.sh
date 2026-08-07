@@ -18,8 +18,9 @@ fi
 
 cd build
 
-if [[ $(which riscv64-unknown-linux-gnu-gcc) ]] ; then
-    make -j $@
+if command -v riscv64-unknown-linux-gnu-gcc >/dev/null 2>&1 || \
+   command -v riscv64-linux-gnu-gcc >/dev/null 2>&1 ; then
+    make -j "$@"
 else
-    make -j BAREMETAL_ONLY=1 $@
+    make -j BAREMETAL_ONLY=1 "$@"
 fi

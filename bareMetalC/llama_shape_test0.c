@@ -16,18 +16,18 @@
 #define profile_data_num 20000
 
 #define MULTI true
-#define gemmini_configuration 7
+#define gemmini_configuration 1
 
-#define MAT_DIM_I 192
-#define MAT_DIM_J 512
-#define MAT_DIM_K 2048
+#define MAT_DIM_I 32
+#define MAT_DIM_J 32
+#define MAT_DIM_K 32
 #define RAND rand()
-#define FAST true
+#define FAST false
 #define NO_BIAS true
 #define FULL_BIAS_WIDTH true
 #define FULL_C_WIDTH true
 #define REPEATING_BIAS false
-#define CHECK false
+#define CHECK true
 
 #define PACKED_A false
 #define PACKED_B false
@@ -73,52 +73,39 @@ void print_gemmini_use(unsigned mask)
   printf(" with DIM: %d\n", DIM);
 }
 
-void full_matmul(elem_t A[MAT_DIM_I][MAT_DIM_K], elem_t B[MAT_DIM_K][MAT_DIM_J], ACC_T D[MAT_DIM_I][MAT_DIM_J], full_t C_full[MAT_DIM_I][MAT_DIM_J])
+void full_matmul(elem_t A[MAT_DIM_I][MAT_DIM_K], elem_t B[MAT_DIM_K][MAT_DIM_J], ACC_T D[MAT_DIM_I][MAT_DIM_J], CACC_T C[MAT_DIM_I][MAT_DIM_J])
 {
   for (size_t r = 0; r < MAT_DIM_I; r++)
     for (size_t c = 0; c < MAT_DIM_J; c++)
     {
-      C_full[r][c] = D[r][c];
+      full_t sum = D[r][c];
       for (size_t k = 0; k < MAT_DIM_K; k++)
-        C_full[r][c] += A[r][k] * B[k][c];
+        sum += A[r][k] * B[k][c];
+#if FULL_C_WIDTH
+      C[r][c] = (CACC_T)sum;
+#else
+      C[r][c] = (CACC_T)ACC_SCALE(sum, ACC_SCALE_IDENTITY);
+#endif
     }
 }
 
-void full_printMatrix(elem_t m[MAT_DIM_I][MAT_DIM_J])
+void full_printMatrix(CACC_T m[MAT_DIM_I][MAT_DIM_J])
 {
   for (size_t i = 0; i < MAT_DIM_I; ++i)
   {
     for (size_t j = 0; j < MAT_DIM_J; ++j)
-      printf("%d ", m[i][j]);
+      printf("%d ", (int)m[i][j]);
     printf("\n");
   }
 }
 
-int full_is_equal(elem_t x[MAT_DIM_I][MAT_DIM_J], elem_t y[MAT_DIM_I][MAT_DIM_J])
+int full_is_equal(CACC_T x[MAT_DIM_I][MAT_DIM_J], CACC_T y[MAT_DIM_I][MAT_DIM_J])
 {
   for (size_t i = 0; i < MAT_DIM_I; ++i)
     for (size_t j = 0; j < MAT_DIM_J; ++j)
       if (x[i][j] != y[i][j])
         return 0;
   return 1;
-}
-
-void full_matscale(full_t full[MAT_DIM_I][MAT_DIM_J], elem_t out[MAT_DIM_I][MAT_DIM_J], acc_scale_t scale)
-{
-  for (size_t r = 0; r < MAT_DIM_I; r++)
-    for (size_t c = 0; c < MAT_DIM_J; c++)
-    {
-      // Scale element
-      full_t scaled = ACC_SCALE(full[r][c], scale);
-
-    // Saturate and cast element
-#ifndef ELEM_T_IS_FLOAT
-      full_t elem = scaled > elem_t_max ? elem_t_max : (scaled < elem_t_min ? elem_t_min : scaled);
-      out[r][c] = elem;
-#else
-      out[r][c] = scaled; // TODO should we also saturate when using floats?
-#endif
-    }
 }
 
 int main()
@@ -165,49 +152,47 @@ int main()
   static CACC_T full_C[MAT_DIM_I][MAT_DIM_J] row_align(MAX_BLOCK_LEN);
   static ACC_T full_D[MAT_DIM_I][MAT_DIM_J] row_align_acc(MAX_BLOCK_LEN_ACC);
 
-#if !FAST && CHECK
-  static full_t gold_full[MAT_DIM_I][MAT_DIM_J];
-  static elem_t gold[MAT_DIM_I][MAT_DIM_J];
+#if CHECK
+  static CACC_T gold[MAT_DIM_I][MAT_DIM_J];
 #endif
 
-  // printf("Init A\n");
-  // for (size_t i = 0; i < MAT_DIM_I; ++i)
-  // {
-  //   for (size_t j = 0; j < MAT_DIM_K; ++j)
-  //   {
-  //     full_A[i][j] = RAND % 2;
-  //   }
-  // }
+  printf("Init A\n");
+  for (size_t i = 0; i < MAT_DIM_I; ++i)
+  {
+    for (size_t j = 0; j < MAT_DIM_K; ++j)
+    {
+      full_A[i][j] = RAND % 10;
+    }
+  }
 
-  // printf("Init D\n");
-  // for (size_t i = 0; i < MAT_DIM_I; ++i) {
-  //   for (size_t j = 0; j < MAT_DIM_J; ++j) {
-  //     full_D[i][j] = NO_BIAS ? 0 : RAND % 2;
-  //   }
-  // }
+  printf("Init D\n");
+  for (size_t i = 0; i < MAT_DIM_I; ++i) {
+    for (size_t j = 0; j < MAT_DIM_J; ++j) {
+      full_D[i][j] = NO_BIAS ? 0 : RAND % 10;
+    }
+  }
 
 #if FAST
   // identity matrix
-  // printf("Init B\n");
-  // for (size_t i = 0; i < MAT_DIM_K; ++i) {
-  //   for (size_t j = 0; j < MAT_DIM_J; ++j) {
-  //     full_B[i][j] = i == j;
-  //   }
-  // }
+  printf("Init B\n");
+  for (size_t i = 0; i < MAT_DIM_K; ++i) {
+    for (size_t j = 0; j < MAT_DIM_J; ++j) {
+      full_B[i][j] = i == j;
+    }
+  }
 #else
   printf("Init B\n");
   for (size_t i = 0; i < MAT_DIM_K; ++i)
   {
     for (size_t j = 0; j < MAT_DIM_J; ++j)
     {
-      full_B[i][j] = RAND % 2;
+      full_B[i][j] = RAND % 10;
     }
   }
+#endif
 #if CHECK
   printf("Calculate Output\n");
-  full_matmul(full_A, full_B, full_D, gold_full);
-  full_matscale(gold_full, gold, ACC_SCALE_IDENTITY);
-#endif
+  full_matmul(full_A, full_B, full_D, gold);
 #endif
   int total_cycles = 0;
   printf("Do Gemmini tiled matmul process\n");
@@ -228,8 +213,15 @@ int main()
   jm.B = (elem_t *)full_B;
   jm.D = NO_BIAS ? NULL : &full_D[0][0];
   jm.C = (CACC_T *)full_C;
-  jm.stride_A = PACKED_A ? GEMMINI_PAGE_PACKED_STRIDE(MAT_DIM_K) : MAT_DIM_K;
-  jm.stride_B = PACKED_B ? GEMMINI_PAGE_PACKED_STRIDE(MAT_DIM_J) : MAT_DIM_J;
+  jm.a_transpose = false;
+  jm.b_transpose = false;
+  // When enabling a transpose option for a page-packed operand, page-pack the
+  // original source matrix before the transpose. The packed stride must use
+  // that source matrix's row width; do not transpose the matrix while packing.
+  const size_t source_stride_A = jm.a_transpose ? MAT_DIM_I : MAT_DIM_K;
+  const size_t source_stride_B = jm.b_transpose ? MAT_DIM_K : MAT_DIM_J;
+  jm.stride_A = PACKED_A ? GEMMINI_PAGE_PACKED_STRIDE(source_stride_A) : source_stride_A;
+  jm.stride_B = PACKED_B ? GEMMINI_PAGE_PACKED_STRIDE(source_stride_B) : source_stride_B;
   jm.stride_D = NO_BIAS ? 0 : (PACKED_D ? GEMMINI_PAGE_PACKED_STRIDE(MAT_DIM_J) : MAT_DIM_J);
   jm.stride_C = PACKED_C ? GEMMINI_PAGE_PACKED_STRIDE(MAT_DIM_J) : MAT_DIM_J;
   jm.A_scale_factor = MVIN_SCALE_IDENTITY;
@@ -239,8 +231,6 @@ int main()
   jm.scale = ACC_SCALE_IDENTITY;
   jm.bert_scale = 0;
   jm.repeating_bias = REPEATING_BIAS;
-  jm.a_transpose = false;
-  jm.b_transpose = false;
   jm.full_C = FULL_C_WIDTH;
   jm.low_D = !FULL_BIAS_WIDTH;
   jm.weightA = 1;
@@ -261,31 +251,17 @@ int main()
 #if CHECK
   printf("Check \"Out\" matrix\n");
 
-#if FAST
-  if (!is_equal_dynamic(full_C, full_A, MAT_DIM_I, MAT_DIM_J))
+  if (!full_is_equal(full_C, gold))
   {
     printf("Incorrect output matrix!\n");
     printf("C:\n");
-    printMatrix_dynamic(full_C, MAT_DIM_I, MAT_DIM_J);
-    printf("A:\n");
-    printMatrix_dynamic(full_A, MAT_DIM_I, MAT_DIM_J);
-    printf("\n");
-
-    exit(1);
-  }
-#else
-  if (!is_equal_dynamic(full_C, gold, MAT_DIM_I, MAT_DIM_J))
-  {
-    printf("Incorrect output matrix!\n");
-    printf("C:\n");
-    printMatrix_dynamic(full_C, MAT_DIM_I, MAT_DIM_J);
+    full_printMatrix(full_C);
     printf("Gold:\n");
-    printMatrix_dynamic(gold, MAT_DIM_I, MAT_DIM_J);
+    full_printMatrix(gold);
     printf("\n");
 
     exit(1);
   }
-#endif
   printf("Output matrix came out as expected\n");
 #endif
 
@@ -313,8 +289,15 @@ int main()
   js.B = (elem_t *)full_B;
   js.D = NO_BIAS ? NULL : &full_D[0][0];
   js.C = (CACC_T *)full_C;
-  js.stride_A = PACKED_A ? GEMMINI_PAGE_PACKED_STRIDE(MAT_DIM_K) : MAT_DIM_K;
-  js.stride_B = PACKED_B ? GEMMINI_PAGE_PACKED_STRIDE(MAT_DIM_J) : MAT_DIM_J;
+  js.a_transpose = false;
+  js.b_transpose = false;
+  // When enabling a transpose option for a page-packed operand, page-pack the
+  // original source matrix before the transpose. The packed stride must use
+  // that source matrix's row width; do not transpose the matrix while packing.
+  const size_t source_stride_A = js.a_transpose ? MAT_DIM_I : MAT_DIM_K;
+  const size_t source_stride_B = js.b_transpose ? MAT_DIM_K : MAT_DIM_J;
+  js.stride_A = PACKED_A ? GEMMINI_PAGE_PACKED_STRIDE(source_stride_A) : source_stride_A;
+  js.stride_B = PACKED_B ? GEMMINI_PAGE_PACKED_STRIDE(source_stride_B) : source_stride_B;
   js.stride_D = NO_BIAS ? 0 : (PACKED_D ? GEMMINI_PAGE_PACKED_STRIDE(MAT_DIM_J) : MAT_DIM_J);
   js.stride_C = PACKED_C ? GEMMINI_PAGE_PACKED_STRIDE(MAT_DIM_J) : MAT_DIM_J;
   js.A_scale_factor = MVIN_SCALE_IDENTITY;
@@ -324,8 +307,6 @@ int main()
   js.scale = ACC_SCALE_IDENTITY;
   js.bert_scale = 0;
   js.repeating_bias = REPEATING_BIAS;
-  js.a_transpose = false;
-  js.b_transpose = false;
   js.full_C = FULL_C_WIDTH;
   js.low_D = !FULL_BIAS_WIDTH;
   js.weightA = 1;

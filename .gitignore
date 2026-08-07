@@ -5,3 +5,9 @@ autom4te.cache
 configure
 .ipynb_checkpoints
 *.pyc
+
+# All compiled programs belong under build/bareMetalC.  Ignore accidental
+# in-source outputs from direct Make invocations.
+/bareMetalC/*-baremetal
+/bareMetalC/*-linux
+/bareMetalC/*-pk

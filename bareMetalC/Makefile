@@ -28,12 +28,29 @@ tests = \
 
 tests_baremetal = $(tests:=-baremetal)
 
-# VPU programs require the custom0/funct64 RTL model and are intentionally not
-# added to the default Spike-backed test list.
+# VPU programs require the custom0/funct64 RTL model. They are built with the
+# ordinary bareMetalC programs, but remain outside the Spike run list below.
 vpu_tests = vpu_dma vpu_nonlinear vpu_interleave vpu_mask_rearrange \
 	vpu_strided_dma
 vpu_tests_baremetal = $(vpu_tests:=-baremetal)
-vpu_tests_pk = $(vpu_tests:=-pk)
+
+# One operation per binary keeps long scalar-libm RTL measurements selectable.
+# The implementations share a compile-time benchmark driver, while each file
+# remains an independently runnable simulation workload.
+vpu_perf_tests = \
+	rmsnorm_vs_CPU_perf final_norm_vs_CPU_perf \
+	relu_vs_CPU_perf sigmoid_vs_CPU_perf tanh_vs_CPU_perf \
+	gelu_vs_CPU_perf silu_vs_CPU_perf swiglu_vs_CPU_perf \
+	softmax_vs_CPU_perf rope_vs_CPU_perf permute_vs_CPU_perf
+vpu_perf_tests_baremetal = $(vpu_perf_tests:=-baremetal)
+
+# This program targets the BF16-Gemmini/FP32-VPU fusion configuration.  Keep
+# it separate from the standalone VPU list: neither Spike nor the legacy
+# INT8+VPU configurations model the shared VSRAM matrix ports/group gate.
+fusion_vpu_tests = vpu_flashattention
+fusion_vpu_tests_baremetal = $(fusion_vpu_tests:=-baremetal)
+fusion_vpu_perf_tests = vpu_flashattention_vs_CPU_perf
+fusion_vpu_perf_tests_baremetal = $(fusion_vpu_perf_tests:=-baremetal)
 
 ifeq ($(findstring spike,$(RUNNER)),spike)
 # Currently don't support conv or conv-with-pool on spike
@@ -43,19 +60,38 @@ else
 runs_baremetal = $(addsuffix .run,$(filter-out tiled_matmul_cpu-baremetal tiled_matmul_option-baremetal,$(tests_baremetal)))
 endif
 
-ifdef BAREMETAL_ONLY
+ifeq ($(BAREMETAL_ONLY),1)
 	tests_linux =
 	tests_pk =
+	vpu_tests_linux =
+	vpu_tests_pk =
+	vpu_perf_tests_linux =
+	vpu_perf_tests_pk =
+	fusion_vpu_tests_linux =
+	fusion_vpu_tests_pk =
+	fusion_vpu_perf_tests_linux =
+	fusion_vpu_perf_tests_pk =
 else
 	tests_linux = $(tests:=-linux)
 	tests_pk = $(tests:=-pk)
+	vpu_tests_linux = $(vpu_tests:=-linux)
+	vpu_tests_pk = $(vpu_tests:=-pk)
+	vpu_perf_tests_linux = $(vpu_perf_tests:=-linux)
+	vpu_perf_tests_pk = $(vpu_perf_tests:=-pk)
+	fusion_vpu_tests_linux = $(fusion_vpu_tests:=-linux)
+	fusion_vpu_tests_pk = $(fusion_vpu_tests:=-pk)
+	fusion_vpu_perf_tests_linux = $(fusion_vpu_perf_tests:=-linux)
+	fusion_vpu_perf_tests_pk = $(fusion_vpu_perf_tests:=-pk)
 endif
 
 BENCH_COMMON = $(abs_top_srcdir)/riscv-tests/benchmarks/common
-GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h $(abs_top_srcdir)/include/gemmini_testutils_all.h $(abs_top_srcdir)/include/gemmini_all.h
-VPU_GENERATED_HEADER ?= vpu_params_generated.h
-VPU_GENERATED_HEADER_DEP = $(if $(filter /%,$(VPU_GENERATED_HEADER)),$(VPU_GENERATED_HEADER),$(abs_top_srcdir)/include/$(VPU_GENERATED_HEADER))
-VPU_HEADERS = $(abs_top_srcdir)/include/vpu.h $(abs_top_srcdir)/include/vpu_params.h $(abs_top_srcdir)/include/vpu_kernels.h $(abs_top_srcdir)/include/vpu_testutils.h $(VPU_GENERATED_HEADER_DEP)
+GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h $(abs_top_srcdir)/include/gemmini_testutils_all.h $(abs_top_srcdir)/include/gemmini_all.h $(abs_top_srcdir)/include/gemmini_tiling.h
+# Workload dimensions and benchmark options belong to their C source/header.
+# Keep this Makefile limited to build flags, targets, and dependencies.
+VPU_PARAMS_HEADER = $(abs_top_srcdir)/include/vpu_params.h
+VPU_HEADERS = $(abs_top_srcdir)/include/vpu.h $(VPU_PARAMS_HEADER) $(abs_top_srcdir)/include/vpu_kernels.h $(abs_top_srcdir)/include/vpu_testutils.h
+VPU_PERF_HEADERS = $(VPU_HEADERS) $(abs_top_srcdir)/bareMetalC/vpu_vs_cpu_perf_common.h
+FUSION_VPU_HEADERS = $(VPU_HEADERS) $(abs_top_srcdir)/include/vpu_flashattention_kernel.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_tiling.h
 
 CFLAGS := $(CFLAGS) \
 	-DPREALLOCATE=1 \
@@ -90,11 +126,44 @@ CFLAGS_BAREMETAL := \
 	-T $(BENCH_COMMON)/test.ld \
 	-DBAREMETAL=1 \
 
-all: $(tests_baremetal) $(tests_linux) $(tests_pk)
+# A single generated vpu_params.h describes the most recently elaborated VPU.
+# Only add fusion-only programs to the default build when that header says the
+# matrix bridge/grouped dependency hardware is present.
+FUSION_VPU_ACTIVE := $(shell \
+	grep -q '^\#define VPU_GROUPED_COMMANDS 1u' $(VPU_PARAMS_HEADER) 2>/dev/null && \
+	grep -q '^\#define VPU_SHARED_DEPS 1u' $(VPU_PARAMS_HEADER) 2>/dev/null && \
+	grep -Eq '^\#define VPU_MATRIX_PORTS [1-9][0-9]*u' $(VPU_PARAMS_HEADER) 2>/dev/null && \
+	echo 1 || echo 0)
+ifeq ($(FUSION_VPU_ACTIVE),1)
+	default_fusion_tests = $(fusion_vpu_tests_baremetal) \
+		$(fusion_vpu_tests_linux) $(fusion_vpu_tests_pk) \
+		$(fusion_vpu_perf_tests_baremetal) \
+		$(fusion_vpu_perf_tests_linux) $(fusion_vpu_perf_tests_pk)
+else
+	default_fusion_tests =
+endif
 
-.PHONY: vpu-baremetal vpu-pk
+all: $(tests_baremetal) $(tests_linux) $(tests_pk) \
+	$(vpu_tests_baremetal) $(vpu_tests_linux) $(vpu_tests_pk) \
+	$(vpu_perf_tests_baremetal) $(vpu_perf_tests_linux) \
+	$(vpu_perf_tests_pk) $(default_fusion_tests)
+
+.PHONY: vpu-baremetal vpu-linux vpu-pk \
+	vpu-perf-baremetal vpu-perf-linux vpu-perf-pk \
+	fusion-vpu-baremetal fusion-vpu-linux fusion-vpu-pk \
+	fusion-vpu-perf-baremetal fusion-vpu-perf-linux fusion-vpu-perf-pk
 vpu-baremetal: $(vpu_tests_baremetal)
+vpu-linux: $(vpu_tests_linux)
 vpu-pk: $(vpu_tests_pk)
+vpu-perf-baremetal: $(vpu_perf_tests_baremetal)
+vpu-perf-linux: $(vpu_perf_tests_linux)
+vpu-perf-pk: $(vpu_perf_tests_pk)
+fusion-vpu-baremetal: $(fusion_vpu_tests_baremetal)
+fusion-vpu-linux: $(fusion_vpu_tests_linux)
+fusion-vpu-pk: $(fusion_vpu_tests_pk)
+fusion-vpu-perf-baremetal: $(fusion_vpu_perf_tests_baremetal)
+fusion-vpu-perf-linux: $(fusion_vpu_perf_tests_linux)
+fusion-vpu-perf-pk: $(fusion_vpu_perf_tests_pk)
 
 vpath %.c $(src_dir)
 
@@ -103,19 +172,48 @@ vpath %.c $(src_dir)
 		$(wildcard $(BENCH_COMMON)/*.c) $(wildcard $(BENCH_COMMON)/*.S) $(LIBS)
 
 %-linux: %.c $(GEMMINI_HEADERS)
-	$(CC_LINUX) $(CFLAGS) $< $(LFLAGS) -o $@
+	$(CC_LINUX) $(CFLAGS) $< $(LFLAGS) -o $@ $(LIBS)
 
 %-pk: %.c $(GEMMINI_HEADERS)
 	$(CC_LINUX) $(CFLAGS_PK) $< $(LFLAGS) -o $@ $(LIBS)
 
-$(vpu_tests_baremetal) $(vpu_tests_pk): LIBS += -lm -lc -lgcc
-$(vpu_tests_baremetal): CFLAGS_BAREMETAL += -fno-fast-math -DVPU_PARAMS_GENERATED_HEADER='"$(VPU_GENERATED_HEADER)"'
-$(vpu_tests_pk): CFLAGS_PK += -fno-fast-math -DVPU_PARAMS_GENERATED_HEADER='"$(VPU_GENERATED_HEADER)"'
-$(vpu_tests_baremetal) $(vpu_tests_pk): $(VPU_HEADERS)
+vpu_test_targets = $(vpu_tests_baremetal) $(vpu_tests_linux) $(vpu_tests_pk)
+vpu_perf_targets = $(vpu_perf_tests_baremetal) $(vpu_perf_tests_linux) \
+	$(vpu_perf_tests_pk)
+fusion_vpu_targets = $(fusion_vpu_tests_baremetal) \
+	$(fusion_vpu_tests_linux) $(fusion_vpu_tests_pk)
+fusion_vpu_perf_targets = $(fusion_vpu_perf_tests_baremetal) \
+	$(fusion_vpu_perf_tests_linux) $(fusion_vpu_perf_tests_pk)
+
+$(vpu_test_targets) $(vpu_perf_targets) $(fusion_vpu_targets) \
+$(fusion_vpu_perf_targets): LIBS += -lm -lc -lgcc
+$(vpu_tests_baremetal): CFLAGS_BAREMETAL += -fno-fast-math
+$(vpu_tests_linux): CFLAGS += -fno-fast-math
+$(vpu_tests_pk): CFLAGS_PK += -fno-fast-math
+$(vpu_test_targets): $(VPU_HEADERS)
+
+$(vpu_perf_tests_baremetal): CFLAGS_BAREMETAL += -fno-fast-math
+$(vpu_perf_tests_linux): CFLAGS += -fno-fast-math
+$(vpu_perf_tests_pk): CFLAGS_PK += -fno-fast-math
+$(vpu_perf_targets): $(VPU_PERF_HEADERS)
+
+$(fusion_vpu_tests_baremetal) $(fusion_vpu_perf_tests_baremetal): CFLAGS_BAREMETAL += -fno-fast-math \
+	-I$(abs_top_srcdir)/include
+$(fusion_vpu_tests_linux) $(fusion_vpu_perf_tests_linux): CFLAGS += -fno-fast-math \
+	-I$(abs_top_srcdir)/include
+$(fusion_vpu_tests_pk) $(fusion_vpu_perf_tests_pk): CFLAGS_PK += -fno-fast-math \
+	-I$(abs_top_srcdir)/include
+$(fusion_vpu_targets) $(fusion_vpu_perf_targets): $(FUSION_VPU_HEADERS)
 
 run-baremetal: $(runs_baremetal)
 
 %-baremetal.run: %-baremetal
 	$(RUNNER)$(abs_top_srcdir)/build/bareMetalC/$^
 
-junk += $(tests_baremetal) $(tests_linux) $(tests_pk) $(vpu_tests_baremetal) $(vpu_tests_pk)
+# Clean every possible output even when this invocation has no Linux compiler
+# and therefore sets BAREMETAL_ONLY=1.
+junk += $(tests_baremetal) $(tests:=-linux) $(tests:=-pk) \
+	$(vpu_tests_baremetal) $(vpu_tests:=-linux) $(vpu_tests:=-pk) \
+	$(vpu_perf_tests_baremetal) $(vpu_perf_tests:=-linux) $(vpu_perf_tests:=-pk) \
+	$(fusion_vpu_tests_baremetal) $(fusion_vpu_tests:=-linux) $(fusion_vpu_tests:=-pk) \
+	$(fusion_vpu_perf_tests_baremetal) $(fusion_vpu_perf_tests:=-linux) $(fusion_vpu_perf_tests:=-pk)

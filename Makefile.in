@@ -5,15 +5,21 @@ RISCVTOOLS      := @RISCVTOOLS@
 ROCC = examples
 RUNNER         := "spike --extension=gemmini "
 
-.PHONY: all bareMetalC clean imagenet transformers mlps vpu-baremetal vpu-pk
-all: bareMetalC imagenet transformers mlps
+# Several public forwarding targets intentionally share build/bareMetalC.
+# Serialize only this top-level dispatcher; each recursive make still uses the
+# jobserver for parallel compilation inside its own output directory.
+.NOTPARALLEL:
 
-# VPU binaries deliberately live outside the default Spike-backed test list.
-# VPU_BUILD_DIR can name a config-specific directory (for example vpu-fp32 or
-# vpu-bf16), which prevents binaries built for different storage ABIs from
-# silently replacing one another.
-VPU_BUILD_DIR ?= bareMetalC
-VPU_GENERATED_HEADER ?= vpu_params_generated.h
+.PHONY: all bareMetalC clean imagenet transformers mlps \
+	vpu-baremetal vpu-linux vpu-pk \
+	vpu-perf-baremetal vpu-perf-linux vpu-perf-pk \
+	fusion-vpu-baremetal fusion-vpu-linux fusion-vpu-pk \
+	fusion-vpu-perf-baremetal fusion-vpu-perf-linux fusion-vpu-perf-pk
+
+# Keep the default out-of-tree layout identical to the legacy flow.
+# VPU and fusion programs are built inside bareMetalC, never in a
+# configuration-named sibling directory.
+all: bareMetalC imagenet transformers mlps
 
 vars = \
 	abs_top_srcdir=$(abs_top_srcdir) \
@@ -26,15 +32,17 @@ bareMetalC:
 	mkdir -p $@
 	$(MAKE) -C $@ -f $(abs_top_srcdir)/$@/Makefile $(vars)
 
-vpu-baremetal vpu-pk:
-	mkdir -p $(VPU_BUILD_DIR)
-	$(MAKE) -C $(VPU_BUILD_DIR) -f $(abs_top_srcdir)/bareMetalC/Makefile \
+vpu-baremetal vpu-linux vpu-pk \
+vpu-perf-baremetal vpu-perf-linux vpu-perf-pk \
+fusion-vpu-baremetal fusion-vpu-linux fusion-vpu-pk \
+fusion-vpu-perf-baremetal fusion-vpu-perf-linux fusion-vpu-perf-pk:
+	mkdir -p bareMetalC
+	$(MAKE) -C bareMetalC -f $(abs_top_srcdir)/bareMetalC/Makefile \
 		abs_top_srcdir=$(abs_top_srcdir) \
 		src_dir=$(abs_top_srcdir)/bareMetalC \
 		XLEN=$(XLEN) \
 		PREFIX=$(ROCC)-bareMetalC \
 		RISCVTOOLS=$(RISCVTOOLS) \
-		VPU_GENERATED_HEADER=$(VPU_GENERATED_HEADER) \
 		$@
 
 imagenet:
@@ -50,9 +58,10 @@ mlps:
 	$(MAKE) -C $@ -f $(abs_top_srcdir)/$@/Makefile $(vars)
 
 clean:
-	$(MAKE) -C bareMetalC -f $(abs_top_srcdir)/bareMetalC/Makefile abs_top_srcdir=$(abs_top_srcdir) PREFIX=$(ROCC)-bareMetalC clean
-	$(MAKE) -C imagenet -f $(abs_top_srcdir)/imagenet/Makefile abs_top_srcdir=$(abs_top_srcdir) PREFIX=$(ROCC)-imagenet clean
-	$(MAKE) -C mlps -f $(abs_top_srcdir)/mlps/Makefile abs_top_srcdir=$(abs_top_srcdir) PREFIX=$(ROCC)-mlps clean
+	@if test -d bareMetalC; then $(MAKE) -C bareMetalC -f $(abs_top_srcdir)/bareMetalC/Makefile abs_top_srcdir=$(abs_top_srcdir) PREFIX=$(ROCC)-bareMetalC clean; fi
+	@if test -d imagenet; then $(MAKE) -C imagenet -f $(abs_top_srcdir)/imagenet/Makefile abs_top_srcdir=$(abs_top_srcdir) PREFIX=$(ROCC)-imagenet clean; fi
+	@if test -d transformers; then $(MAKE) -C transformers -f $(abs_top_srcdir)/transformers/Makefile abs_top_srcdir=$(abs_top_srcdir) PREFIX=$(ROCC)-transformers clean; fi
+	@if test -d mlps; then $(MAKE) -C mlps -f $(abs_top_srcdir)/mlps/Makefile abs_top_srcdir=$(abs_top_srcdir) PREFIX=$(ROCC)-mlps clean; fi
 
 test-baremetal-bareMetalC:
 	make -C bareMetalC	\
