@@ -4,15 +4,15 @@
 #include <stdint.h>
 #include <limits.h>
 
-#define XCUSTOM_ACC 0
-#define DIM 16
+#define XCUSTOM_ACC 3
+#define DIM 32
 #define ADDR_LEN 32
 #define BANK_NUM 4
-#define BANK_ROWS 2048
-#define ACC_ROWS 4096
+#define BANK_ROWS 1024
+#define ACC_ROWS 2048
 #define MAX_BYTES 64
 #define MAX_BLOCK_LEN (MAX_BYTES/(DIM*2))
-#define MAX_BLOCK_LEN_ACC (MAX_BYTES/(DIM*4))
+#define MAX_BLOCK_LEN_ACC 1
 
 typedef uint16_t elem_t;
 #define ELEM_T_IS_LOWPREC_FLOAT

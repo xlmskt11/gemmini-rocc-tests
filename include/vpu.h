@@ -55,6 +55,7 @@ enum vpu_opcode {
 
   VPU_OP_V_MAX_VF = 0x35,
   VPU_OP_V_MIN_VF = 0x36,
+  VPU_OP_C_SET_VSTRIDE = 0x37,
 
   VPU_OP_C_WRITE_GP = 0x38,
   VPU_OP_C_WRITE_FP = 0x39,
@@ -458,6 +459,14 @@ static inline void vpu_set_vmask_all(void) {
 static inline void vpu_set_stride_bytes(uint64_t stride_bytes) {
   vpu_rocc_issue(
       vpu_micro_op(VPU_OP_C_SET_STRIDE, 0, 0, 0, 0, 0), stride_bytes);
+}
+
+/* Start-to-start VSRAM stride, in elements, between matrix-row segments of
+ * one logical vector command. Zero selects the original contiguous layout. */
+static inline void vpu_set_vector_stride_elements(size_t stride_elements) {
+  vpu_rocc_issue(
+      vpu_micro_op(VPU_OP_C_SET_VSTRIDE, 0, 0, 0, 0, 0),
+      (uint64_t)stride_elements);
 }
 
 static inline void vpu_set_vl(size_t vl) {

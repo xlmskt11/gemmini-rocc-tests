@@ -60,11 +60,23 @@ extern "C" {
 #error "vpu_flashattention_kernel requires FP32 VPU storage"
 #endif
 #if VPU_GROUPED_COMMANDS != 1 || VPU_SHARED_DEPS != 1 || \
-    VPU_MATRIX_PORTS < 1
+    VPU_MATRIX_PORTS < 1 || VPU_MATRIX_PORTS > 4
 #error "vpu_flashattention_kernel requires grouped commands, SharedDeps, and matrix ports"
 #endif
-#if DIM != 16 || VPU_NLANES != DIM || VPU_VLEN < DIM
-#error "vpu_flashattention_kernel requires DIM=VPU_NLANES=16 and VLEN>=DIM"
+#if !defined(VPU_MATRIX_ROW_ELEMENTS)
+#error "vpu_flashattention_kernel requires generated VPU matrix-row geometry"
+#endif
+#if VPU_MATRIX_ROW_ELEMENTS != DIM || VPU_NLANES > DIM || \
+    (DIM % VPU_NLANES) != 0 || VPU_VLEN < DIM
+#error "vpu_flashattention_kernel requires matrix rows matching DIM, DIM divisible by VPU_NLANES, and VLEN>=DIM"
+#endif
+/* Matrix bridge rows and VPU commands share the architectural element-address
+ * space.  A DIM-wide row may therefore span several physical lane words; the
+ * bridge gathers/splits those words across sub-banks without changing the
+ * DIM-by-DIM software tile layout below. */
+#define VPU_FA_MATRIX_WORDS_PER_ROW (VPU_MATRIX_ROW_ELEMENTS / VPU_NLANES)
+#if VPU_FA_MATRIX_WORDS_PER_ROW > VPU_VSPAD_SUBBANKS
+#error "vpu_flashattention_kernel requires one VSRAM sub-bank per matrix-row lane word"
 #endif
 #if VPU_VSPAD_BANKS < 2 * VPU_MATRIX_PORTS
 #error "vpu_flashattention_kernel requires score/output bank pairs"
@@ -100,7 +112,8 @@ typedef struct {
   size_t value_stride;
   size_t output_stride;
 
-  /* custom0..custom3 bitmap. Selected endpoints must have matrix ports. */
+  /* Logical Gemmini-member bitmap. Member 0 is issued through the generated
+   * XCUSTOM_ACC opcode; selected members must have matrix ports. */
   unsigned gemmini_mask;
 
   /* Reusable caller-owned storage disjoint from Q/K/V/output; at least
@@ -241,7 +254,7 @@ static inline uint32_t vpu_fa_float_bits(float value) {
   do {                                                                    \
     switch (custom_) {                                                    \
       case VPU_FA_CUSTOM0:                                                \
-        ROCC_INSTRUCTION_0_R_R(0, rs1_, rs2_, funct_);                    \
+        ROCC_INSTRUCTION_0_R_R(XCUSTOM_ACC, rs1_, rs2_, funct_);          \
         break;                                                            \
       case VPU_FA_CUSTOM1:                                                \
         ROCC_INSTRUCTION_0_R_R(1, rs1_, rs2_, funct_);                    \
@@ -449,6 +462,12 @@ static inline void vpu_fa_group_terminator(unsigned group_id) {
 static inline void vpu_fa_group_set_vl(unsigned group_id, size_t vl) {
   vpu_fa_group_command(group_id, false, VPU_OP_C_SET_VL,
                        0, 0, 0, 0, 0, vl);
+}
+
+static inline void vpu_fa_group_set_vector_stride(
+    unsigned group_id, size_t stride_elements) {
+  vpu_fa_group_command(group_id, false, VPU_OP_C_SET_VSTRIDE,
+                       0, 0, 0, 0, 0, stride_elements);
 }
 
 static inline void vpu_fa_group_vector(unsigned group_id, unsigned opcode,
@@ -923,8 +942,25 @@ static inline void vpu_fa_group_score_max_stream(
     unsigned group_id, unsigned full_tiles, unsigned tail_columns) {
   const bool expand_tiles = VPU_LOOP_BUFFER_ENTRIES >= 56u &&
       tail_columns == 0u && full_tiles <= 4u;
+  const unsigned total_columns = full_tiles * DIM + tail_columns;
   vpu_fa_group_addi_gp(group_id, VPU_FA_GP_VECTOR,
                        VPU_FA_GP_SCORE_ROW, 0u);
+  /* Keep Gemmini's tile-major matrix layout, but present one score row to the
+   * VPU as a single logical vector. This removes per-DIM reduction drains
+   * while retaining the existing QK/PV bridge addresses. */
+  if (total_columns != 0u && total_columns <= VPU_VLEN) {
+    vpu_fa_group_set_vl(group_id, total_columns);
+    vpu_fa_group_set_vector_stride(group_id,
+                                   VPU_FA_MATRIX_TILE_ELEMENTS);
+    vpu_fa_group_vector(group_id, VPU_OP_V_MUL_VF,
+                        VPU_FA_GP_VECTOR, VPU_FA_GP_VECTOR,
+                        VPU_FA_FP_SCALE);
+    vpu_fa_group_command(group_id, false, VPU_OP_V_RED_MAX,
+                         VPU_FA_FP_M_NEW, VPU_FA_GP_VECTOR,
+                         0, 0, 0, 0);
+    vpu_fa_group_set_vector_stride(group_id, 0u);
+    return;
+  }
   if (full_tiles != 0u) {
     vpu_fa_group_set_vl(group_id, DIM);
     if (expand_tiles) {
@@ -980,8 +1016,24 @@ static inline void vpu_fa_group_score_exp_stream(
     unsigned group_id, unsigned full_tiles, unsigned tail_columns) {
   const bool expand_tiles = VPU_LOOP_BUFFER_ENTRIES >= 56u &&
       tail_columns == 0u && full_tiles <= 4u;
+  const unsigned total_columns = full_tiles * DIM + tail_columns;
   vpu_fa_group_addi_gp(group_id, VPU_FA_GP_VECTOR,
                        VPU_FA_GP_SCORE_ROW, 0u);
+  if (total_columns != 0u && total_columns <= VPU_VLEN) {
+    vpu_fa_group_set_vl(group_id, total_columns);
+    vpu_fa_group_set_vector_stride(group_id,
+                                   VPU_FA_MATRIX_TILE_ELEMENTS);
+    vpu_fa_group_vector(group_id, VPU_OP_V_SUB_VF,
+                        VPU_FA_GP_VECTOR, VPU_FA_GP_VECTOR,
+                        VPU_FA_FP_M_NEW);
+    vpu_fa_group_vector(group_id, VPU_OP_V_EXP_V,
+                        VPU_FA_GP_VECTOR, VPU_FA_GP_VECTOR, 0u);
+    vpu_fa_group_command(group_id, false, VPU_OP_V_RED_SUM,
+                         VPU_FA_FP_P_SUM, VPU_FA_GP_VECTOR,
+                         0, 0, 0, 0);
+    vpu_fa_group_set_vector_stride(group_id, 0u);
+    return;
+  }
   if (full_tiles != 0u) {
     vpu_fa_group_set_vl(group_id, DIM);
     if (expand_tiles) {
@@ -1049,6 +1101,15 @@ static inline void vpu_fa_group_output_scale_stream(
       tail_columns == 0u && full_tiles <= 4u;
   vpu_fa_group_addi_gp(group_id, VPU_FA_GP_OUTPUT,
                        VPU_FA_GP_OUTPUT_ROW, 0u);
+  if (value_dim != 0u && value_dim <= VPU_VLEN) {
+    vpu_fa_group_set_vl(group_id, value_dim);
+    vpu_fa_group_set_vector_stride(group_id,
+                                   VPU_FA_MATRIX_TILE_ELEMENTS);
+    vpu_fa_group_vector(group_id, VPU_OP_V_MUL_VF,
+                        VPU_FA_GP_OUTPUT, VPU_FA_GP_OUTPUT, scalar_fp);
+    vpu_fa_group_set_vector_stride(group_id, 0u);
+    return;
+  }
   if (full_tiles != 0u) {
     vpu_fa_group_set_vl(group_id, DIM);
     if (expand_tiles) {
@@ -1108,6 +1169,10 @@ static inline void vpu_fa_issue_causal_mask_row_run(
       full_score_tiles - first_future_full;
   const bool future_tail = tail_score_columns != 0u &&
       first_future_tile <= full_score_tiles;
+  const unsigned future_columns = future_full_tiles * DIM +
+      (future_tail ? tail_score_columns : 0u);
+  const bool coalesce_future =
+      future_columns != 0u && future_columns <= VPU_VLEN;
 
   ++stats->mask_row_loop_regions;
   stats->mask_row_loop_rows += row_count;
@@ -1125,7 +1190,8 @@ static inline void vpu_fa_issue_causal_mask_row_run(
   }
   if (future_full_tiles != 0u || future_tail) {
     stats->mask_future_vectors += (uint64_t)row_count *
-        (future_full_tiles + (future_tail ? 1u : 0u));
+        (coalesce_future ? 1u :
+          future_full_tiles + (future_tail ? 1u : 0u));
     vpu_fa_group_write_gp(
         group_id, VPU_FA_GP_FUTURE_ROW,
         vpu_fa_distributed_matrix_address(
@@ -1147,7 +1213,15 @@ static inline void vpu_fa_issue_causal_mask_row_run(
   if (future_full_tiles != 0u || future_tail) {
     vpu_fa_group_addi_gp(group_id, VPU_FA_GP_VECTOR,
                          VPU_FA_GP_FUTURE_ROW, 0u);
-    if (future_full_tiles != 0u) {
+    if (coalesce_future) {
+      vpu_fa_group_set_vl(group_id, future_columns);
+      vpu_fa_group_set_vector_stride(group_id,
+                                     VPU_FA_MATRIX_TILE_ELEMENTS);
+      vpu_fa_group_vector(group_id, VPU_OP_V_MIN_VF,
+                          VPU_FA_GP_VECTOR, VPU_FA_GP_VECTOR,
+                          VPU_FA_FP_NEG_INF);
+      vpu_fa_group_set_vector_stride(group_id, 0u);
+    } else if (future_full_tiles != 0u) {
       vpu_fa_group_set_vl(group_id, DIM);
       vpu_fa_group_loop_start(group_id, VPU_FA_GP_TILE_LOOP,
                               future_full_tiles);
@@ -1159,7 +1233,7 @@ static inline void vpu_fa_issue_causal_mask_row_run(
                            VPU_FA_MATRIX_TILE_ELEMENTS);
       vpu_fa_group_loop_end(group_id, VPU_FA_GP_TILE_LOOP);
     }
-    if (future_tail) {
+    if (future_tail && !coalesce_future) {
       vpu_fa_group_set_vl(group_id, tail_score_columns);
       vpu_fa_group_vector(group_id, VPU_OP_V_MIN_VF,
                           VPU_FA_GP_VECTOR, VPU_FA_GP_VECTOR,
@@ -1263,6 +1337,8 @@ static inline void vpu_fa_issue_qk_vpu(
     unsigned group_id) {
   const bool first_block = kv_start == 0u;
   const float scale = 1.0f / sqrtf((float)config->q_dim);
+  /* Make the kernel independent of any prior standalone/aborted VPU stream. */
+  vpu_fa_group_set_vector_stride(group_id, 0u);
   vpu_fa_group_write_fp(group_id, VPU_FA_FP_SCALE, scale);
   vpu_fa_group_write_fp(group_id, VPU_FA_FP_NEG_INF, -INFINITY);
 
@@ -1299,6 +1375,9 @@ static inline void vpu_fa_issue_final_normalize(
     const vpu_flashattention_config_t *config,
     vpu_flashattention_stats_t *stats, unsigned q_rows,
     bool last_causal_block, unsigned group_id) {
+  /* Final normalization uses the same segmented layout only where requested
+   * below; establish the legacy contiguous mode for all other commands. */
+  vpu_fa_group_set_vector_stride(group_id, 0u);
   if (!last_causal_block) {
     vpu_fa_group_terminator(group_id);
     return;

@@ -33,7 +33,11 @@
 #define total_gemmini_num 4
 #define nSharers 4
 #define group_w 4
-#define custom0 0
+/* Logical Gemmini member 0 follows the primary Gemmini opcode generated for
+ * the selected hardware configuration. It is custom0 in the 4-Gemmini
+ * fusion target and custom3 in the single-Gemmini target. Members 1--3 keep
+ * their fixed custom1--custom3 mappings. */
+#define custom0 XCUSTOM_ACC
 #define custom1 1
 #define custom2 2
 #define custom3 3
@@ -180,7 +184,10 @@ static void tiled_matmul_auto_set_tiling_override(bool enabled,
 static inline int gemmini_group_last_member(size_t group_list) {
   for (int i = total_gemmini_num - 1; i >= 0; --i) {
     if ((group_list >> i) & 1) {
-      return i;
+      /* shared_gemmini_loop_* compares this value with the physical opcode
+       * used to issue the command, whereas group_list itself remains a
+       * logical-sharer bitmap. */
+      return i == 0 ? custom0 : i;
     }
   }
 

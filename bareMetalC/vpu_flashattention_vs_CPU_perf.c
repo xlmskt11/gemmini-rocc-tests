@@ -27,10 +27,10 @@
 #include "vpu_kernels.h"
 
 #ifndef FA_QUERY_ROWS
-#define FA_QUERY_ROWS 256u
+#define FA_QUERY_ROWS 128u
 #endif
 #ifndef FA_SEQUENCE
-#define FA_SEQUENCE 256u
+#define FA_SEQUENCE 128u
 #endif
 #ifndef FA_HEAD_DIM
 #define FA_HEAD_DIM 64u
@@ -49,7 +49,7 @@
   ((FA_SEQUENCE) >= (FA_QUERY_ROWS) ? (FA_SEQUENCE) - (FA_QUERY_ROWS) : 0u)
 #endif
 #ifndef FA_GEMMINI_MASK
-#define FA_GEMMINI_MASK 0xfu
+#define FA_GEMMINI_MASK ((1u << VPU_MATRIX_PORTS) - 1u)
 #endif
 
 #ifndef FA_PERF_WARMUPS
@@ -59,7 +59,7 @@
 #define FA_PERF_REPEATS 1u
 #endif
 #ifndef FA_PERF_CHECK
-#define FA_PERF_CHECK 0
+#define FA_PERF_CHECK 1
 #endif
 
 #if FA_QUERY_ROWS == 0 || FA_SEQUENCE == 0 || FA_Q_DIM == 0 || \

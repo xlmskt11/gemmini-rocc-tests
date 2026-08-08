@@ -45,7 +45,7 @@
   ((FA_SEQUENCE) >= (FA_QUERY_ROWS) ? (FA_SEQUENCE) - (FA_QUERY_ROWS) : 0u)
 #endif
 #ifndef FA_GEMMINI_MASK
-#define FA_GEMMINI_MASK 0xfu
+#define FA_GEMMINI_MASK ((1u << VPU_MATRIX_PORTS) - 1u)
 #endif
 #ifndef FA_CHECK_REFERENCE
 #define FA_CHECK_REFERENCE 0

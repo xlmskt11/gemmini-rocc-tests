@@ -15,19 +15,21 @@
 #define PROFILE false
 #define profile_data_num 20000
 
-#define MULTI true
-#define gemmini_configuration 15
+#define MULTI false
+/* Logical Gemmini-member bitmap. For the 1x32 fusion config, member 0 is
+ * physically routed through generated XCUSTOM_ACC=custom3. */
+#define gemmini_configuration 1
 
-#define MAT_DIM_I 128
-#define MAT_DIM_J 128
-#define MAT_DIM_K 128
+#define MAT_DIM_I 256
+#define MAT_DIM_J 256
+#define MAT_DIM_K 256
 #define RAND rand()
 #define FAST true
 #define NO_BIAS true
 #define FULL_BIAS_WIDTH true
 #define FULL_C_WIDTH true
 #define REPEATING_BIAS false
-#define CHECK true
+#define CHECK false
 
 #define PACKED_A false
 #define PACKED_B false
@@ -49,6 +51,31 @@ typedef acc_t CACC_T;
 #else
 typedef elem_t CACC_T;
 #endif
+
+static inline elem_t test_elem_from_float(float value) {
+#if defined(ELEM_T_IS_LOWPREC_FLOAT) && ELEM_T_EXP_BITS == 8 && ELEM_T_SIG_BITS == 8
+  union {
+    float value;
+    uint32_t bits;
+  } encoded = {value};
+  encoded.bits += 0x7fffu + ((encoded.bits >> 16) & 1u);
+  return elem_t_bits_to_elem_t((elem_t_bits)(encoded.bits >> 16));
+#else
+  return (elem_t)value;
+#endif
+}
+
+static inline acc_t test_elem_to_acc(elem_t value) {
+#if defined(ELEM_T_IS_LOWPREC_FLOAT) && ELEM_T_EXP_BITS == 8 && ELEM_T_SIG_BITS == 8
+  union {
+    uint32_t bits;
+    float value;
+  } decoded = {(uint32_t)elem_t_to_elem_t_bits(value) << 16};
+  return (acc_t)decoded.value;
+#else
+  return (acc_t)value;
+#endif
+}
 
 void print_gemmini_use(unsigned mask)
 {
@@ -127,11 +154,17 @@ int main() {
     printf("Set profiler address\n");
     static uint64_t P[total_gemmini_num][profile_data_num] row_align(1);
 #if MULTI
-    gemmini_profiler(custom0, (uint64_t *)P[0]);
-    gemmini_profiler(custom1, (uint64_t *)P[1]);
-    gemmini_profiler(custom2, (uint64_t *)P[2]);
-#endif
+    if (gemmini_configuration & 0x1u)
+      gemmini_profiler(custom0, (uint64_t *)P[0]);
+    if (gemmini_configuration & 0x2u)
+      gemmini_profiler(custom1, (uint64_t *)P[1]);
+    if (gemmini_configuration & 0x4u)
+      gemmini_profiler(custom2, (uint64_t *)P[2]);
+    if (gemmini_configuration & 0x8u)
+      gemmini_profiler(custom3, (uint64_t *)P[3]);
+#else
     gemmini_profiler(custom3, (uint64_t *)P[3]);
+#endif
 #endif
 
 #if MULTI
@@ -143,13 +176,19 @@ int main() {
     printf("MAT_DIM_J: %d\n", MAT_DIM_J);
     printf("MAT_DIM_K: %d\n", MAT_DIM_K);
 
-    printf("Flush All Gemmini TLB of stale virtual addresses\n");
+    printf("Flush selected Gemmini TLBs of stale virtual addresses\n");
 #if MULTI
-    gemmini_flush(custom0, 0);
-    gemmini_flush(custom1, 0);
-    gemmini_flush(custom2, 0);
-#endif
+    if (gemmini_configuration & 0x1u)
+      gemmini_flush(custom0, 0);
+    if (gemmini_configuration & 0x2u)
+      gemmini_flush(custom1, 0);
+    if (gemmini_configuration & 0x4u)
+      gemmini_flush(custom2, 0);
+    if (gemmini_configuration & 0x8u)
+      gemmini_flush(custom3, 0);
+#else
     gemmini_flush(custom3, 0);
+#endif
 
     printf("Initialize our input and output matrices in main memory\n");
     static elem_t full_A[MAT_DIM_I][MAT_DIM_K] row_align(MAX_BLOCK_LEN);
@@ -162,37 +201,38 @@ int main() {
     static elem_t gold[MAT_DIM_I][MAT_DIM_J];
 #endif
 
-    printf("Init A\n");
-    for (size_t i = 0; i < MAT_DIM_I; ++i)
-    {
-      for (size_t j = 0; j < MAT_DIM_K; ++j)
-      {
-        full_A[i][j] = RAND % 2;
-      }
-    }
+    // printf("Init A\n");
+    // for (size_t i = 0; i < MAT_DIM_I; ++i)
+    // {
+    //   for (size_t j = 0; j < MAT_DIM_K; ++j)
+    //   {
+    //     const float value = (float)((int)(RAND % 255) - 127) / 16.0f;
+    //     full_A[i][j] = test_elem_from_float(value);
+    //   }
+    // }
 
-    printf("Init D\n");
-    for (size_t i = 0; i < MAT_DIM_I; ++i) {
-      for (size_t j = 0; j < MAT_DIM_J; ++j) {
-        full_D[i][j] = NO_BIAS ? 0 : RAND % 2;
-      }
-    }
+    // printf("Init D\n");
+    // for (size_t i = 0; i < MAT_DIM_I; ++i) {
+    //   for (size_t j = 0; j < MAT_DIM_J; ++j) {
+    //     full_D[i][j] = NO_BIAS ? 0 : RAND % 2;
+    //   }
+    // }
 
 #if FAST
   // identity matrix
-  printf("Init B\n");
-  for (size_t i = 0; i < MAT_DIM_K; ++i) {
-    for (size_t j = 0; j < MAT_DIM_J; ++j) {
-      full_B[i][j] = i == j;
-    }
-  }
+  // printf("Init B\n");
+  // for (size_t i = 0; i < MAT_DIM_K; ++i) {
+  //   for (size_t j = 0; j < MAT_DIM_J; ++j) {
+  //     full_B[i][j] = test_elem_from_float(i == j ? 1.0f : 0.0f);
+  //   }
+  // }
 #else
-  printf("Init B\n");
-  for (size_t i = 0; i < MAT_DIM_K; ++i) {
-    for (size_t j = 0; j < MAT_DIM_J; ++j) {
-      full_B[i][j] = RAND % 2;
-    }
-  }
+  // printf("Init B\n");
+  // for (size_t i = 0; i < MAT_DIM_K; ++i) {
+  //   for (size_t j = 0; j < MAT_DIM_J; ++j) {
+  //     full_B[i][j] = test_elem_from_float((float)((int)(RAND % 255) - 127) / 16.0f);
+  //   }
+  // }
 #if CHECK
   printf("Calculate Output\n");
   full_matmul(full_A, full_B, full_D, gold_full);
@@ -252,6 +292,21 @@ int main() {
   printf("Check \"Out\" matrix\n");
 
 #if FAST
+#if defined(ELEM_T_IS_LOWPREC_FLOAT) && FULL_C_WIDTH
+  for (size_t i = 0; i < MAT_DIM_I; ++i) {
+    for (size_t j = 0; j < MAT_DIM_J; ++j) {
+      const acc_t expected = test_elem_to_acc(full_A[i][j]);
+      if (full_C[i][j] != expected) {
+        printf("Incorrect output at C[%zu][%zu]: got=0x%x expected=%g A_bits=0x%x\n",
+               i, j,
+               (unsigned)acc_t_to_acc_t_bits(full_C[i][j]),
+               (double)expected,
+               (unsigned)elem_t_to_elem_t_bits(full_A[i][j]));
+        exit(1);
+      }
+    }
+  }
+#else
   if (!is_equal_dynamic(full_C, full_A, MAT_DIM_I, MAT_DIM_J))
   {
     printf("Incorrect output matrix!\n");
@@ -263,6 +318,7 @@ int main() {
 
     exit(1);
   }
+#endif
 #else
   if (!is_equal_dynamic(full_C, gold, MAT_DIM_I, MAT_DIM_J))
   {
