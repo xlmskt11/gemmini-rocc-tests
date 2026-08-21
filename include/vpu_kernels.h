@@ -400,14 +400,50 @@ static inline void vpu_stream_configure_spad(void) {
   vpu_write_gp(VPU_STREAM_GP_PONG_OUTPUT, VPU_BANK_BASE(7));
 }
 
-static inline void vpu_stream_configure_memory(const vpu_storage_t *input,
-                                                const vpu_storage_t *aux,
-                                                vpu_storage_t *output) {
-  /* Publish all software-produced tiles once before asynchronous prefetches. */
-  vpu_publish_cpu_writes();
+/*
+ * Asynchronous nonlinear batch contract.
+ *
+ * Call vpu_batch_begin() once after the CPU has finished producing every host
+ * input buffer, enqueue one or more independent kernels, and call
+ * vpu_batch_finish() before the CPU reads any output buffer.  Enqueue helpers
+ * do not publish or fence.  Their VSRAM reuse is ordered by the VPU reservation
+ * station; callers must still keep host input/output storage alive and
+ * unmodified for the DMA lifetime of the batch.  In particular, this API does
+ * not make a store to host memory an ordered producer for a later host-memory
+ * load.  Use independent rows/buffers, or finish between such kernels.
+ *
+ * A validation failure emits no commands.  Once a batch contains any earlier
+ * successful enqueue, the caller must still finish it before touching those
+ * buffers, even if a later enqueue is rejected.
+ *
+ * The override is used only by host-side command-trace tests.  Target builds
+ * retain the ordinary Rocket memory-ordering fence.
+ */
+#ifndef VPU_BATCH_PUBLISH_CPU_WRITES
+#define VPU_BATCH_PUBLISH_CPU_WRITES() vpu_publish_cpu_writes()
+#endif
+
+static inline void vpu_batch_begin(void) {
+  VPU_BATCH_PUBLISH_CPU_WRITES();
+}
+
+static inline uint64_t vpu_batch_finish(void) {
+  return vpu_fence();
+}
+
+static inline void vpu_stream_configure_memory_unpublished(
+    const vpu_storage_t *input, const vpu_storage_t *aux,
+    vpu_storage_t *output) {
   vpu_write_h(VPU_STREAM_H_INPUT, (uintptr_t)input);
   vpu_write_h(VPU_STREAM_H_AUX, (uintptr_t)aux);
   vpu_write_h(VPU_STREAM_H_OUTPUT, (uintptr_t)output);
+}
+
+static inline void vpu_stream_configure_memory(const vpu_storage_t *input,
+                                                const vpu_storage_t *aux,
+                                                vpu_storage_t *output) {
+  vpu_batch_begin();
+  vpu_stream_configure_memory_unpublished(input, aux, output);
 }
 
 static inline void vpu_stream_select_tile(size_t elements, size_t tile) {
@@ -759,10 +795,10 @@ static inline void vpu_tiled_emit_softmax_recompute_run(
  * reloaded into bank zero after the cached prefix has been consumed.  Hazard
  * tracking makes reuse safe even while the final cached commands drain.
  */
-static inline uint64_t vpu_tiled_rmsnorm_resident(
+static inline uint64_t vpu_tiled_rmsnorm_resident_impl(
     const vpu_storage_t *input, const vpu_storage_t *weight,
     vpu_storage_t *output, size_t elements, float epsilon,
-    struct vpu_tiled_plan plan) {
+    struct vpu_tiled_plan plan, int synchronize) {
   const int rms_plan = plan.kernel == VPU_TILED_KERNEL_RMSNORM ||
       plan.kernel == VPU_TILED_KERNEL_FINAL_NORM;
   if (!rms_plan || !vpu_tiled_plan_is_resident(plan) || elements == 0 ||
@@ -770,7 +806,10 @@ static inline uint64_t vpu_tiled_rmsnorm_resident(
     return VPU_STATUS_ILLEGAL_COMMAND;
   }
 
-  vpu_stream_configure_memory(input, weight, output);
+  if (synchronize) {
+    vpu_batch_begin();
+  }
+  vpu_stream_configure_memory_unpublished(input, weight, output);
   vpu_write_fp(VPU_STREAM_FP_ACCUM_OR_MAX, 0.0f);
   vpu_write_fp(VPU_STREAM_FP_CONSTANT_OR_SUM, 1.0f / (float)elements);
   vpu_write_fp(VPU_STREAM_FP_EPSILON, epsilon);
@@ -949,7 +988,15 @@ static inline uint64_t vpu_tiled_rmsnorm_resident(
     vpu_tiled_store_run(VPU_RESIDENT_GP_OUTPUT, result_address,
                         tile, 1, tail);
   }
-  return vpu_fence();
+  return synchronize ? vpu_batch_finish() : 0u;
+}
+
+static inline uint64_t vpu_tiled_rmsnorm_resident(
+    const vpu_storage_t *input, const vpu_storage_t *weight,
+    vpu_storage_t *output, size_t elements, float epsilon,
+    struct vpu_tiled_plan plan) {
+  return vpu_tiled_rmsnorm_resident_impl(
+      input, weight, output, elements, epsilon, plan, 1);
 }
 
 /*
@@ -957,16 +1004,21 @@ static inline uint64_t vpu_tiled_rmsnorm_resident(
  *   pass 1: stream x, materialize x*x per tile, accumulate FP32 sum;
  *   pass 2: reload x and weight, normalize, and store each output tile.
  */
-static inline uint64_t vpu_tiled_rmsnorm_streaming(
+static inline uint64_t vpu_tiled_rmsnorm_streaming_impl(
     const vpu_storage_t *input, const vpu_storage_t *weight,
-    vpu_storage_t *output, size_t elements, float epsilon) {
+    vpu_storage_t *output, size_t elements, float epsilon,
+    int synchronize) {
   if (elements > UINT32_MAX) {
     return VPU_STATUS_ILLEGAL_COMMAND;
   }
+  if (synchronize) {
+    vpu_batch_begin();
+  }
   vpu_stream_configure_spad();
-  vpu_stream_configure_memory(input, weight, output);
+  vpu_stream_configure_memory_unpublished(input, weight, output);
   if (elements == 0) {
-    return vpu_stream_empty();
+    vpu_set_vl(0);
+    return synchronize ? vpu_batch_finish() : 0u;
   }
 
   const size_t full_tiles = elements / VPU_VLEN;
@@ -1067,20 +1119,35 @@ static inline uint64_t vpu_tiled_rmsnorm_streaming(
     vpu_tiled_store_run(VPU_RESIDENT_GP_OUTPUT, output_address,
                         full_tiles, 1, tail);
   }
-  return vpu_fence();
+  return synchronize ? vpu_batch_finish() : 0u;
+}
+
+static inline uint64_t vpu_tiled_rmsnorm_streaming(
+    const vpu_storage_t *input, const vpu_storage_t *weight,
+    vpu_storage_t *output, size_t elements, float epsilon) {
+  return vpu_tiled_rmsnorm_streaming_impl(
+      input, weight, output, elements, epsilon, 1);
+}
+
+static inline uint64_t vpu_tiled_rmsnorm_impl(
+    const vpu_storage_t *input, const vpu_storage_t *weight,
+    vpu_storage_t *output, size_t elements, float epsilon,
+    int synchronize) {
+  const struct vpu_tiled_plan plan =
+      vpu_tiled_plan_for(VPU_TILED_KERNEL_RMSNORM, elements);
+  if (vpu_tiled_plan_is_resident(plan)) {
+    return vpu_tiled_rmsnorm_resident_impl(
+        input, weight, output, elements, epsilon, plan, synchronize);
+  }
+  return vpu_tiled_rmsnorm_streaming_impl(
+      input, weight, output, elements, epsilon, synchronize);
 }
 
 static inline uint64_t vpu_tiled_rmsnorm(
     const vpu_storage_t *input, const vpu_storage_t *weight,
     vpu_storage_t *output, size_t elements, float epsilon) {
-  const struct vpu_tiled_plan plan =
-      vpu_tiled_plan_for(VPU_TILED_KERNEL_RMSNORM, elements);
-  if (vpu_tiled_plan_is_resident(plan)) {
-    return vpu_tiled_rmsnorm_resident(
-        input, weight, output, elements, epsilon, plan);
-  }
-  return vpu_tiled_rmsnorm_streaming(
-      input, weight, output, elements, epsilon);
+  return vpu_tiled_rmsnorm_impl(
+      input, weight, output, elements, epsilon, 1);
 }
 
 static inline uint64_t vpu_tiled_rmsnorm_auto(
@@ -1099,6 +1166,19 @@ static inline uint64_t vpu_tiled_final_norm_auto(
     const vpu_storage_t *input, const vpu_storage_t *weight,
     vpu_storage_t *output, size_t elements, float epsilon) {
   return vpu_tiled_final_norm(input, weight, output, elements, epsilon);
+}
+
+static inline uint64_t vpu_rmsnorm_enqueue(
+    const vpu_storage_t *input, const vpu_storage_t *weight,
+    vpu_storage_t *output, size_t elements, float epsilon) {
+  return vpu_tiled_rmsnorm_impl(
+      input, weight, output, elements, epsilon, 0);
+}
+
+static inline uint64_t vpu_final_norm_enqueue(
+    const vpu_storage_t *input, const vpu_storage_t *weight,
+    vpu_storage_t *output, size_t elements, float epsilon) {
+  return vpu_rmsnorm_enqueue(input, weight, output, elements, epsilon);
 }
 
 static inline uint64_t vpu_stream_rmsnorm(
@@ -1120,10 +1200,25 @@ enum vpu_stream_activation {
   VPU_STREAM_ACT_GELU = 3,
   VPU_STREAM_ACT_SILU = 4,
   VPU_STREAM_ACT_SWIGLU = 5,
+  VPU_STREAM_ACT_ADD = 6,
+  VPU_STREAM_ACT_MUL = 7,
 };
 
-/* Emit one dynamic VLEN row. Constants are FP0=0, FP1=1, and FP2 is the
- * kernel coefficient (2 for tanh, 1.702 for sigmoid-GELU). */
+static inline int vpu_stream_activation_is_binary(
+    enum vpu_stream_activation activation) {
+  return activation == VPU_STREAM_ACT_ADD ||
+      activation == VPU_STREAM_ACT_MUL;
+}
+
+static inline int vpu_stream_activation_loads_aux(
+    enum vpu_stream_activation activation) {
+  return activation == VPU_STREAM_ACT_SWIGLU ||
+      vpu_stream_activation_is_binary(activation);
+}
+
+/* Emit one dynamic VLEN row. For nonlinear operations, constants are FP0=0,
+ * FP1=1, and FP2 is the kernel coefficient (2 for tanh, 1.702 for
+ * sigmoid-GELU). ADD/MUL need no FP constants. */
 static inline void vpu_stream_emit_activation_row(
     enum vpu_stream_activation activation, unsigned buffer) {
   const unsigned input_gp = vpu_stream_input_gp(buffer);
@@ -1132,6 +1227,12 @@ static inline void vpu_stream_emit_activation_row(
   const unsigned output_gp = vpu_stream_output_gp(buffer);
 
   switch (activation) {
+    case VPU_STREAM_ACT_ADD:
+      vpu_v_add_vv(output_gp, input_gp, aux_gp);
+      break;
+    case VPU_STREAM_ACT_MUL:
+      vpu_v_mul_vv(output_gp, input_gp, aux_gp);
+      break;
     case VPU_STREAM_ACT_RELU:
       vpu_v_max_vf(output_gp, input_gp, VPU_STREAM_FP_ACCUM_OR_MAX);
       break;
@@ -1192,9 +1293,29 @@ static inline void vpu_stream_advance_activation_row(unsigned buffer) {
                  vpu_stream_output_gp(buffer), VPU_VLEN);
 }
 
+/* ADD/MUL do not touch the temporary bank.  Keeping its address out of the
+ * captured loop saves one frontend command per vector row. */
+static inline void vpu_stream_advance_binary_row(unsigned buffer) {
+  vpu_s_addi_int(vpu_stream_input_gp(buffer),
+                 vpu_stream_input_gp(buffer), VPU_VLEN);
+  vpu_s_addi_int(vpu_stream_aux_gp(buffer),
+                 vpu_stream_aux_gp(buffer), VPU_VLEN);
+  vpu_s_addi_int(vpu_stream_output_gp(buffer),
+                 vpu_stream_output_gp(buffer), VPU_VLEN);
+}
+
 static inline void vpu_stream_emit_activation_batch(
     enum vpu_stream_activation activation, unsigned buffer, size_t rows) {
   vpu_stream_reset_batch_addresses(buffer);
+#if VPU_LOOP_BUFFER_ENTRIES >= 6
+  if (rows > 1u && vpu_stream_activation_is_binary(activation)) {
+    vpu_loop_start(VPU_STREAM_GP_LOOP, (uint32_t)rows);
+    vpu_stream_emit_activation_row(activation, buffer);
+    vpu_stream_advance_binary_row(buffer);
+    vpu_loop_end(VPU_STREAM_GP_LOOP);
+    return;
+  }
+#endif
 #if VPU_LOOP_BUFFER_ENTRIES >= 5
   if (rows > 1u && activation == VPU_STREAM_ACT_RELU) {
     vpu_loop_start(VPU_STREAM_GP_LOOP, (uint32_t)rows);
@@ -1225,30 +1346,39 @@ static inline void vpu_stream_emit_activation_batch(
                      vpu_stream_input_gp(buffer), VPU_VLEN);
       vpu_s_addi_int(vpu_stream_output_gp(buffer),
                      vpu_stream_output_gp(buffer), VPU_VLEN);
+    } else if (vpu_stream_activation_is_binary(activation)) {
+      vpu_stream_advance_binary_row(buffer);
     } else {
       vpu_stream_advance_activation_row(buffer);
     }
   }
 }
 
-static inline uint64_t vpu_stream_activation_auto(
+static inline uint64_t vpu_stream_activation_impl(
     const vpu_storage_t *input, const vpu_storage_t *aux,
     vpu_storage_t *output, size_t elements,
-    enum vpu_stream_activation activation) {
+    enum vpu_stream_activation activation, int synchronize) {
   if (elements > UINT32_MAX) {
     return VPU_STATUS_ILLEGAL_COMMAND;
   }
-  const int load_aux = activation == VPU_STREAM_ACT_SWIGLU;
+  if (synchronize) {
+    vpu_batch_begin();
+  }
+  const int load_aux = vpu_stream_activation_loads_aux(activation);
   vpu_stream_configure_spad();
-  vpu_stream_configure_memory(input, load_aux ? aux : input, output);
+  vpu_stream_configure_memory_unpublished(
+      input, load_aux ? aux : input, output);
   if (elements == 0) {
-    return vpu_stream_empty();
+    vpu_set_vl(0);
+    return synchronize ? vpu_batch_finish() : 0u;
   }
 
-  vpu_write_fp(VPU_STREAM_FP_ACCUM_OR_MAX, 0.0f);
-  vpu_write_fp(VPU_STREAM_FP_CONSTANT_OR_SUM, 1.0f);
-  vpu_write_fp(VPU_STREAM_FP_EPSILON,
-               activation == VPU_STREAM_ACT_GELU ? 1.702f : 2.0f);
+  if (!vpu_stream_activation_is_binary(activation)) {
+    vpu_write_fp(VPU_STREAM_FP_ACCUM_OR_MAX, 0.0f);
+    vpu_write_fp(VPU_STREAM_FP_CONSTANT_OR_SUM, 1.0f);
+    vpu_write_fp(VPU_STREAM_FP_EPSILON,
+                 activation == VPU_STREAM_ACT_GELU ? 1.702f : 2.0f);
+  }
 
   const size_t full_tiles = elements / VPU_VLEN;
   const size_t tail = elements % VPU_VLEN;
@@ -1300,7 +1430,37 @@ static inline uint64_t vpu_stream_activation_auto(
     vpu_h_store_v(vpu_stream_output_gp(buffer),
                   vpu_stream_offset_gp(buffer), VPU_STREAM_H_OUTPUT);
   }
-  return vpu_fence();
+  return synchronize ? vpu_batch_finish() : 0u;
+}
+
+static inline uint64_t vpu_stream_activation_enqueue(
+    const vpu_storage_t *input, const vpu_storage_t *aux,
+    vpu_storage_t *output, size_t elements,
+    enum vpu_stream_activation activation) {
+  return vpu_stream_activation_impl(
+      input, aux, output, elements, activation, 0);
+}
+
+static inline uint64_t vpu_stream_activation_auto(
+    const vpu_storage_t *input, const vpu_storage_t *aux,
+    vpu_storage_t *output, size_t elements,
+    enum vpu_stream_activation activation) {
+  return vpu_stream_activation_impl(
+      input, aux, output, elements, activation, 1);
+}
+
+static inline uint64_t vpu_stream_add(
+    const vpu_storage_t *lhs, const vpu_storage_t *rhs,
+    vpu_storage_t *output, size_t elements) {
+  return vpu_stream_activation_auto(
+      lhs, rhs, output, elements, VPU_STREAM_ACT_ADD);
+}
+
+static inline uint64_t vpu_stream_mul(
+    const vpu_storage_t *lhs, const vpu_storage_t *rhs,
+    vpu_storage_t *output, size_t elements) {
+  return vpu_stream_activation_auto(
+      lhs, rhs, output, elements, VPU_STREAM_ACT_MUL);
 }
 
 static inline uint64_t vpu_stream_relu(
@@ -1349,15 +1509,20 @@ static inline uint64_t vpu_stream_swiglu(
  * contract; NaN, +Inf, or an all-negative-infinity row propagates canonical
  * NaN and the corresponding sticky flags.
  */
-static inline uint64_t vpu_tiled_softmax_streaming(
-    const vpu_storage_t *input, vpu_storage_t *output, size_t elements) {
+static inline uint64_t vpu_tiled_softmax_streaming_impl(
+    const vpu_storage_t *input, vpu_storage_t *output, size_t elements,
+    int synchronize) {
   if (elements > UINT32_MAX) {
     return VPU_STATUS_ILLEGAL_COMMAND;
   }
+  if (synchronize) {
+    vpu_batch_begin();
+  }
   vpu_stream_configure_spad();
-  vpu_stream_configure_memory(input, input, output);
+  vpu_stream_configure_memory_unpublished(input, input, output);
   if (elements == 0) {
-    return vpu_stream_empty();
+    vpu_set_vl(0);
+    return synchronize ? vpu_batch_finish() : 0u;
   }
 
   const size_t full_tiles = elements / VPU_VLEN;
@@ -1477,7 +1642,12 @@ static inline uint64_t vpu_tiled_softmax_streaming(
     vpu_tiled_store_run(VPU_RESIDENT_GP_OUTPUT, output_address,
                         full_tiles, 1, tail);
   }
-  return vpu_fence();
+  return synchronize ? vpu_batch_finish() : 0u;
+}
+
+static inline uint64_t vpu_tiled_softmax_streaming(
+    const vpu_storage_t *input, vpu_storage_t *output, size_t elements) {
+  return vpu_tiled_softmax_streaming_impl(input, output, elements, 1);
 }
 
 /*
@@ -1488,16 +1658,19 @@ static inline uint64_t vpu_tiled_softmax_streaming(
  * three and EXP overwrites that transient input slot.  Cached EXP is reused in
  * pass three, eliminating both reload and recomputation for resident tiles.
  */
-static inline uint64_t vpu_tiled_softmax_resident(
+static inline uint64_t vpu_tiled_softmax_resident_impl(
     const vpu_storage_t *input, vpu_storage_t *output, size_t elements,
-    struct vpu_tiled_plan plan) {
+    struct vpu_tiled_plan plan, int synchronize) {
   if (plan.kernel != VPU_TILED_KERNEL_SOFTMAX ||
       !vpu_tiled_plan_is_resident(plan) || elements == 0 ||
       elements > UINT32_MAX || plan.elements != elements) {
     return VPU_STATUS_ILLEGAL_COMMAND;
   }
 
-  vpu_stream_configure_memory(input, input, output);
+  if (synchronize) {
+    vpu_batch_begin();
+  }
+  vpu_stream_configure_memory_unpublished(input, input, output);
   const unsigned first_workspace_bank = plan.resident_banks;
   const unsigned transient_bank = first_workspace_bank;
   const unsigned shifted_output_bank = plan.schedule ==
@@ -1704,22 +1877,42 @@ static inline uint64_t vpu_tiled_softmax_resident(
     vpu_tiled_store_run(VPU_RESIDENT_GP_OUTPUT, output_address,
                         tile, 1, tail);
   }
-  return vpu_fence();
+  return synchronize ? vpu_batch_finish() : 0u;
+}
+
+static inline uint64_t vpu_tiled_softmax_resident(
+    const vpu_storage_t *input, vpu_storage_t *output, size_t elements,
+    struct vpu_tiled_plan plan) {
+  return vpu_tiled_softmax_resident_impl(
+      input, output, elements, plan, 1);
+}
+
+static inline uint64_t vpu_tiled_softmax_impl(
+    const vpu_storage_t *input, vpu_storage_t *output, size_t elements,
+    int synchronize) {
+  const struct vpu_tiled_plan plan =
+      vpu_tiled_plan_for(VPU_TILED_KERNEL_SOFTMAX, elements);
+  if (vpu_tiled_plan_is_resident(plan)) {
+    return vpu_tiled_softmax_resident_impl(
+        input, output, elements, plan, synchronize);
+  }
+  return vpu_tiled_softmax_streaming_impl(
+      input, output, elements, synchronize);
 }
 
 static inline uint64_t vpu_tiled_softmax(
     const vpu_storage_t *input, vpu_storage_t *output, size_t elements) {
-  const struct vpu_tiled_plan plan =
-      vpu_tiled_plan_for(VPU_TILED_KERNEL_SOFTMAX, elements);
-  if (vpu_tiled_plan_is_resident(plan)) {
-    return vpu_tiled_softmax_resident(input, output, elements, plan);
-  }
-  return vpu_tiled_softmax_streaming(input, output, elements);
+  return vpu_tiled_softmax_impl(input, output, elements, 1);
 }
 
 static inline uint64_t vpu_tiled_softmax_auto(
     const vpu_storage_t *input, vpu_storage_t *output, size_t elements) {
   return vpu_tiled_softmax(input, output, elements);
+}
+
+static inline uint64_t vpu_softmax_enqueue(
+    const vpu_storage_t *input, vpu_storage_t *output, size_t elements) {
+  return vpu_tiled_softmax_impl(input, output, elements, 0);
 }
 
 static inline uint64_t vpu_stream_softmax(
@@ -1879,23 +2072,27 @@ static inline void vpu_rope_build_masks(
  * rotary_dim must be even and no larger than VLEN, and all addressed element
  * offsets must fit the VPU's 32-bit GP/address interface.
  *
- * This is a synchronous E2E helper: it publishes CPU writes, loads the tables
- * once, streams rows through software-managed ping/pong banks, stores every
- * result, restores an all-enabled architectural mask, and fences before
- * returning status.
+ * The implementation is shared by the synchronous auto ABI and the
+ * no-publish/no-fence enqueue ABI.  It loads the tables once, streams rows
+ * through software-managed ping/pong banks, stores every result, and restores
+ * an all-enabled architectural mask.
  */
-static inline uint64_t vpu_rope_auto(
+static inline uint64_t vpu_rope_impl(
     const vpu_storage_t *input, const vpu_storage_t *cosine,
     const vpu_storage_t *sine, vpu_storage_t *output, size_t rows,
-    size_t rotary_dim, enum vpu_rope_layout layout) {
+    size_t rotary_dim, enum vpu_rope_layout layout, int synchronize) {
   if ((layout != VPU_ROPE_INTERLEAVED && layout != VPU_ROPE_NEOX) ||
       rotary_dim > VPU_VLEN || (rotary_dim & 1u) != 0 ||
       !vpu_rearrange_total_valid(rows, rotary_dim)) {
     return VPU_STATUS_ILLEGAL_COMMAND;
   }
+  if (synchronize) {
+    vpu_batch_begin();
+  }
   if (rows == 0 || rotary_dim == 0) {
     vpu_set_vmask_all();
-    return vpu_stream_empty();
+    vpu_set_vl(0);
+    return synchronize ? vpu_batch_finish() : 0u;
   }
 
   uint64_t first_mask[VPU_VMASK_CHUNKS];
@@ -1903,7 +2100,6 @@ static inline uint64_t vpu_rope_auto(
   vpu_rope_build_masks(first_mask, second_mask, rotary_dim, layout);
 
   vpu_rearrange_configure_spad();
-  vpu_publish_cpu_writes();
   vpu_write_h(VPU_REARRANGE_H_INPUT, (uintptr_t)input);
   vpu_write_h(VPU_REARRANGE_H_TABLE0, (uintptr_t)cosine);
   vpu_write_h(VPU_REARRANGE_H_TABLE1, (uintptr_t)sine);
@@ -1996,7 +2192,23 @@ static inline uint64_t vpu_rope_auto(
                      vpu_rearrange_rows_gp(buffer));
   }
   vpu_set_vmask_all();
-  return vpu_fence();
+  return synchronize ? vpu_batch_finish() : 0u;
+}
+
+static inline uint64_t vpu_rope_enqueue(
+    const vpu_storage_t *input, const vpu_storage_t *cosine,
+    const vpu_storage_t *sine, vpu_storage_t *output, size_t rows,
+    size_t rotary_dim, enum vpu_rope_layout layout) {
+  return vpu_rope_impl(
+      input, cosine, sine, output, rows, rotary_dim, layout, 0);
+}
+
+static inline uint64_t vpu_rope_auto(
+    const vpu_storage_t *input, const vpu_storage_t *cosine,
+    const vpu_storage_t *sine, vpu_storage_t *output, size_t rows,
+    size_t rotary_dim, enum vpu_rope_layout layout) {
+  return vpu_rope_impl(
+      input, cosine, sine, output, rows, rotary_dim, layout, 1);
 }
 
 /*
@@ -2078,7 +2290,63 @@ static inline uint64_t vpu_permute_auto(
   return vpu_fence();
 }
 
-/* Short public spellings analogous to Gemmini's auto helpers. */
+/*
+ * Public no-publish/no-fence enqueue spellings.  A successful return means
+ * only that the command stream was emitted; hardware status is returned by
+ * the batch's final vpu_batch_finish().
+ */
+static inline uint64_t vpu_add_enqueue(
+    const vpu_storage_t *lhs, const vpu_storage_t *rhs,
+    vpu_storage_t *output, size_t elements) {
+  return vpu_stream_activation_enqueue(
+      lhs, rhs, output, elements, VPU_STREAM_ACT_ADD);
+}
+
+static inline uint64_t vpu_mul_enqueue(
+    const vpu_storage_t *lhs, const vpu_storage_t *rhs,
+    vpu_storage_t *output, size_t elements) {
+  return vpu_stream_activation_enqueue(
+      lhs, rhs, output, elements, VPU_STREAM_ACT_MUL);
+}
+
+static inline uint64_t vpu_silu_enqueue(
+    const vpu_storage_t *input, vpu_storage_t *output, size_t elements) {
+  return vpu_stream_activation_enqueue(
+      input, input, output, elements, VPU_STREAM_ACT_SILU);
+}
+
+static inline uint64_t vpu_relu_enqueue(
+    const vpu_storage_t *input, vpu_storage_t *output, size_t elements) {
+  return vpu_stream_activation_enqueue(
+      input, input, output, elements, VPU_STREAM_ACT_RELU);
+}
+
+static inline uint64_t vpu_sigmoid_enqueue(
+    const vpu_storage_t *input, vpu_storage_t *output, size_t elements) {
+  return vpu_stream_activation_enqueue(
+      input, input, output, elements, VPU_STREAM_ACT_SIGMOID);
+}
+
+static inline uint64_t vpu_tanh_enqueue(
+    const vpu_storage_t *input, vpu_storage_t *output, size_t elements) {
+  return vpu_stream_activation_enqueue(
+      input, input, output, elements, VPU_STREAM_ACT_TANH);
+}
+
+static inline uint64_t vpu_gelu_enqueue(
+    const vpu_storage_t *input, vpu_storage_t *output, size_t elements) {
+  return vpu_stream_activation_enqueue(
+      input, input, output, elements, VPU_STREAM_ACT_GELU);
+}
+
+static inline uint64_t vpu_swiglu_enqueue(
+    const vpu_storage_t *gate, const vpu_storage_t *up,
+    vpu_storage_t *output, size_t elements) {
+  return vpu_stream_activation_enqueue(
+      gate, up, output, elements, VPU_STREAM_ACT_SWIGLU);
+}
+
+/* Short synchronous spellings analogous to Gemmini's auto helpers. */
 static inline uint64_t vpu_rmsnorm_auto(
     const vpu_storage_t *input, const vpu_storage_t *weight,
     vpu_storage_t *output, size_t elements, float epsilon) {
@@ -2089,6 +2357,18 @@ static inline uint64_t vpu_final_norm_auto(
     const vpu_storage_t *input, const vpu_storage_t *weight,
     vpu_storage_t *output, size_t elements, float epsilon) {
   return vpu_tiled_final_norm_auto(input, weight, output, elements, epsilon);
+}
+
+static inline uint64_t vpu_add_auto(
+    const vpu_storage_t *lhs, const vpu_storage_t *rhs,
+    vpu_storage_t *output, size_t elements) {
+  return vpu_stream_add(lhs, rhs, output, elements);
+}
+
+static inline uint64_t vpu_mul_auto(
+    const vpu_storage_t *lhs, const vpu_storage_t *rhs,
+    vpu_storage_t *output, size_t elements) {
+  return vpu_stream_mul(lhs, rhs, output, elements);
 }
 
 static inline uint64_t vpu_silu_auto(

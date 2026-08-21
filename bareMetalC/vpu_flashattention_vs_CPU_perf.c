@@ -51,6 +51,10 @@
 #ifndef FA_GEMMINI_MASK
 #define FA_GEMMINI_MASK ((1u << VPU_MATRIX_PORTS) - 1u)
 #endif
+#ifndef FA_SCORE_SCALE
+/* Nonstandard positive scale keeps the benchmark's reference path generic. */
+#define FA_SCORE_SCALE 0.15625f
+#endif
 
 #ifndef FA_PERF_WARMUPS
 #define FA_PERF_WARMUPS 0u
@@ -151,8 +155,6 @@ static void perf_initialize_inputs(void) {
 __attribute__((noinline))
 static void perf_cpu_causal_attention(
     const vpu_flashattention_config_t *config, float *output) {
-  const float score_scale = 1.0f / sqrtf((float)config->q_dim);
-
   for (size_t query = 0; query < config->query_rows; ++query) {
     const size_t global_query = config->query_base + query;
     const size_t visible_keys = global_query + 1u < config->sequence
@@ -168,7 +170,7 @@ static void perf_cpu_causal_attention(
         dot = fmaf(perf_decode_bf16(query_row[depth]),
                    perf_decode_bf16(key_row[depth]), dot);
       }
-      const float score = dot * score_scale;
+      const float score = dot * config->score_scale;
       perf_score_scratch[key] = score;
       row_max = fmaxf(row_max, score);
     }
@@ -337,6 +339,7 @@ int main(void) {
       .q_dim = FA_Q_DIM,
       .k_dim = FA_K_DIM,
       .value_dim = FA_V_DIM,
+      .score_scale = FA_SCORE_SCALE,
       .query_base = FA_QUERY_BASE,
       .query_stride = FA_Q_DIM,
       .key_stride = FA_K_DIM,

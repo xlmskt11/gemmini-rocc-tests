@@ -1,5 +1,7 @@
 // See LICENSE for license details.
 
+static void record_batch_publish(void);
+#define VPU_BATCH_PUBLISH_CPU_WRITES() record_batch_publish()
 #include "include/vpu_kernels.h"
 
 #include <assert.h>
@@ -13,9 +15,15 @@ struct traced_command {
 
 static struct traced_command trace[4096];
 static size_t trace_count;
+static size_t publish_count;
+
+static void record_batch_publish(void) {
+  ++publish_count;
+}
 
 static void reset_trace(void) {
   trace_count = 0;
+  publish_count = 0;
 }
 
 static void record_command(uint64_t transport, uint64_t payload) {
@@ -312,6 +320,109 @@ static void test_fixed_2048_chunk_schedule(void) {
   assert(count_opcode(VPU_OP_C_FENCE) == 1u);
 }
 
+typedef uint64_t (*vpu_binary_auto_fn)(
+    const vpu_storage_t *, const vpu_storage_t *, vpu_storage_t *, size_t);
+
+static void check_binary_elementwise_schedule(
+    vpu_binary_auto_fn kernel, unsigned opcode, unsigned other_opcode) {
+  const size_t capacity = vpu_stream_batch_capacity();
+  assert(capacity >= 1u);
+  const size_t last_rows = capacity > 1u ? 2u : 1u;
+  const size_t full_tiles = 2u * capacity + last_rows;
+  const size_t tail = VPU_VLEN > 17u ? 17u : VPU_VLEN - 1u;
+  const size_t tail_descriptors = tail == 0u ? 0u : 1u;
+  const size_t full_batches = 3u;
+#if VPU_LOOP_BUFFER_ENTRIES >= 6
+  const size_t loop_batches =
+      (capacity > 1u ? 2u : 0u) + (last_rows > 1u ? 1u : 0u);
+  const size_t execute_commands = full_batches + tail_descriptors;
+  const size_t induction_commands = 3u * full_batches;
+#else
+  const size_t loop_batches = 0u;
+  const size_t execute_commands = full_tiles + tail_descriptors;
+  const size_t induction_commands = 3u * full_tiles;
+#endif
+  const size_t elements = full_tiles * (size_t)VPU_VLEN + tail;
+  const vpu_storage_t *lhs =
+      (const vpu_storage_t *)(uintptr_t)0x800000u;
+  const vpu_storage_t *rhs =
+      (const vpu_storage_t *)(uintptr_t)0x900000u;
+  vpu_storage_t *output = (vpu_storage_t *)(uintptr_t)0xa00000u;
+
+  reset_trace();
+  assert(kernel(lhs, rhs, output, elements) == 0u);
+
+  /* Every full batch has one 2-D load for each operand and one 2-D store.
+   * A partial-VLEN tail uses the corresponding three legacy descriptors. */
+  assert(count_opcode(VPU_OP_H_PREFETCH_V) ==
+         2u * (full_batches + tail_descriptors));
+  assert(count_memory_form(VPU_OP_H_PREFETCH_V, 1u) ==
+         2u * full_batches);
+  assert(count_memory_form(VPU_OP_H_PREFETCH_V, 0u) ==
+         2u * tail_descriptors);
+  assert(count_opcode(VPU_OP_H_STORE_V) ==
+         full_batches + tail_descriptors);
+  assert(count_memory_form(VPU_OP_H_STORE_V, 1u) == full_batches);
+  assert(count_memory_form(VPU_OP_H_STORE_V, 0u) == tail_descriptors);
+
+  assert(count_opcode(opcode) == execute_commands);
+  assert(count_opcode(other_opcode) == 0u);
+  assert(count_opcode(VPU_OP_C_LOOP_START) == loop_batches);
+  assert(count_opcode(VPU_OP_C_LOOP_END) == loop_batches);
+  assert(count_opcode(VPU_OP_S_ADDI_INT) == induction_commands);
+  assert(count_opcode(VPU_OP_C_WRITE_FP) == 0u);
+  check_chunk_row_writes(2u * full_batches, capacity);
+
+  /* The arithmetic body must read INPUT/AUX and write OUTPUT.  Both loads for
+   * the next pong batch are admitted before the first ping execution body. */
+  const size_t first_execute = find_opcode(opcode, 0u);
+  assert(first_execute < trace_count);
+  assert(vpu_micro_rd(trace[first_execute].uop) ==
+         VPU_STREAM_GP_PING_OUTPUT);
+  assert(vpu_micro_rs1(trace[first_execute].uop) ==
+         VPU_STREAM_GP_PING_INPUT);
+  assert(vpu_micro_rs2(trace[first_execute].uop) ==
+         VPU_STREAM_GP_PING_AUX);
+  const size_t second_aux_load =
+      find_memory_form(VPU_OP_H_PREFETCH_V, 1u, 3u);
+  assert(second_aux_load < first_execute);
+
+  assert(contains_vl(VPU_VLEN));
+  if (tail != 0u) {
+    assert(contains_vl(tail));
+  }
+  assert(count_opcode(VPU_OP_C_FENCE) == 1u);
+}
+
+static void test_binary_elementwise_schedule(void) {
+  check_binary_elementwise_schedule(
+      vpu_add_auto, VPU_OP_V_ADD_VV, VPU_OP_V_MUL_VV);
+  check_binary_elementwise_schedule(
+      vpu_mul_auto, VPU_OP_V_MUL_VV, VPU_OP_V_ADD_VV);
+
+  const vpu_storage_t *lhs =
+      (const vpu_storage_t *)(uintptr_t)0xb00000u;
+  const vpu_storage_t *rhs =
+      (const vpu_storage_t *)(uintptr_t)0xc00000u;
+  vpu_storage_t *output = (vpu_storage_t *)(uintptr_t)0xd00000u;
+
+  reset_trace();
+  assert(vpu_add_auto(lhs, rhs, output, 0u) == 0u);
+  assert(count_opcode(VPU_OP_H_PREFETCH_V) == 0u);
+  assert(count_opcode(VPU_OP_H_STORE_V) == 0u);
+  assert(count_opcode(VPU_OP_V_ADD_VV) == 0u);
+  assert(contains_vl(0u));
+  assert(count_opcode(VPU_OP_C_FENCE) == 1u);
+
+#if SIZE_MAX > UINT32_MAX
+  reset_trace();
+  assert(vpu_mul_auto(
+             lhs, rhs, output, (size_t)UINT32_MAX + 1u) ==
+         VPU_STATUS_ILLEGAL_COMMAND);
+  assert(trace_count == 0u);
+#endif
+}
+
 static void test_resident_reduction_chunk_schedule(void) {
   const size_t capacity = vpu_stream_batch_capacity();
   const size_t remainder_rows = capacity > 1u ? capacity - 1u : 1u;
@@ -383,6 +494,85 @@ static void test_resident_reduction_chunk_schedule(void) {
                            VPU_BANK_BASE(softmax_plan.resident_banks)));
 }
 
+static void test_synchronous_auto_boundaries(void) {
+  const size_t elements = VPU_VLEN;
+  const vpu_storage_t *input =
+      (const vpu_storage_t *)(uintptr_t)0x1000000u;
+  const vpu_storage_t *aux =
+      (const vpu_storage_t *)(uintptr_t)0x1100000u;
+  const vpu_storage_t *cosine =
+      (const vpu_storage_t *)(uintptr_t)0x1200000u;
+  const vpu_storage_t *sine =
+      (const vpu_storage_t *)(uintptr_t)0x1300000u;
+  vpu_storage_t *output = (vpu_storage_t *)(uintptr_t)0x1400000u;
+
+#define CHECK_SYNCHRONOUS_AUTO(call_) do { \
+    reset_trace();                         \
+    assert((call_) == 0u);                 \
+    assert(publish_count == 1u);           \
+    assert(count_opcode(VPU_OP_C_FENCE) == 1u); \
+  } while (0)
+
+  CHECK_SYNCHRONOUS_AUTO(
+      vpu_rmsnorm_auto(input, aux, output, elements, 1.0e-5f));
+  CHECK_SYNCHRONOUS_AUTO(
+      vpu_final_norm_auto(input, aux, output, elements, 1.0e-5f));
+  CHECK_SYNCHRONOUS_AUTO(vpu_softmax_auto(input, output, elements));
+  CHECK_SYNCHRONOUS_AUTO(vpu_rope_auto(
+      input, cosine, sine, output, 2u, VPU_VLEN, VPU_ROPE_NEOX));
+  CHECK_SYNCHRONOUS_AUTO(vpu_add_auto(input, aux, output, elements));
+  CHECK_SYNCHRONOUS_AUTO(vpu_mul_auto(input, aux, output, elements));
+  CHECK_SYNCHRONOUS_AUTO(vpu_silu_auto(input, output, elements));
+  CHECK_SYNCHRONOUS_AUTO(vpu_relu_auto(input, output, elements));
+  CHECK_SYNCHRONOUS_AUTO(vpu_sigmoid_auto(input, output, elements));
+  CHECK_SYNCHRONOUS_AUTO(vpu_tanh_auto(input, output, elements));
+  CHECK_SYNCHRONOUS_AUTO(vpu_gelu_auto(input, output, elements));
+  CHECK_SYNCHRONOUS_AUTO(vpu_swiglu_auto(input, aux, output, elements));
+
+#undef CHECK_SYNCHRONOUS_AUTO
+}
+
+static void test_multi_enqueue_single_boundary(void) {
+  const size_t elements = VPU_VLEN;
+  const vpu_storage_t *input =
+      (const vpu_storage_t *)(uintptr_t)0x2000000u;
+  const vpu_storage_t *aux =
+      (const vpu_storage_t *)(uintptr_t)0x2100000u;
+  const vpu_storage_t *cosine =
+      (const vpu_storage_t *)(uintptr_t)0x2200000u;
+  const vpu_storage_t *sine =
+      (const vpu_storage_t *)(uintptr_t)0x2300000u;
+  vpu_storage_t *output = (vpu_storage_t *)(uintptr_t)0x2400000u;
+
+  reset_trace();
+  vpu_batch_begin();
+  assert(publish_count == 1u);
+  assert(count_opcode(VPU_OP_C_FENCE) == 0u);
+
+  assert(vpu_rmsnorm_enqueue(
+             input, aux, output, elements, 1.0e-5f) == 0u);
+  assert(vpu_final_norm_enqueue(
+             input, aux, output, elements, 1.0e-5f) == 0u);
+  assert(vpu_softmax_enqueue(input, output, elements) == 0u);
+  assert(vpu_rope_enqueue(
+             input, cosine, sine, output, 2u, VPU_VLEN,
+             VPU_ROPE_INTERLEAVED) == 0u);
+  assert(vpu_add_enqueue(input, aux, output, elements) == 0u);
+  assert(vpu_mul_enqueue(input, aux, output, elements) == 0u);
+  assert(vpu_silu_enqueue(input, output, elements) == 0u);
+  assert(vpu_relu_enqueue(input, output, elements) == 0u);
+  assert(vpu_sigmoid_enqueue(input, output, elements) == 0u);
+  assert(vpu_tanh_enqueue(input, output, elements) == 0u);
+  assert(vpu_gelu_enqueue(input, output, elements) == 0u);
+  assert(vpu_swiglu_enqueue(input, aux, output, elements) == 0u);
+
+  assert(publish_count == 1u);
+  assert(count_opcode(VPU_OP_C_FENCE) == 0u);
+  assert(vpu_batch_finish() == 0u);
+  assert(publish_count == 1u);
+  assert(count_opcode(VPU_OP_C_FENCE) == 1u);
+}
+
 int main(void) {
   const size_t physical = vpu_stream_physical_batch_capacity();
   const size_t expected_capacity = physical < VPU_NONLINEAR_CHUNK_ROWS
@@ -394,6 +584,9 @@ int main(void) {
 
   test_ping_pong_tail_schedule();
   test_fixed_2048_chunk_schedule();
+  test_binary_elementwise_schedule();
   test_resident_reduction_chunk_schedule();
+  test_synchronous_auto_boundaries();
+  test_multi_enqueue_single_boundary();
   return 0;
 }

@@ -47,6 +47,10 @@
 #ifndef FA_GEMMINI_MASK
 #define FA_GEMMINI_MASK ((1u << VPU_MATRIX_PORTS) - 1u)
 #endif
+#ifndef FA_SCORE_SCALE
+/* Nonstandard positive scale exercises the runtime scale path. */
+#define FA_SCORE_SCALE 0.15625f
+#endif
 #ifndef FA_CHECK_REFERENCE
 #define FA_CHECK_REFERENCE 0
 #endif
@@ -123,7 +127,7 @@ static float fa_dot_qk(size_t query_row, size_t key_row) {
     sum = fmaf(fa_decode_bf16(queries[query_row][depth]),
                fa_decode_bf16(keys[key_row][depth]), sum);
   }
-  return sum * (1.0f / sqrtf((float)FA_Q_DIM));
+  return sum * FA_SCORE_SCALE;
 }
 
 /* The fused reference deliberately follows the selected KV blocking and
@@ -254,6 +258,7 @@ int main(void) {
       .q_dim = FA_Q_DIM,
       .k_dim = FA_K_DIM,
       .value_dim = FA_V_DIM,
+      .score_scale = FA_SCORE_SCALE,
       .query_base = FA_QUERY_BASE,
       .query_stride = FA_Q_DIM,
       .key_stride = FA_K_DIM,

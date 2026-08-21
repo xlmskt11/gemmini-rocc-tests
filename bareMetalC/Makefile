@@ -91,7 +91,7 @@ GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/
 VPU_PARAMS_HEADER = $(abs_top_srcdir)/include/vpu_params.h
 VPU_HEADERS = $(abs_top_srcdir)/include/vpu.h $(VPU_PARAMS_HEADER) $(abs_top_srcdir)/include/vpu_kernels.h $(abs_top_srcdir)/include/vpu_testutils.h
 VPU_PERF_HEADERS = $(VPU_HEADERS) $(abs_top_srcdir)/bareMetalC/vpu_vs_cpu_perf_common.h
-FUSION_VPU_HEADERS = $(VPU_HEADERS) $(abs_top_srcdir)/include/vpu_flashattention_kernel.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_tiling.h
+FUSION_VPU_HEADERS = $(VPU_HEADERS) $(abs_top_srcdir)/include/vpu_flashattention_kernel.h $(abs_top_srcdir)/include/gemmini_page_packed.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_tiling.h
 
 CFLAGS := $(CFLAGS) \
 	-DPREALLOCATE=1 \

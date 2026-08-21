@@ -444,6 +444,23 @@ static int finish_benchmark_and_check(const char *name, size_t n,
 static int check_softmax_distribution(const char *name, size_t n,
                                       const vpu_storage_t *actual_values);
 
+static int test_binary_elementwise(size_t n, int multiply) {
+  const char *name = multiply ? "mul" : "add";
+  prepare_vectors(n);
+  for (size_t i = 0; i < n; ++i) {
+    expected[i] = multiply
+        ? input_reference[i] * aux_reference[i]
+        : input_reference[i] + aux_reference[i];
+  }
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  const uint64_t status = multiply
+      ? vpu_mul_auto(&input_storage[1], &aux_storage[1],
+                     &output_storage[1], n)
+      : vpu_add_auto(&input_storage[1], &aux_storage[1],
+                     &output_storage[1], n);
+  return finish_and_check(name, n, status);
+}
+
 static int test_rmsnorm(size_t n, int final_norm) {
   const float epsilon = final_norm ? 1.0e-6f : 1.0e-5f;
   const char *name = final_norm ? "final_norm" : "rmsnorm";
@@ -608,6 +625,75 @@ static int test_unary_activation_multibatch(void) {
          test_unary_activation(n, TEST_ACT_SIGMOID) ||
          test_unary_activation(n, TEST_ACT_TANH) ||
          test_unary_activation(n, TEST_ACT_GELU);
+}
+
+static int finish_inplace_and_check(const char *name, size_t n,
+                                    uint64_t status,
+                                    const vpu_storage_t *actual) {
+  if ((status & VPU_STATUS_ERROR_MASK) != 0) {
+    printf("%s[%u]: VPU status error 0x%llx\n", name, (unsigned)n,
+           (unsigned long long)status);
+    return 1;
+  }
+  return check_guards(name, n) || check_output_values(name, n, actual);
+}
+
+static int test_inplace_direct_kernels(void) {
+  const size_t capacity = vpu_stream_batch_capacity();
+  const size_t requested = (2u * capacity + 2u) * (size_t)VPU_VLEN + 17u;
+  const size_t n = requested < VPU_TEST_MAX_ELEMENTS
+      ? requested : VPU_TEST_MAX_ELEMENTS;
+  uint64_t status = 0;
+
+  prepare_vectors(n);
+  for (size_t i = 0; i < n; ++i) {
+    expected[i] = input_reference[i] + aux_reference[i];
+  }
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_add_auto(&input_storage[1], &aux_storage[1],
+                        &input_storage[1], n);
+  if (finish_inplace_and_check("add_inplace_lhs", n, status,
+                               &input_storage[1])) return 1;
+
+  prepare_vectors(n);
+  for (size_t i = 0; i < n; ++i) {
+    expected[i] = input_reference[i] * aux_reference[i];
+  }
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_mul_auto(&input_storage[1], &aux_storage[1],
+                        &aux_storage[1], n);
+  if (finish_inplace_and_check("mul_inplace_rhs", n, status,
+                               &aux_storage[1])) return 1;
+
+  prepare_vectors(n);
+  vpu_ref_silu(input_reference, expected, n);
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_silu_auto(&input_storage[1], &input_storage[1], n);
+  if (finish_inplace_and_check("silu_inplace", n, status,
+                               &input_storage[1])) return 1;
+
+  prepare_vectors(n);
+  vpu_ref_swiglu(input_reference, aux_reference, expected, n);
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_swiglu_auto(&input_storage[1], &aux_storage[1],
+                           &input_storage[1], n);
+  if (finish_inplace_and_check("swiglu_inplace_gate", n, status,
+                               &input_storage[1])) return 1;
+
+  prepare_vectors(n);
+  vpu_ref_rmsnorm(input_reference, aux_reference, expected, n, 1.0e-5f);
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_rmsnorm_auto(&input_storage[1], &aux_storage[1],
+                            &input_storage[1], n, 1.0e-5f);
+  if (finish_inplace_and_check("rmsnorm_inplace", n, status,
+                               &input_storage[1])) return 1;
+
+  prepare_vectors(n);
+  vpu_ref_softmax(input_reference, expected, n);
+  vpu_clear_status(VPU_CLEAR_ERRORS);
+  status = vpu_softmax_auto(&input_storage[1], &input_storage[1], n);
+  return finish_inplace_and_check("softmax_inplace", n, status,
+                                  &input_storage[1]);
 }
 
 static int test_swiglu(size_t n) {
@@ -1592,6 +1678,9 @@ static int test_length(size_t n) {
   printf("VPU nonlinear length %u rms=%s softmax=%s\n", (unsigned)n,
          vpu_tiled_schedule_name(rms_plan.schedule),
          vpu_tiled_schedule_name(softmax_plan.schedule));
+  printf("  ADD/MUL\n");
+  if (test_binary_elementwise(n, 0) ||
+      test_binary_elementwise(n, 1)) return 1;
   printf("  RMSNorm\n");
   if (test_rmsnorm(n, 0)) return 1;
   printf("  final RMSNorm\n");
@@ -1666,6 +1755,9 @@ int main(void) {
   if (test_unary_activation_multibatch()) {
     return 1;
   }
+  if (test_inplace_direct_kernels()) {
+    return 1;
+  }
   if (test_finite_stress()) {
     return 1;
   }
@@ -1676,7 +1768,7 @@ int main(void) {
     return 1;
   }
 
-  printf("VPU auto RMSNorm/final-norm, ReLU, sigmoid, tanh, GELU, SiLU, "
+  printf("VPU auto ADD, MUL, RMSNorm/final-norm, ReLU, sigmoid, tanh, GELU, SiLU, "
          "SwiGLU, softmax, RoPE, and local-permute large/edge, "
          "finite-stress, and special-value tests passed\n");
   return 0;
