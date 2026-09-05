@@ -27,9 +27,19 @@ enum {
 #define TWO_D_VL (VPU_VLEN - 3u)
 #define SOURCE_PITCH (VPU_VLEN + 7u)
 #define DESTINATION_PITCH (VPU_VLEN + 11u)
-#define SOURCE_2D_ELEMENTS (VPU_DMA_MAX_ROWS * SOURCE_PITCH + 2u)
+#ifndef VPU_STRIDED_DMA_ROWS
+#if VPU_EXTERNAL_MEMORY
+/* The shared-ACC path deliberately serializes through the physical ACC write
+ * pipeline. Keep the ordinary RTL smoke bounded while retaining an override
+ * which can request the architectural maximum for long-running regressions. */
+#define VPU_STRIDED_DMA_ROWS (2u * VPU_VSPAD_SUBBANKS)
+#else
+#define VPU_STRIDED_DMA_ROWS VPU_DMA_MAX_ROWS
+#endif
+#endif
+#define SOURCE_2D_ELEMENTS (VPU_STRIDED_DMA_ROWS * SOURCE_PITCH + 2u)
 #define DESTINATION_2D_ELEMENTS \
-  (VPU_DMA_MAX_ROWS * DESTINATION_PITCH + 2u)
+  (VPU_STRIDED_DMA_ROWS * DESTINATION_PITCH + 2u)
 #define ONE_D_VL 17u
 #define ONE_D_ELEMENTS (VPU_VLEN + 2u)
 
@@ -37,7 +47,11 @@ enum {
 #error "vpu_strided_dma requires VPU_VLEN >= 17"
 #endif
 
-#if VPU_DMA_MAX_ROWS != VPU_SLOTS_PER_BANK
+#if VPU_STRIDED_DMA_ROWS == 0 || VPU_STRIDED_DMA_ROWS > VPU_DMA_MAX_ROWS
+#error "The 2-D test row count must fit the architectural descriptor"
+#endif
+
+#if !VPU_EXTERNAL_MEMORY && VPU_DMA_MAX_ROWS != VPU_SLOTS_PER_BANK
 #error "A maximum-size 2-D descriptor must cover exactly one VSRAM bank"
 #endif
 
@@ -99,7 +113,7 @@ static void initialize_2d_buffers(void) {
   destination_2d[0] =
       destination_2d[DESTINATION_2D_ELEMENTS - 1u] = guard;
 
-  for (size_t row = 0; row < VPU_DMA_MAX_ROWS; ++row) {
+  for (size_t row = 0; row < VPU_STRIDED_DMA_ROWS; ++row) {
     for (size_t column = 0; column < TWO_D_VL; ++column) {
       source_2d[1u + row * SOURCE_PITCH + column] =
           source_value(row, column);
@@ -107,7 +121,7 @@ static void initialize_2d_buffers(void) {
   }
 }
 
-static int test_maximum_2d_round_trip(void) {
+static int test_strided_2d_round_trip(void) {
   const char *name = "strided_2d_max_rows";
   initialize_2d_buffers();
   vpu_publish_cpu_writes();
@@ -115,7 +129,7 @@ static int test_maximum_2d_round_trip(void) {
 
   vpu_write_gp(GP_VSRAM_BASE, VPU_BANK_BASE(0));
   vpu_write_gp(GP_HOST_OFFSET, 0);
-  vpu_write_gp(GP_ROW_COUNT, VPU_DMA_MAX_ROWS);
+  vpu_write_gp(GP_ROW_COUNT, VPU_STRIDED_DMA_ROWS);
   vpu_write_h(H_SOURCE, (uintptr_t)&source_2d[1]);
   vpu_write_h(H_DESTINATION, (uintptr_t)&destination_2d[1]);
   vpu_set_vl(TWO_D_VL);
@@ -144,7 +158,7 @@ static int test_maximum_2d_round_trip(void) {
     return 1;
   }
 
-  for (size_t row = 0; row < VPU_DMA_MAX_ROWS; ++row) {
+  for (size_t row = 0; row < VPU_STRIDED_DMA_ROWS; ++row) {
     for (size_t column = 0; column < DESTINATION_PITCH; ++column) {
       const vpu_storage_t actual =
           destination_2d[1u + row * DESTINATION_PITCH + column];
@@ -160,7 +174,7 @@ static int test_maximum_2d_round_trip(void) {
     }
   }
 
-  const uint64_t bytes = (uint64_t)VPU_DMA_MAX_ROWS * TWO_D_VL *
+  const uint64_t bytes = (uint64_t)VPU_STRIDED_DMA_ROWS * TWO_D_VL *
                          VPU_STORAGE_BYTES;
   return check_perf(name, bytes, bytes);
 }
@@ -182,7 +196,10 @@ static int test_legacy_1d_compatibility(void) {
   vpu_publish_cpu_writes();
   vpu_clear_status(VPU_CLEAR_ALL);
 
-  vpu_write_gp(GP_VSRAM_BASE, VPU_BANK_BASE(1));
+  /* Exercise a second bank when the generated geometry has one, while
+   * keeping the compatibility case legal for a one-bank configuration. */
+  const unsigned legacy_bank = VPU_VSPAD_BANKS > 1u ? 1u : 0u;
+  vpu_write_gp(GP_VSRAM_BASE, VPU_BANK_BASE(legacy_bank));
   vpu_write_gp(GP_HOST_OFFSET, 0);
   /* A non-one rowCount and unrelated configured stride must have no effect
    * when legacy H_* wrappers encode funct1=0 and rs3=0. */
@@ -221,10 +238,10 @@ static int test_legacy_1d_compatibility(void) {
 }
 
 int main(void) {
-  if (test_maximum_2d_round_trip() || test_legacy_1d_compatibility()) {
+  if (test_strided_2d_round_trip() || test_legacy_1d_compatibility()) {
     return 1;
   }
-  printf("VPU maximum-bank strided 2-D load/store, VL-tail guards, "
+  printf("VPU strided 2-D load/store, VL-tail guards, "
          "source/destination stride, and legacy 1-D tests passed\n");
   return 0;
 }

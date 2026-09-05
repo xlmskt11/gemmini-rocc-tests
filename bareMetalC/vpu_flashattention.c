@@ -47,6 +47,12 @@
 #ifndef FA_GEMMINI_MASK
 #define FA_GEMMINI_MASK ((1u << VPU_MATRIX_PORTS) - 1u)
 #endif
+#ifndef FA_QK_PARTITION_AXIS
+#define FA_QK_PARTITION_AXIS GEMMINI_PARTITION_AXIS_M
+#endif
+#ifndef FA_PV_PARTITION_AXIS
+#define FA_PV_PARTITION_AXIS GEMMINI_PARTITION_AXIS_M
+#endif
 #ifndef FA_SCORE_SCALE
 /* Nonstandard positive scale exercises the runtime scale path. */
 #define FA_SCORE_SCALE 0.15625f
@@ -265,6 +271,8 @@ int main(void) {
       .value_stride = FA_V_DIM,
       .output_stride = FA_V_DIM,
       .gemmini_mask = FA_GEMMINI_MASK,
+      .qk_partition_axis = FA_QK_PARTITION_AXIS,
+      .pv_partition_axis = FA_PV_PARTITION_AXIS,
       .causal_mask_workspace = causal_mask_workspace,
       .causal_mask_workspace_elements =
           VPU_FLASHATTENTION_CAUSAL_MASK_ELEMENTS,

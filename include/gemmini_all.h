@@ -14,6 +14,7 @@
 
 #include "include/gemmini_params.h"
 #include "include/gemmini_tiling.h"
+#include "include/gemmini_matmul_job.h"
 
 #define GEMMINI_ASSERTIONS
 
@@ -154,7 +155,9 @@ static void tiled_matmul_auto_set_tiling_override(bool enabled,
 
 // made
 #define SET_PROFILER_PADDR 23
-#define k_LOOP_WS_CONFIG_MV_BOUNDS_1 24
+#define k_LOOP_WS_CONFIG_PARTITION_BOUNDS 24
+// Source-compatible name for legacy M-only callers.
+#define k_LOOP_WS_CONFIG_MV_BOUNDS_1 k_LOOP_WS_CONFIG_PARTITION_BOUNDS
 #define k_LOOP_WS_CONFIG_SPADDR 25
 #define k_LOOP_CONV_WS_CONFIG_MV_BOUNDS_1 26
 #define k_LOOP_CONV_WS_CONFIG_SPADDR 27
@@ -328,6 +331,27 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
 
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) \
   ROCC_INSTRUCTION_0_R_R(x, rs1, rs2, funct)
+
+#if GEMMINI_SHARED_PARTITION_DESCRIPTOR_AVAILABLE
+#define GEMMINI_ISSUE_SHARED_PARTITION_BOUNDS(                                \
+    custom_num_, axis_, partition_extent_, partition_offset_, aux_extent_,    \
+    aux_offset_, aux_pad_)                                                    \
+  do {                                                                        \
+    ROCC_INSTRUCTION_RS1_RS2(                                                 \
+        custom_num_,                                                         \
+        gemmini_shared_partition_pack_rs1(                                    \
+            axis_, partition_offset_, aux_offset_),                           \
+        gemmini_shared_partition_pack_rs2(                                    \
+            partition_extent_, aux_extent_, aux_pad_),                        \
+        k_LOOP_WS_CONFIG_PARTITION_BOUNDS)                                    \
+  } while (0)
+#else
+#define GEMMINI_ISSUE_SHARED_PARTITION_BOUNDS(                                \
+    custom_num_, axis_, partition_extent_, partition_offset_, aux_extent_,    \
+    aux_offset_, aux_pad_)                                                    \
+  do {                                                                        \
+  } while (0)
+#endif
 
 #define GEMMINI_ISSUE_LOOP_WS(custom_num, rs1, rs2)            \
   do                                                           \
@@ -561,11 +585,20 @@ static void counter_reset(int custom_num) {
 
 #define gemmini_loop_ws_with_page_offsets(custom_num, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, A_row_offset, A_col_offset, B_row_offset, B_col_offset, D_row_offset, D_col_offset, C_row_offset, C_col_offset) \
   {                                                                                                                                                                                                                                                                                                                  \
+    const size_t gemmini_d_stride_ = (D_stride);                                                                                                                                                                                                                                                                    \
+    if (!gemmini_loop_bounds_fields_valid((I), (J), (K), (pad_I), (pad_J), (pad_K)) ||                                                                                                                                                                                                                             \
+        !gemmini_page_offset_fields_valid((A_row_offset), (A_col_offset), (B_row_offset), (B_col_offset), (D_row_offset), (D_col_offset), (C_row_offset), (C_col_offset)) ||                                                                                                                                          \
+        !gemmini_shared_partition_page_offsets_valid(                                                                                                                                                                                                                                                              \
+            GEMMINI_PARTITION_AXIS_M, (I), 0, (K), 0, (I), (J), (K),                                                                                                                                                                                                                                               \
+            gemmini_page_packed_stride_is_packed(A_stride), gemmini_page_packed_stride_is_packed(B_stride),                                                                                                                                                                                                        \
+            gemmini_page_packed_stride_is_packed(gemmini_d_stride_), gemmini_page_packed_stride_is_packed(C_stride),                                                                                                                                                                                               \
+            (A_row_offset), (A_col_offset), (B_row_offset), (B_col_offset),                                                                                                                                                                                                                                         \
+            (D_row_offset), (D_col_offset), (C_row_offset), (C_col_offset))) abort();                                                                                                                                                                                                                               \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS)                                                                                                          \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB)                                                                                                                                                                                                                                            \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC)                                                                                                                                                                                                                                            \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB)                                                                                                                                                                                                                            \
-    ROCC_INSTRUCTION_RS1_RS2(custom_num, D_stride, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC)                                                                                                                                                                                                                            \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, gemmini_d_stride_, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC)                                                                                                                                                                                                                   \
     ROCC_INSTRUCTION_RS1_RS2(custom_num,                                                                                                                                                                                                                                                                             \
                              GEMMINI_PACK_PAGE_BLOCK_OFFSETS(A_row_offset, A_col_offset, B_row_offset, B_col_offset),                                                                                                                                                                                                \
                              GEMMINI_PACK_PAGE_BLOCK_OFFSETS(D_row_offset, D_col_offset, C_row_offset, C_col_offset),                                                                                                                                                                                                \
@@ -573,11 +606,19 @@ static void counter_reset(int custom_num) {
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((B_transpose) << 1) | (A_transpose), k_LOOP_WS);                                                                                                                                              \
   }
 
-// made
-#define shared_gemmini_loop_ws(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
+// Shared LOOP_WS funct=24 partition descriptor. Keep this canonical ordering
+// in sync with gemmini_shared_partition_pack_rs1/rs2 in gemmini_tiling.h.
+#define shared_gemmini_loop_ws_axis(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, axis, partition_extent, aux_extent, aux_pad, partition_offset, aux_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
   { \
+      const gemmini_partition_axis_t gemmini_axis_ = (axis); \
+      const size_t gemmini_partition_extent_ = (partition_extent); \
+      const size_t gemmini_partition_offset_ = (partition_offset); \
+      const size_t gemmini_aux_extent_ = (aux_extent); \
+      const size_t gemmini_aux_offset_ = (aux_offset); \
+      const size_t gemmini_aux_pad_ = (aux_pad); \
+      if (!gemmini_shared_partition_fields_valid(gemmini_axis_, gemmini_partition_extent_, gemmini_partition_offset_, gemmini_aux_extent_, gemmini_aux_offset_, gemmini_aux_pad_) || !gemmini_loop_bounds_fields_valid((I), (J), (K), (pad_I), (pad_J), (pad_K)) || !gemmini_partition_axis_supported_by_abi(gemmini_axis_, gemmini_partition_generated_axis_abi_version())) abort(); \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, acc_addr_start, ((uint64_t)(sp_addr_end) << 16) | (uint64_t)(sp_addr_start), k_LOOP_WS_CONFIG_SPADDR) \
-      ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(laddrK_offset) << 16) | (uint64_t)(laddrI_offset), ((uint64_t)(mv_K) << 32) | ((uint64_t)(mv_pad_K) << 16) | (uint64_t)(ex_I), k_LOOP_WS_CONFIG_MV_BOUNDS_1) \
+      GEMMINI_ISSUE_SHARED_PARTITION_BOUNDS(custom_num, gemmini_axis_, gemmini_partition_extent_, gemmini_partition_offset_, gemmini_aux_extent_, gemmini_aux_offset_, gemmini_aux_pad_); \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
       ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
@@ -588,15 +629,26 @@ static void counter_reset(int custom_num) {
       } \
   }
 
-#define shared_gemmini_loop_ws_with_page_offsets(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, A_row_offset, A_col_offset, B_row_offset, B_col_offset, D_row_offset, D_col_offset, C_row_offset, C_col_offset) \
+#define shared_gemmini_loop_ws(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act) \
+  shared_gemmini_loop_ws_axis(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, GEMMINI_PARTITION_AXIS_M, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act)
+
+#define shared_gemmini_loop_ws_with_page_offsets_axis(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, axis, partition_extent, aux_extent, aux_pad, partition_offset, aux_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, A_row_offset, A_col_offset, B_row_offset, B_col_offset, D_row_offset, D_col_offset, C_row_offset, C_col_offset) \
   {                                                                                                                                                                                                                                                                                                                                                                                                                                               \
+    const gemmini_partition_axis_t gemmini_axis_ = (axis);                                                                                                                                                                                                                                                                                                                                                                                        \
+    const size_t gemmini_partition_extent_ = (partition_extent);                                                                                                                                                                                                                                                                                                                                                                                  \
+    const size_t gemmini_partition_offset_ = (partition_offset);                                                                                                                                                                                                                                                                                                                                                                                  \
+    const size_t gemmini_aux_extent_ = (aux_extent);                                                                                                                                                                                                                                                                                                                                                                                              \
+    const size_t gemmini_aux_offset_ = (aux_offset);                                                                                                                                                                                                                                                                                                                                                                                              \
+    const size_t gemmini_aux_pad_ = (aux_pad);                                                                                                                                                                                                                                                                                                                                                                                                    \
+    const size_t gemmini_d_stride_ = (D_stride);                                                                                                                                                                                                                                                                                                                                                                                                   \
+    if (!gemmini_shared_partition_fields_valid(gemmini_axis_, gemmini_partition_extent_, gemmini_partition_offset_, gemmini_aux_extent_, gemmini_aux_offset_, gemmini_aux_pad_) || !gemmini_loop_bounds_fields_valid((I), (J), (K), (pad_I), (pad_J), (pad_K)) || !gemmini_page_offset_fields_valid((A_row_offset), (A_col_offset), (B_row_offset), (B_col_offset), (D_row_offset), (D_col_offset), (C_row_offset), (C_col_offset)) || !gemmini_partition_axis_supported_by_abi(gemmini_axis_, gemmini_partition_generated_axis_abi_version()) || !gemmini_shared_partition_page_offsets_valid(gemmini_axis_, gemmini_partition_extent_, gemmini_partition_offset_, gemmini_aux_extent_, gemmini_aux_offset_, (I), (J), (K), gemmini_page_packed_stride_is_packed(A_stride), gemmini_page_packed_stride_is_packed(B_stride), gemmini_page_packed_stride_is_packed(gemmini_d_stride_), gemmini_page_packed_stride_is_packed(C_stride), (A_row_offset), (A_col_offset), (B_row_offset), (B_col_offset), (D_row_offset), (D_col_offset), (C_row_offset), (C_col_offset))) abort();                                                                                 \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, acc_addr_start, ((uint64_t)(sp_addr_end) << 16) | (uint64_t)(sp_addr_start), k_LOOP_WS_CONFIG_SPADDR)                                                                                                                                                                                                                                                                                                    \
-    ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(laddrK_offset) << 16) | (uint64_t)(laddrI_offset), ((uint64_t)(mv_K) << 32) | ((uint64_t)(mv_pad_K) << 16) | (uint64_t)(ex_I), k_LOOP_WS_CONFIG_MV_BOUNDS_1)                                                                                                                                                                                                                                 \
+    GEMMINI_ISSUE_SHARED_PARTITION_BOUNDS(custom_num, gemmini_axis_, gemmini_partition_extent_, gemmini_partition_offset_, gemmini_aux_extent_, gemmini_aux_offset_, gemmini_aux_pad_);                                                                                                                                                                                               \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS)                                                                                                                                                                                                                                       \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, A, B, k_LOOP_WS_CONFIG_ADDRS_AB)                                                                                                                                                                                                                                                                                                                                                                         \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, D, C, k_LOOP_WS_CONFIG_ADDRS_DC)                                                                                                                                                                                                                                                                                                                                                                         \
     ROCC_INSTRUCTION_RS1_RS2(custom_num, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB)                                                                                                                                                                                                                                                                                                                                                         \
-    ROCC_INSTRUCTION_RS1_RS2(custom_num, D_stride, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC)                                                                                                                                                                                                                                                                                                                                                         \
+    ROCC_INSTRUCTION_RS1_RS2(custom_num, gemmini_d_stride_, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC)                                                                                                                                                                                                                                                                                                                                                \
     ROCC_INSTRUCTION_RS1_RS2(custom_num,                                                                                                                                                                                                                                                                                                                                                                                                          \
                              GEMMINI_PACK_PAGE_BLOCK_OFFSETS(A_row_offset, A_col_offset, B_row_offset, B_col_offset),                                                                                                                                                                                                                                                                                                                             \
                              GEMMINI_PACK_PAGE_BLOCK_OFFSETS(D_row_offset, D_col_offset, C_row_offset, C_col_offset),                                                                                                                                                                                                                                                                                                                             \
@@ -606,6 +658,9 @@ static void counter_reset(int custom_num) {
       ROCC_INSTRUCTION_RS1_RS2(custom_num, ((uint64_t)(group_list) << 48) | ((uint64_t)(group_id) << 32) | ((uint64_t)(act) << 8) | ((uint64_t)(low_D) << 2) | ((uint64_t)(full_C) << 1) | (uint64_t)(ex_accumulate), ((uint64_t)(B_transpose) << 1) | (uint64_t)(A_transpose), k_LOOP_WS);                                                                                                                                                                  \
     }                                                                                                                                                                                                                                                                                                                                                                                                                                             \
   }
+
+#define shared_gemmini_loop_ws_with_page_offsets(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, A_row_offset, A_col_offset, B_row_offset, B_col_offset, D_row_offset, D_col_offset, C_row_offset, C_col_offset) \
+  shared_gemmini_loop_ws_with_page_offsets_axis(custom_num, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, GEMMINI_PARTITION_AXIS_M, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset, I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, A_row_offset, A_col_offset, B_row_offset, B_col_offset, D_row_offset, D_col_offset, C_row_offset, C_col_offset)
 
 // weight-stationary conv loop
 #define gemmini_loop_conv_ws(custom_num, batch_size, in_dim, in_channels, out_channels, out_dim, pool_out_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, activation, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, dw) \
@@ -1647,28 +1702,32 @@ static void sp_tiled_matmul_ws(int custom_num, const elem_t * A, const elem_t * 
   switch(custom_num) {
     case 0:
       gemmini_loop_ws(custom0, I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
-        A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+        A_row_stride, B_row_stride,
+        repeating_bias ? 0 : D_row_stride, C_row_stride,
         a_transpose, b_transpose,
         full_C, low_D, !no_bias || D == NULL,
         act);
       break;
     case 1:
       gemmini_loop_ws(custom1, I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
-        A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+        A_row_stride, B_row_stride,
+        repeating_bias ? 0 : D_row_stride, C_row_stride,
         a_transpose, b_transpose,
         full_C, low_D, !no_bias || D == NULL,
         act);
       break;
     case 2:
       gemmini_loop_ws(custom2, I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
-        A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+        A_row_stride, B_row_stride,
+        repeating_bias ? 0 : D_row_stride, C_row_stride,
         a_transpose, b_transpose,
         full_C, low_D, !no_bias || D == NULL,
         act);
       break;
     case 3:
       gemmini_loop_ws(custom3, I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
-        A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+        A_row_stride, B_row_stride,
+        repeating_bias ? 0 : D_row_stride, C_row_stride,
         a_transpose, b_transpose,
         full_C, low_D, !no_bias || D == NULL,
         act);
@@ -1697,7 +1756,8 @@ static void sp_tiled_matmul_ws_with_page_offsets(
   case 0:
     gemmini_loop_ws_with_page_offsets(custom0, I, J, K, pad_I, pad_J, pad_K,
                                       A, B, no_bias ? NULL : D, C,
-                                      A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                                      A_row_stride, B_row_stride,
+                                      repeating_bias ? 0 : D_row_stride, C_row_stride,
                                       a_transpose, b_transpose, full_C, low_D, !no_bias || D == NULL, act,
                                       A_row_offset, A_col_offset, B_row_offset, B_col_offset,
                                       D_row_offset, D_col_offset, C_row_offset, C_col_offset);
@@ -1705,7 +1765,8 @@ static void sp_tiled_matmul_ws_with_page_offsets(
   case 1:
     gemmini_loop_ws_with_page_offsets(custom1, I, J, K, pad_I, pad_J, pad_K,
                                       A, B, no_bias ? NULL : D, C,
-                                      A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                                      A_row_stride, B_row_stride,
+                                      repeating_bias ? 0 : D_row_stride, C_row_stride,
                                       a_transpose, b_transpose, full_C, low_D, !no_bias || D == NULL, act,
                                       A_row_offset, A_col_offset, B_row_offset, B_col_offset,
                                       D_row_offset, D_col_offset, C_row_offset, C_col_offset);
@@ -1713,7 +1774,8 @@ static void sp_tiled_matmul_ws_with_page_offsets(
   case 2:
     gemmini_loop_ws_with_page_offsets(custom2, I, J, K, pad_I, pad_J, pad_K,
                                       A, B, no_bias ? NULL : D, C,
-                                      A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                                      A_row_stride, B_row_stride,
+                                      repeating_bias ? 0 : D_row_stride, C_row_stride,
                                       a_transpose, b_transpose, full_C, low_D, !no_bias || D == NULL, act,
                                       A_row_offset, A_col_offset, B_row_offset, B_col_offset,
                                       D_row_offset, D_col_offset, C_row_offset, C_col_offset);
@@ -1721,7 +1783,8 @@ static void sp_tiled_matmul_ws_with_page_offsets(
   case 3:
     gemmini_loop_ws_with_page_offsets(custom3, I, J, K, pad_I, pad_J, pad_K,
                                       A, B, no_bias ? NULL : D, C,
-                                      A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                                      A_row_stride, B_row_stride,
+                                      repeating_bias ? 0 : D_row_stride, C_row_stride,
                                       a_transpose, b_transpose, full_C, low_D, !no_bias || D == NULL, act,
                                       A_row_offset, A_col_offset, B_row_offset, B_col_offset,
                                       D_row_offset, D_col_offset, C_row_offset, C_col_offset);
@@ -2309,7 +2372,8 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
   case 0:
     shared_gemmini_loop_ws(custom0, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
-                           A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                           A_row_stride, B_row_stride,
+                           repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
                            full_C, low_D, !no_bias || D == NULL,
                            act);
@@ -2317,7 +2381,8 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
   case 1:
     shared_gemmini_loop_ws(custom1, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
-                           A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                           A_row_stride, B_row_stride,
+                           repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
                            full_C, low_D, !no_bias || D == NULL,
                            act);
@@ -2325,7 +2390,8 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
   case 2:
     shared_gemmini_loop_ws(custom2, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
-                           A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                           A_row_stride, B_row_stride,
+                           repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
                            full_C, low_D, !no_bias || D == NULL,
                            act);
@@ -2333,12 +2399,60 @@ static void shared_multi_sp_tiled_matmul_ws(int custom_num, int group_list, int 
   case 3:
     shared_gemmini_loop_ws(custom3, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start, ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,
                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,
-                           A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride,
+                           A_row_stride, B_row_stride,
+                           repeating_bias ? 0 : D_row_stride, C_row_stride,
                            a_transpose, b_transpose,
                            full_C, low_D, !no_bias || D == NULL,
                            act);
     break;
   }
+}
+
+static void shared_multi_sp_tiled_matmul_ws_axis(
+    int custom_num, int group_list, int group_id,
+    size_t sp_addr_start, size_t sp_addr_end, size_t acc_addr_start,
+    const elem_t *A, const elem_t *B, const void *D, void *C,
+    scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+    gemmini_partition_axis_t axis,
+    size_t partition_extent, size_t aux_extent, size_t aux_pad,
+    size_t partition_offset, size_t aux_offset,
+    size_t I, size_t J, size_t K, size_t pad_I, size_t pad_J, size_t pad_K,
+    size_t A_row_stride, size_t B_row_stride, size_t D_row_stride, size_t C_row_stride,
+    bool a_transpose, bool b_transpose,
+    bool full_C, bool low_D,
+    bool no_bias, bool repeating_bias, bool ex_accumulate,
+    int act)
+{
+  (void)A_scale_factor;
+  (void)B_scale_factor;
+  (void)D_scale_factor;
+
+#define SHARED_GEMMINI_LOOP_WS_AXIS_CASE(custom)                                     \
+  shared_gemmini_loop_ws_axis(                                                       \
+      custom, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start,      \
+      axis, partition_extent, aux_extent, aux_pad, partition_offset, aux_offset,     \
+      I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,                    \
+      A_row_stride, B_row_stride,                                                   \
+      repeating_bias ? 0 : D_row_stride, C_row_stride, \
+      a_transpose, b_transpose, full_C, low_D, ex_accumulate, act)
+
+  switch (custom_num)
+  {
+  case 0:
+    SHARED_GEMMINI_LOOP_WS_AXIS_CASE(custom0);
+    break;
+  case 1:
+    SHARED_GEMMINI_LOOP_WS_AXIS_CASE(custom1);
+    break;
+  case 2:
+    SHARED_GEMMINI_LOOP_WS_AXIS_CASE(custom2);
+    break;
+  case 3:
+    SHARED_GEMMINI_LOOP_WS_AXIS_CASE(custom3);
+    break;
+  }
+
+#undef SHARED_GEMMINI_LOOP_WS_AXIS_CASE
 }
 
 static void shared_multi_sp_tiled_matmul_ws_with_page_offsets(
@@ -2365,7 +2479,8 @@ static void shared_multi_sp_tiled_matmul_ws_with_page_offsets(
                                            sp_addr_start, sp_addr_end, acc_addr_start,                                  \
                                            ex_I, mv_K, mv_pad_K, laddrI_offset, laddrK_offset,                          \
                                            I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,                   \
-                                           A_row_stride, B_row_stride, repeating_bias ? 0 : D_row_stride, C_row_stride, \
+                                           A_row_stride, B_row_stride,                                                \
+                                           repeating_bias ? 0 : D_row_stride, C_row_stride, \
                                            a_transpose, b_transpose, full_C, low_D, !no_bias || D == NULL, act,         \
                                            A_row_offset, A_col_offset, B_row_offset, B_col_offset,                      \
                                            D_row_offset, D_col_offset, C_row_offset, C_col_offset)
@@ -2387,6 +2502,57 @@ static void shared_multi_sp_tiled_matmul_ws_with_page_offsets(
   }
 
 #undef SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_CASE
+}
+
+static void shared_multi_sp_tiled_matmul_ws_with_page_offsets_axis(
+    int custom_num, int group_list, int group_id,
+    size_t sp_addr_start, size_t sp_addr_end, size_t acc_addr_start,
+    const elem_t *A, const elem_t *B, const void *D, void *C,
+    scale_t A_scale_factor, scale_t B_scale_factor, scale_acc_t D_scale_factor,
+    gemmini_partition_axis_t axis,
+    size_t partition_extent, size_t aux_extent, size_t aux_pad,
+    size_t partition_offset, size_t aux_offset,
+    size_t I, size_t J, size_t K, size_t pad_I, size_t pad_J, size_t pad_K,
+    size_t A_row_stride, size_t B_row_stride, size_t D_row_stride, size_t C_row_stride,
+    bool a_transpose, bool b_transpose, bool full_C, bool low_D,
+    bool no_bias, bool repeating_bias, bool ex_accumulate, int act,
+    size_t A_row_offset, size_t A_col_offset,
+    size_t B_row_offset, size_t B_col_offset,
+    size_t D_row_offset, size_t D_col_offset,
+    size_t C_row_offset, size_t C_col_offset)
+{
+  (void)A_scale_factor;
+  (void)B_scale_factor;
+  (void)D_scale_factor;
+
+#define SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_AXIS_CASE(custom)                         \
+  shared_gemmini_loop_ws_with_page_offsets_axis(                                    \
+      custom, group_list, group_id, sp_addr_start, sp_addr_end, acc_addr_start,      \
+      axis, partition_extent, aux_extent, aux_pad, partition_offset, aux_offset,     \
+      I, J, K, pad_I, pad_J, pad_K, A, B, no_bias ? NULL : D, C,                    \
+      A_row_stride, B_row_stride,                                                   \
+      repeating_bias ? 0 : D_row_stride, C_row_stride, \
+      a_transpose, b_transpose, full_C, low_D, ex_accumulate, act,                  \
+      A_row_offset, A_col_offset, B_row_offset, B_col_offset,                         \
+      D_row_offset, D_col_offset, C_row_offset, C_col_offset)
+
+  switch (custom_num)
+  {
+  case 0:
+    SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_AXIS_CASE(custom0);
+    break;
+  case 1:
+    SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_AXIS_CASE(custom1);
+    break;
+  case 2:
+    SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_AXIS_CASE(custom2);
+    break;
+  case 3:
+    SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_AXIS_CASE(custom3);
+    break;
+  }
+
+#undef SHARED_GEMMINI_LOOP_WS_PAGE_OFFSET_AXIS_CASE
 }
 
 static void tiled_matmul_outer(int custom_num, size_t dim_I, size_t dim_J, size_t dim_K,
@@ -9275,51 +9441,6 @@ static void tiled_global_average_auto(int custom_num, const elem_t * input, elem
       channel_tile_size);
 }
 
-// made
-typedef struct
-{
-  // 입력 인자들
-  int gemmini_list;
-  int tile_id;
-  size_t sp_addr_start_stack, sp_addr_end_stack, acc_addr_start_stack;
-  size_t sp_addr_range, acc_addr_range;
-  size_t sp_addr_A_stacked, sp_addr_B_stacked, acc_addr_stacked;
-  size_t dim_I, dim_J, dim_K;
-  const elem_t *A;
-  const elem_t *B;
-  const void *D;
-  void *C;
-  size_t stride_A, stride_B, stride_D, stride_C;
-  scale_t A_scale_factor, B_scale_factor;
-  scale_acc_t D_scale_factor;
-  size_t tile_I, tile_J, tile_K;
-  int act;
-  acc_scale_t scale, bert_scale;
-  bool repeating_bias;
-  bool a_transpose, b_transpose;
-  bool full_C, low_D;
-  uint8_t weightA;
-  int dataflow; // OUTPUT_STATIONARY or WEIGHT_STATIONARY
-
-  // 파생 값들 (outer_test prologue에서 계산하던 것들)
-  size_t dim_I_padded, dim_J_padded, dim_K_padded;
-  size_t I0, J0, K0;
-  size_t last_I, last_J, last_K;
-  size_t padding_I, padding_J, padding_K;
-  bool no_bias;
-  size_t sizeof_D, sizeof_C;
-  int gemmini_num;
-
-  // 루프 진행 상태
-  size_t i0, j0, k0;
-  int inner_call_counter;
-  int lastK_toggle;
-
-  // 이 job이 끝났는지 여부
-  bool done;
-
-} shared_multi_matmul_job_t;
-
 static void shared_multi_choose_tiling_factors_static(shared_multi_matmul_job_t *job, size_t tI_static, size_t tJ_static, size_t tK_static)
 {
 
@@ -9479,18 +9600,23 @@ static void shared_multi_choose_tiling_factors_static(shared_multi_matmul_job_t 
 #endif
 #endif
 
-  job->tile_I = tI_static;
-  job->tile_J = tJ_static;
-  job->tile_K = tK_static;
+  (void)shared_multi_matmul_job_set_exact_tiling(
+      job, tI_static, tJ_static, tK_static);
   job->sp_addr_range = tiled_matmul_total_spad_rows(tI_static, tJ_static, tK_static) * 2;
   job->acc_addr_range = tiled_matmul_total_acc_rows(tI_static, tJ_static) * 2;
-  job->sp_addr_A_stacked = tiled_matmul_A_spad_rows(tI_static, tJ_static, tK_static);
-  job->sp_addr_B_stacked = tiled_matmul_B_spad_rows(tI_static, tJ_static, tK_static);
-  job->acc_addr_stacked = tiled_matmul_total_acc_rows(tI_static, tJ_static);
 }
 
-static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
+static void shared_multi_choose_tiling_factors(
+    shared_multi_matmul_job_t *job)
 {
+  const gemmini_partition_axis_t axis = job->partition_axis;
+  if (!gemmini_partition_axis_is_valid(axis))
+  {
+    job->partition_status = SHARED_MULTI_PARTITION_BAD_AXIS;
+    job->done = true;
+    return;
+  }
+
   job->gemmini_num = 0;
   for (int i = 0; i < total_gemmini_num; i++)
   {
@@ -9511,11 +9637,7 @@ static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
   request.act = job->act;
 
   const gemmini_tiling_factors_t factors =
-      gemmini_shared_multi_choose_tiling(&request);
-
-  job->dim_I_padded = factors.dim_I_padded;
-  job->dim_J_padded = factors.dim_J_padded;
-  job->dim_K_padded = factors.dim_K_padded;
+      gemmini_shared_multi_choose_tiling_axis(&request, axis);
 
 #ifdef PRINT_TILE
 #if PRINT_TILE
@@ -9542,50 +9664,87 @@ static void shared_multi_choose_tiling_factors(shared_multi_matmul_job_t *job)
 #endif
 #endif
 
-  job->tile_I = factors.tile_I;
-  job->tile_J = factors.tile_J;
-  job->tile_K = factors.tile_K;
+  if (!shared_multi_matmul_job_set_exact_tiling(
+          job, factors.tile_I, factors.tile_J, factors.tile_K))
+    return;
   job->sp_addr_range = tiled_matmul_total_spad_rows(
       factors.tile_I, factors.tile_J, factors.tile_K) * 2;
   job->acc_addr_range = tiled_matmul_total_acc_rows(
       factors.tile_I, factors.tile_J) * 2;
-  job->sp_addr_A_stacked = tiled_matmul_A_spad_rows(
-      factors.tile_I, factors.tile_J, factors.tile_K);
-  job->sp_addr_B_stacked = tiled_matmul_B_spad_rows(
-      factors.tile_I, factors.tile_J, factors.tile_K);
-  job->acc_addr_stacked = tiled_matmul_total_acc_rows(
-      factors.tile_I, factors.tile_J);
+}
+
+static bool shared_multi_page_packed_job_fields_valid(
+    const shared_multi_matmul_job_t *job,
+    gemmini_partition_axis_t axis)
+{
+  const bool page_packed_A =
+      gemmini_page_packed_stride_is_packed(job->stride_A);
+  const bool page_packed_B =
+      gemmini_page_packed_stride_is_packed(job->stride_B);
+  const bool page_packed_D =
+      gemmini_page_packed_stride_is_packed(job->stride_D);
+  const bool page_packed_C =
+      gemmini_page_packed_stride_is_packed(job->stride_C);
+  if (!page_packed_A && !page_packed_B &&
+      !page_packed_D && !page_packed_C)
+    return true;
+  if (job->dataflow != WEIGHT_STATIONARY)
+    return false;
+
+  const size_t I = job->dim_I / DIM + (job->dim_I % DIM != 0);
+  const size_t J = job->dim_J / DIM + (job->dim_J % DIM != 0);
+  const size_t K = job->dim_K / DIM + (job->dim_K % DIM != 0);
+  const size_t partition_extent =
+      axis == GEMMINI_PARTITION_AXIS_M
+          ? I
+          : (axis == GEMMINI_PARTITION_AXIS_N ? J : K);
+  const size_t aux_extent =
+      axis == GEMMINI_PARTITION_AXIS_M ? K : I;
+
+  return gemmini_shared_partition_page_offsets_valid(
+      axis, partition_extent, 0, aux_extent, 0, I, J, K,
+      page_packed_A, page_packed_B, page_packed_D, page_packed_C,
+      0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+static shared_multi_partition_status_t shared_multi_partition_axis_status(
+    const shared_multi_matmul_job_t *job,
+    gemmini_partition_axis_t axis)
+{
+  if (!gemmini_partition_axis_is_valid(axis))
+    return SHARED_MULTI_PARTITION_BAD_AXIS;
+  if (job->gemmini_list == 0 || job->gemmini_num <= 0)
+    return SHARED_MULTI_PARTITION_EMPTY_MASK;
+  if (!gemmini_partition_axis_supported_by_abi(
+          axis, gemmini_partition_generated_axis_abi_version()))
+    return SHARED_MULTI_PARTITION_UNSUPPORTED_MODE;
+  if (axis != GEMMINI_PARTITION_AXIS_M &&
+      (job->dataflow != WEIGHT_STATIONARY || job->act != NO_ACTIVATION))
+    return SHARED_MULTI_PARTITION_UNSUPPORTED_MODE;
+  if (!shared_multi_page_packed_job_fields_valid(job, axis))
+    return SHARED_MULTI_PARTITION_FIELD_OVERFLOW;
+  return SHARED_MULTI_PARTITION_OK;
 }
 
 void shared_multi_tiled_matmul_job_init(shared_multi_matmul_job_t *job)
 {
   // memset(job, 0, sizeof(*job));
 
-  job->I0 = job->dim_I_padded / (job->tile_I * DIM) + (job->dim_I_padded % (job->tile_I * DIM) != 0);
-  job->J0 = job->dim_J_padded / (job->tile_J * DIM) + (job->dim_J_padded % (job->tile_J * DIM) != 0);
-  job->K0 = job->dim_K_padded / (job->tile_K * DIM) + (job->dim_K_padded % (job->tile_K * DIM) != 0);
+  const shared_multi_partition_status_t partition_status =
+      shared_multi_partition_axis_status(job, job->partition_axis);
+  job->partition_status = partition_status;
+  if (partition_status != SHARED_MULTI_PARTITION_OK)
+  {
+    job->done = true;
+    return;
+  }
 
-  job->last_I = job->dim_I_padded % (job->tile_I * DIM) == 0 ? job->tile_I : (job->dim_I_padded / DIM) % job->tile_I;
-  job->last_J = job->dim_J_padded % (job->tile_J * DIM) == 0 ? job->tile_J : (job->dim_J_padded / DIM) % job->tile_J;
-  job->last_K = job->dim_K_padded % (job->tile_K * DIM) == 0 ? job->tile_K : (job->dim_K_padded / DIM) % job->tile_K;
-
-  job->padding_I = job->dim_I_padded - job->dim_I;
-  job->padding_J = job->dim_J_padded - job->dim_J;
-  job->padding_K = job->dim_K_padded - job->dim_K;
-
-  job->no_bias = (job->D == NULL);
+  if (!shared_multi_matmul_job_init_state(job))
+    return;
   if (job->no_bias)
   {
     job->D = (void *)1; // dummy
   }
-
-  job->sizeof_D = job->low_D ? sizeof(elem_t) : sizeof(acc_t);
-  job->sizeof_C = job->full_C ? sizeof(acc_t) : sizeof(elem_t);
-
-  job->i0 = job->j0 = job->k0 = 0;
-  job->inner_call_counter = 0;
-  job->lastK_toggle = 1;
-  job->done = false;
 
   const size_t config_stride_A = gemmini_page_packed_a_dma_stride_bytes(job->stride_A);
   const size_t config_stride_B = gemmini_page_packed_b_dma_stride_bytes(job->stride_B);
@@ -9708,9 +9867,13 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
   if (job->done)
     return;
 
-  const size_t i0 = job->i0;
-  const size_t j0 = job->j0;
-  const size_t k0 = job->k0;
+  shared_multi_matmul_job_step_t job_step;
+  if (!shared_multi_matmul_job_plan_step(job, &job_step))
+    return;
+
+  const size_t i0 = job_step.i0;
+  const size_t j0 = job_step.j0;
+  const size_t k0 = job_step.k0;
 
   const bool no_bias = job->no_bias;
   const size_t sizeof_D = job->sizeof_D;
@@ -9733,25 +9896,11 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
   else
     inner = &shared_multi_sp_tiled_matmul_ws;
 
-  const size_t I0 = job->I0;
-  const size_t J0 = job->J0;
   const size_t K0 = job->K0;
 
   const size_t tile_I = job->tile_I;
   const size_t tile_J = job->tile_J;
   const size_t tile_K = job->tile_K;
-
-  const size_t last_I = job->last_I;
-  const size_t last_J = job->last_J;
-  const size_t last_K = job->last_K;
-
-  const size_t padding_I = job->padding_I;
-  const size_t padding_J = job->padding_J;
-  const size_t padding_K = job->padding_K;
-
-  const size_t dim_I_padded = job->dim_I_padded;
-  const size_t dim_J_padded = job->dim_J_padded;
-  const size_t dim_K_padded = job->dim_K_padded;
 
   const elem_t *A = job->A;
   const elem_t *B = job->B;
@@ -9799,10 +9948,9 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
   const size_t sp_addr_range = job->sp_addr_range;
   const size_t acc_addr_range = job->acc_addr_range;
   const int tile_id = job->tile_id;
-  const int gemmini_list = job->gemmini_list;
 
   const void *pre;
-  if (k0 != 0)
+  if (k0 != 0 || no_bias)
   {
     pre = NULL;
   }
@@ -9822,13 +9970,13 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
                                     (i0 * tile_I * DIM * plain_stride_C + j0 * tile_J * DIM) * sizeof_C))
                   : NULL;
 
-  const size_t I = i0 < I0 - 1 ? tile_I : last_I;
-  const size_t J = j0 < J0 - 1 ? tile_J : last_J;
-  const size_t K = k0 < K0 - 1 ? tile_K : last_K;
-
-  const size_t pad_I = i0 == I0 - 1 ? padding_I : 0;
-  const size_t pad_J = j0 == J0 - 1 ? padding_J : 0;
-  const size_t pad_K = k0 == K0 - 1 ? padding_K : 0;
+  const size_t I = job_step.I;
+  const size_t J = job_step.J;
+  const size_t K = job_step.K;
+  const size_t pad_I = job_step.pad_I;
+  const size_t pad_J = job_step.pad_J;
+  const size_t pad_K = job_step.pad_K;
+  const bool ex_accumulate = gemmini_partition_ex_accumulate(no_bias, k0);
 
   const elem_t *a = page_packed_A_active
                         ? A
@@ -9840,87 +9988,157 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
                         : (b_transpose ? (B + j0 * tile_J * DIM * plain_stride_B + k0 * tile_K * DIM)
                                        : (B + k0 * tile_K * DIM * plain_stride_B + j0 * tile_J * DIM));
 
-  // group_list 계산
-  int using_gemmini_num = job->gemmini_num;
-  if (I < job->gemmini_num && K < job->gemmini_num)
-  {
-    using_gemmini_num = (I < K) ? K : I;
-  }
-
-  size_t group_list = gemmini_list;
-  int shift_num = 0;
-  for (int i = 0; i < total_gemmini_num; i++)
-  {
-    size_t shifted_list = (gemmini_list >> i);
-    if (shift_num == using_gemmini_num)
-    {
-      group_list = group_list & ~(shifted_list << i);
-      break;
-    }
-    if (shifted_list & 1)
-    {
-      shift_num++;
-    }
-  }
-
-  const size_t I_div = I / using_gemmini_num;
-  const size_t I_div_added = I_div + 1;
-  const size_t I_added_gemmini_num = I % using_gemmini_num;
-
-  const size_t K_div = K / using_gemmini_num;
-  const size_t K_div_added = K_div + 1;
-  const size_t K_added_gemmini_num = K % using_gemmini_num;
-
-  const elem_t *a_local = a;
-  const elem_t *b_local = b;
-  const int8_t *c_local = (int8_t *)out;
-  const int8_t *d_local = (int8_t *)pre;
-
-  size_t laddrI_offset = 0;
-  size_t laddrK_offset = 0;
+  const gemmini_partition_axis_t partition_axis = job->partition_axis;
+  const size_t using_gemmini_num = job_step.active_gemmini_count;
+  const size_t group_list = (size_t)job_step.group_list;
 
   const int t = (job->inner_call_counter & 1);
   const size_t local_sp_addr_start = (t == 0) ? sp_addr_start_stack : sp_addr_start_stack + BANK_NUM * BANK_ROWS / 2;
   const size_t local_sp_addr_end = (t == 0) ? BANK_NUM * BANK_ROWS / 2 - sp_addr_end_stack : BANK_NUM * BANK_ROWS - sp_addr_end_stack;
   const size_t local_acc_addr_start = job->lastK_toggle ? acc_addr_start_stack : acc_addr_start_stack + ACC_ROWS / 2;
 
-  int activated_gemmini_num = 0;
+  const size_t A_row_offset = i0 * tile_I;
+  const size_t A_col_offset = k0 * tile_K;
+  const size_t B_row_offset = k0 * tile_K;
+  const size_t B_col_offset = j0 * tile_J;
+  const size_t D_row_offset = repeating_bias ? 0 : A_row_offset;
+  const size_t D_col_offset = B_col_offset;
+  const size_t C_row_offset = A_row_offset;
+  const size_t C_col_offset = B_col_offset;
+
+  if (dataflow == WEIGHT_STATIONARY && use_page_offsets)
+  {
+    const size_t whole_partition_extent =
+        partition_axis == GEMMINI_PARTITION_AXIS_M
+            ? I
+            : (partition_axis == GEMMINI_PARTITION_AXIS_N ? J : K);
+    const size_t whole_aux_extent =
+        partition_axis == GEMMINI_PARTITION_AXIS_M ? K : I;
+    if (!gemmini_shared_partition_page_offsets_valid(
+            partition_axis,
+            whole_partition_extent, 0, whole_aux_extent, 0,
+            I, J, K,
+            page_packed_A_active, page_packed_B_active,
+            page_packed_D, page_packed_C,
+            A_row_offset, A_col_offset, B_row_offset, B_col_offset,
+            D_row_offset, D_col_offset, C_row_offset, C_col_offset))
+    {
+      job->partition_status = SHARED_MULTI_PARTITION_FIELD_OVERFLOW;
+      job->done = true;
+      return;
+    }
+  }
+
+  size_t activated_gemmini_num = 0;
   for (int i = 0; i < total_gemmini_num; i++)
   {
     if ((group_list >> i) & 1)
     {
-      size_t this_I = (activated_gemmini_num < I_added_gemmini_num) ? I_div_added : I_div;
-      int ex_gemmini_num = (using_gemmini_num < I) ? using_gemmini_num : I;
-      size_t this_pad_I = (activated_gemmini_num == ex_gemmini_num - 1) ? pad_I : 0;
+      gemmini_partition_plan_t plan;
+      if (!gemmini_partition_plan_member(
+              partition_axis, I, J, K, pad_I, pad_J, pad_K,
+              using_gemmini_num, activated_gemmini_num, &plan))
+      {
+        job->partition_status = SHARED_MULTI_PARTITION_FIELD_OVERFLOW;
+        job->done = true;
+        return;
+      }
 
-      size_t this_K = (activated_gemmini_num < K_added_gemmini_num) ? K_div_added : K_div;
-      int ldB_gemmini_num = (using_gemmini_num < K) ? using_gemmini_num : K;
-      size_t this_pad_K = (activated_gemmini_num == ldB_gemmini_num - 1) ? pad_K : 0;
+      size_t member_pad_I = pad_I;
+      size_t member_pad_J = pad_J;
+      size_t member_pad_K = pad_K;
+      size_t A_i_offset = 0;
+      size_t A_k_offset = 0;
+      size_t B_k_offset = 0;
+      size_t B_j_offset = 0;
+      size_t D_i_offset = 0;
+      size_t D_j_offset = 0;
+      size_t C_i_offset = 0;
+      size_t C_j_offset = 0;
+
+      if (partition_axis == GEMMINI_PARTITION_AXIS_M)
+      {
+        member_pad_I = plan.partition_pad;
+        A_i_offset = plan.partition_offset;
+        B_k_offset = plan.aux_offset;
+        D_i_offset = plan.partition_offset;
+        C_i_offset = plan.partition_offset;
+      }
+      else if (partition_axis == GEMMINI_PARTITION_AXIS_N)
+      {
+        member_pad_J = plan.partition_pad;
+        A_i_offset = plan.aux_offset;
+        B_j_offset = plan.partition_offset;
+        D_j_offset = plan.partition_offset;
+        C_j_offset = plan.partition_offset;
+      }
+      else
+      {
+        member_pad_K = plan.partition_pad;
+        A_k_offset = plan.partition_offset;
+        B_k_offset = plan.partition_offset;
+        D_i_offset = plan.aux_offset;
+        C_i_offset = plan.aux_offset;
+      }
+
+      const elem_t *a_local = page_packed_A_active
+                                  ? a
+                                  : (a_transpose
+                                         ? a + (A_k_offset * plain_stride_A + A_i_offset) * DIM
+                                         : a + (A_i_offset * plain_stride_A + A_k_offset) * DIM);
+      const elem_t *b_local = page_packed_B_active
+                                  ? b
+                                  : (b_transpose
+                                         ? b + (B_j_offset * plain_stride_B + B_k_offset) * DIM
+                                         : b + (B_k_offset * plain_stride_B + B_j_offset) * DIM);
+      const size_t D_memory_i_offset =
+          gemmini_partition_d_memory_i_offset(D_i_offset, repeating_bias);
+      const void *d_local = pre == NULL || page_packed_D
+                                ? pre
+                                : (const void *)((const int8_t *)pre +
+                                                 (D_memory_i_offset * plain_stride_D + D_j_offset) *
+                                                     DIM * sizeof_D);
+      void *c_local = out == NULL || page_packed_C
+                          ? out
+                          : (void *)((int8_t *)out +
+                                     (C_i_offset * plain_stride_C + C_j_offset) *
+                                         DIM * sizeof_C);
 
       if (dataflow == WEIGHT_STATIONARY && use_page_offsets)
       {
-        const size_t A_row_offset = i0 * tile_I;
-        const size_t A_col_offset = k0 * tile_K;
-        const size_t B_row_offset = k0 * tile_K;
-        const size_t B_col_offset = j0 * tile_J;
-        const size_t D_row_offset = repeating_bias ? 0 : A_row_offset;
-        const size_t D_col_offset = B_col_offset;
-        const size_t C_row_offset = A_row_offset;
-        const size_t C_col_offset = B_col_offset;
-
-        shared_multi_sp_tiled_matmul_ws_with_page_offsets(
+        shared_multi_sp_tiled_matmul_ws_with_page_offsets_axis(
             i, group_list, tile_id << 1 | t,
             local_sp_addr_start, local_sp_addr_end, local_acc_addr_start,
             a_local, b_local, (k0 != 0) ? NULL : (void *)d_local,
             (k0 == K0 - 1) ? (void *)c_local : NULL,
             A_scale_factor, B_scale_factor, D_scale_factor,
-            this_I, this_K, this_pad_K, laddrI_offset, laddrK_offset,
-            I, J, K, this_pad_I, pad_J, pad_K,
+            partition_axis,
+            plan.partition_extent, plan.aux_extent, plan.aux_pad,
+            plan.partition_offset, plan.aux_offset,
+            I, J, K, member_pad_I, member_pad_J, member_pad_K,
             stride_A, stride_B, stride_D, stride_C,
             a_transpose, b_transpose, full_C, low_D,
-            no_bias, repeating_bias, act,
+            no_bias, repeating_bias, ex_accumulate, act,
             A_row_offset, A_col_offset, B_row_offset, B_col_offset,
             D_row_offset, D_col_offset, C_row_offset, C_col_offset);
+      }
+      else if (dataflow == WEIGHT_STATIONARY)
+      {
+        shared_multi_sp_tiled_matmul_ws_axis(
+            i, group_list, tile_id << 1 | t,
+            local_sp_addr_start, local_sp_addr_end, local_acc_addr_start,
+            a_local, b_local, (k0 != 0) ? NULL : d_local,
+            (k0 == K0 - 1) ? c_local : NULL,
+            A_scale_factor, B_scale_factor, D_scale_factor,
+            partition_axis,
+            plan.partition_extent, plan.aux_extent, plan.aux_pad,
+            plan.partition_offset, plan.aux_offset,
+            I, J, K, member_pad_I, member_pad_J, member_pad_K,
+            stride_A, stride_B, stride_D, stride_C,
+            a_transpose, b_transpose,
+            full_C, low_D,
+            no_bias, repeating_bias, ex_accumulate,
+            act);
       }
       else
       {
@@ -9928,9 +10146,10 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
                  local_sp_addr_start, local_sp_addr_end, local_acc_addr_start,
                  a_local, b_local, (k0 != 0) ? NULL : (void *)d_local, (k0 == K0 - 1) ? (void *)c_local : NULL,
                  A_scale_factor, B_scale_factor, D_scale_factor,
-                 this_I, this_K, this_pad_K, laddrI_offset, laddrK_offset,
+                 plan.partition_extent, plan.aux_extent, plan.aux_pad,
+                 plan.partition_offset, plan.aux_offset,
                  I, J, K,
-                 this_pad_I, pad_J, pad_K,
+                 member_pad_I, member_pad_J, member_pad_K,
                  stride_A, stride_B, stride_D, stride_C,
                  a_transpose, b_transpose,
                  full_C, low_D,
@@ -9938,30 +10157,15 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
                  act);
       }
 
-      laddrI_offset += this_I;
-      laddrK_offset += this_K;
-
-      if (!page_packed_A_active)
-      {
-        size_t local_stride_A = a_transpose ? 1 : plain_stride_A;
-        a_local += local_stride_A * DIM * this_I;
-      }
-      if (!page_packed_B_active)
-      {
-        size_t local_stride_B = b_transpose ? 1 : plain_stride_B;
-        b_local += local_stride_B * DIM * this_K;
-      }
-      if (!page_packed_C)
-      {
-        c_local += plain_stride_C * DIM * this_I * sizeof_C;
-      }
-      if (!page_packed_D)
-      {
-        d_local += plain_stride_D * DIM * this_I * sizeof_D;
-      }
-
       activated_gemmini_num++;
     }
+  }
+
+  if (activated_gemmini_num != using_gemmini_num)
+  {
+    job->partition_status = SHARED_MULTI_PARTITION_EMPTY_MASK;
+    job->done = true;
+    return;
   }
 
   // for (int i = 0; i < total_gemmini_num; i++)
@@ -9990,29 +10194,9 @@ static void shared_multi_tiled_matmul_job_step(shared_multi_matmul_job_t *job)
   //   }
   // }
 
-  job->inner_call_counter++;
-  if (k0 == K0 - 1)
-    job->lastK_toggle ^= 1;
-
   // ---- 여기까지가 원래 한 (i0,j0,k0) 타일에 대해 하던 일 ----
-  // 이제 (i0, j0, k0) 인덱스를 다음 타일로 증가시킴
-
-  // k0 증가
-  job->k0++;
-  if (job->k0 >= K0)
-  {
-    job->k0 = 0;
-    job->j0++;
-    if (job->j0 >= J0)
-    {
-      job->j0 = 0;
-      job->i0++;
-      if (job->i0 >= I0)
-      {
-        job->done = true; // 모든 타일 완료
-      }
-    }
-  }
+  // 이제 공통 K -> J -> I cursor를 다음 타일로 진행시킴
+  shared_multi_matmul_job_complete_step(job);
 }
 
 // // made

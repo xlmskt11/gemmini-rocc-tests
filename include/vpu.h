@@ -74,6 +74,16 @@ enum vpu_wait_mask {
   VPU_WAIT_ALL = VPU_WAIT_LD | VPU_WAIT_EX | VPU_WAIT_ST,
 };
 
+/* funct1 control for retaining one reduction context across vector chunks.
+ * SINGLE is the legacy encoding; START/CONTINUE do not fold, and FINAL is the
+ * only continuation which folds and writes the scalar FP destination. */
+enum vpu_reduction_mode {
+  VPU_REDUCTION_SINGLE = 0,
+  VPU_REDUCTION_START = 1,
+  VPU_REDUCTION_CONTINUE = 2,
+  VPU_REDUCTION_FINAL = 3,
+};
+
 enum vpu_clear_mask {
   VPU_CLEAR_FFLAGS = 1u << 0,
   VPU_CLEAR_FAULT_ILLEGAL = 1u << 1,
@@ -296,27 +306,69 @@ static inline uint64_t vpu_rocc_issue_result(uint64_t transport,
 }
 #endif
 
-/* Group metadata occupies the formerly reserved upper half of rs1. */
+/* Event metadata occupies the formerly reserved upper half of rs1. */
 #ifndef VPU_GROUP_ID_BITS
 #define VPU_GROUP_ID_BITS 3u
 #endif
+#ifndef VPU_GROUP_ID_SHIFT
 #define VPU_GROUP_ID_SHIFT 32u
+#endif
+#ifndef VPU_GROUPED_SHIFT
 #define VPU_GROUPED_SHIFT 35u
+#endif
+#ifndef VPU_GROUP_LAST_SHIFT
 #define VPU_GROUP_LAST_SHIFT 36u
+#endif
 
+#ifndef VPU_EVENT_ID_BITS
+#define VPU_EVENT_ID_BITS 3u
+#endif
+#define VPU_EVENT_WAIT_ID_SHIFT 32u
+#define VPU_EVENT_WAIT_VALID_SHIFT 35u
+#define VPU_EVENT_STAGE_LAST_SHIFT 36u
+#define VPU_EVENT_PRODUCE_ID_SHIFT 37u
+#define VPU_EVENT_PRODUCE_VALID_SHIFT 40u
+#define VPU_EVENT_PRODUCE_SEAL_SHIFT 41u
+
+static inline uint64_t vpu_event_transport(unsigned wait_event_id,
+                                            bool wait_valid,
+                                            bool stage_last,
+                                            unsigned produce_event_id,
+                                            bool produce_valid,
+                                            bool produce_seal,
+                                            uint32_t uop) {
+  const uint64_t event_mask =
+      (UINT64_C(1) << VPU_EVENT_ID_BITS) - UINT64_C(1);
+  return (uint64_t)uop |
+      (((uint64_t)wait_event_id & event_mask) << VPU_EVENT_WAIT_ID_SHIFT) |
+      ((uint64_t)wait_valid << VPU_EVENT_WAIT_VALID_SHIFT) |
+      ((uint64_t)stage_last << VPU_EVENT_STAGE_LAST_SHIFT) |
+      (((uint64_t)produce_event_id & event_mask) <<
+       VPU_EVENT_PRODUCE_ID_SHIFT) |
+      ((uint64_t)produce_valid << VPU_EVENT_PRODUCE_VALID_SHIFT) |
+      ((uint64_t)produce_seal << VPU_EVENT_PRODUCE_SEAL_SHIFT);
+}
+
+static inline void vpu_issue_event(unsigned wait_event_id, bool wait_valid,
+                                   bool stage_last,
+                                   unsigned produce_event_id,
+                                   bool produce_valid, bool produce_seal,
+                                   uint32_t uop, uint64_t payload) {
+  vpu_rocc_issue(vpu_event_transport(wait_event_id, wait_valid, stage_last,
+                                     produce_event_id, produce_valid,
+                                     produce_seal, uop),
+                 payload);
+}
+
+/* Compatibility wrappers for software which still models a VPU stream as a
+ * consumer of one legacy Gemmini group. */
 static inline uint64_t vpu_grouped_transport(unsigned group_id,
                                               bool is_last,
                                               uint32_t uop) {
-  const uint64_t group_mask =
-      (UINT64_C(1) << VPU_GROUP_ID_BITS) - UINT64_C(1);
-  return (uint64_t)uop |
-      (((uint64_t)group_id & group_mask) << VPU_GROUP_ID_SHIFT) |
-      (UINT64_C(1) << VPU_GROUPED_SHIFT) |
-      ((uint64_t)is_last << VPU_GROUP_LAST_SHIFT);
+  return vpu_event_transport(group_id, true, is_last, 0u, false, false, uop);
 }
 
-/* The group is released only when this command is atomically admitted to
- * both the VPU reservation station and the shared dependency table. */
+/* Legacy spelling for a wait-only event stage. */
 static inline void vpu_issue_grouped(unsigned group_id, bool is_last,
                                      uint32_t uop, uint64_t payload) {
   vpu_rocc_issue(vpu_grouped_transport(group_id, is_last, uop), payload);
@@ -662,6 +714,24 @@ static inline void vpu_v_red_sum(unsigned dst_fp, unsigned src_gp) {
   vpu_rocc_issue(vpu_micro_op(VPU_OP_V_RED_SUM, dst_fp, src_gp, 0, 0, 0), 0);
 }
 
+static inline void vpu_v_red_sum_start(unsigned dst_fp, unsigned src_gp) {
+  vpu_rocc_issue(vpu_micro_op(VPU_OP_V_RED_SUM, dst_fp, src_gp, 0, 0,
+                              VPU_REDUCTION_START),
+                 0);
+}
+
+static inline void vpu_v_red_sum_continue(unsigned dst_fp, unsigned src_gp) {
+  vpu_rocc_issue(vpu_micro_op(VPU_OP_V_RED_SUM, dst_fp, src_gp, 0, 0,
+                              VPU_REDUCTION_CONTINUE),
+                 0);
+}
+
+static inline void vpu_v_red_sum_final(unsigned dst_fp, unsigned src_gp) {
+  vpu_rocc_issue(vpu_micro_op(VPU_OP_V_RED_SUM, dst_fp, src_gp, 0, 0,
+                              VPU_REDUCTION_FINAL),
+                 0);
+}
+
 static inline void vpu_v_red_sum_masked(unsigned dst_fp, unsigned src_gp) {
   vpu_rocc_issue(
       vpu_micro_op(VPU_OP_V_RED_SUM, dst_fp, src_gp, 0, 1, 0), 0);
@@ -669,6 +739,24 @@ static inline void vpu_v_red_sum_masked(unsigned dst_fp, unsigned src_gp) {
 
 static inline void vpu_v_red_max(unsigned dst_fp, unsigned src_gp) {
   vpu_rocc_issue(vpu_micro_op(VPU_OP_V_RED_MAX, dst_fp, src_gp, 0, 0, 0), 0);
+}
+
+static inline void vpu_v_red_max_start(unsigned dst_fp, unsigned src_gp) {
+  vpu_rocc_issue(vpu_micro_op(VPU_OP_V_RED_MAX, dst_fp, src_gp, 0, 0,
+                              VPU_REDUCTION_START),
+                 0);
+}
+
+static inline void vpu_v_red_max_continue(unsigned dst_fp, unsigned src_gp) {
+  vpu_rocc_issue(vpu_micro_op(VPU_OP_V_RED_MAX, dst_fp, src_gp, 0, 0,
+                              VPU_REDUCTION_CONTINUE),
+                 0);
+}
+
+static inline void vpu_v_red_max_final(unsigned dst_fp, unsigned src_gp) {
+  vpu_rocc_issue(vpu_micro_op(VPU_OP_V_RED_MAX, dst_fp, src_gp, 0, 0,
+                              VPU_REDUCTION_FINAL),
+                 0);
 }
 
 static inline void vpu_v_red_max_masked(unsigned dst_fp, unsigned src_gp) {

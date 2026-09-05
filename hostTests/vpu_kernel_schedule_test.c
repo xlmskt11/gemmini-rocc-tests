@@ -127,6 +127,25 @@ static size_t find_opcode(unsigned opcode, size_t occurrence) {
   return trace_count;
 }
 
+#if VPU_LOOP_BUFFER_ENTRIES >= 4 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+static uint32_t loop_iterations(size_t trace_index) {
+  assert(trace_index < trace_count);
+  assert(vpu_micro_opcode(trace[trace_index].uop) ==
+         VPU_OP_C_LOOP_START);
+  return (trace[trace_index].uop >> 10) & VPU_LOOP_COUNT_MAX;
+}
+#endif
+
+#if VPU_LOOP_BUFFER_ENTRIES >= 8 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+static void check_opcode_in_loop(unsigned opcode, size_t occurrence,
+                                 size_t loop_occurrence) {
+  const size_t operation = find_opcode(opcode, occurrence);
+  const size_t start = find_opcode(VPU_OP_C_LOOP_START, loop_occurrence);
+  const size_t end = find_opcode(VPU_OP_C_LOOP_END, loop_occurrence);
+  assert(start < operation && operation < end);
+}
+#endif
+
 static int contains_vl(size_t vl) {
   for (size_t i = 0; i < trace_count; ++i) {
     if ((trace[i].uop & 0x3fu) == VPU_OP_C_SET_VL &&
@@ -167,7 +186,7 @@ static struct descriptor_summary check_resident_descriptors(
   uint64_t gp[16] = {0};
   size_t vl = 0;
   const size_t capacity = vpu_stream_batch_capacity();
-  struct descriptor_summary summary = {0};
+  struct descriptor_summary summary = {0u, 0u, 0u, 0u, 0u, 0u};
 
   for (size_t i = 0; i < trace_count; ++i) {
     const uint32_t uop = trace[i].uop;
@@ -332,7 +351,7 @@ static void check_binary_elementwise_schedule(
   const size_t tail = VPU_VLEN > 17u ? 17u : VPU_VLEN - 1u;
   const size_t tail_descriptors = tail == 0u ? 0u : 1u;
   const size_t full_batches = 3u;
-#if VPU_LOOP_BUFFER_ENTRIES >= 6
+#if VPU_LOOP_BUFFER_ENTRIES >= 8
   const size_t loop_batches =
       (capacity > 1u ? 2u : 0u) + (last_rows > 1u ? 1u : 0u);
   const size_t execute_commands = full_batches + tail_descriptors;
@@ -423,6 +442,120 @@ static void test_binary_elementwise_schedule(void) {
 #endif
 }
 
+static void test_activation_phase_loops(void) {
+#if VPU_LOOP_BUFFER_ENTRIES >= 8 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+  const size_t capacity = vpu_stream_batch_capacity();
+  if (capacity < 2u) {
+    return;
+  }
+  const size_t rows = capacity < 4u ? capacity : 4u;
+
+  reset_trace();
+  vpu_stream_emit_activation_batch(VPU_STREAM_ACT_SILU, 0u, rows);
+  assert(count_opcode(VPU_OP_C_LOOP_START) == 5u);
+  assert(count_opcode(VPU_OP_C_LOOP_END) == 5u);
+  for (size_t phase = 0u; phase < 5u; ++phase) {
+    assert(loop_iterations(find_opcode(
+               VPU_OP_C_LOOP_START, phase)) == rows);
+  }
+  check_opcode_in_loop(VPU_OP_V_SUB_VF, 0u, 0u);
+  check_opcode_in_loop(VPU_OP_V_EXP_V, 0u, 1u);
+  check_opcode_in_loop(VPU_OP_V_ADD_VF, 0u, 2u);
+  check_opcode_in_loop(VPU_OP_V_RECI_V, 0u, 3u);
+  check_opcode_in_loop(VPU_OP_V_MUL_VV, 0u, 4u);
+
+  reset_trace();
+  vpu_stream_emit_activation_batch(VPU_STREAM_ACT_SWIGLU, 0u, rows);
+  assert(count_opcode(VPU_OP_C_LOOP_START) == 5u);
+  assert(count_opcode(VPU_OP_C_LOOP_END) == 5u);
+  for (size_t phase = 0u; phase < 5u; ++phase) {
+    assert(loop_iterations(find_opcode(
+               VPU_OP_C_LOOP_START, phase)) == rows);
+  }
+  check_opcode_in_loop(VPU_OP_V_SUB_VF, 0u, 0u);
+  check_opcode_in_loop(VPU_OP_V_EXP_V, 0u, 1u);
+  check_opcode_in_loop(VPU_OP_V_ADD_VF, 0u, 2u);
+  check_opcode_in_loop(VPU_OP_V_RECI_V, 0u, 3u);
+  check_opcode_in_loop(VPU_OP_V_MUL_VV, 0u, 4u);
+  check_opcode_in_loop(VPU_OP_V_MUL_VV, 1u, 4u);
+  assert(find_opcode(VPU_OP_V_MUL_VV, 0u) <
+         find_opcode(VPU_OP_V_MUL_VV, 1u));
+#endif
+}
+
+static void check_segmented_reduction(unsigned opcode, int maximum) {
+  const size_t rows = 4u;
+
+  reset_trace();
+  vpu_tiled_emit_reduction_run(
+      VPU_STREAM_FP_ACCUM_OR_MAX, VPU_BANK_BASE(0u), rows, maximum);
+  assert(count_memory_form(opcode, VPU_REDUCTION_SINGLE) == 0u);
+  assert(count_memory_form(opcode, VPU_REDUCTION_START) == 1u);
+  assert(count_memory_form(opcode, VPU_REDUCTION_CONTINUE) >= 1u);
+  assert(count_memory_form(opcode, VPU_REDUCTION_FINAL) == 1u);
+
+#if VPU_LOOP_BUFFER_ENTRIES >= 4 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+  assert(count_memory_form(opcode, VPU_REDUCTION_CONTINUE) == 1u);
+  assert(count_opcode(VPU_OP_C_LOOP_START) == 1u);
+  assert(count_opcode(VPU_OP_C_LOOP_END) == 1u);
+  const size_t start = find_memory_form(
+      opcode, VPU_REDUCTION_START, 0u);
+  const size_t continuation = find_memory_form(
+      opcode, VPU_REDUCTION_CONTINUE, 0u);
+  const size_t final = find_memory_form(
+      opcode, VPU_REDUCTION_FINAL, 0u);
+  const size_t loop_start = find_opcode(VPU_OP_C_LOOP_START, 0u);
+  const size_t loop_end = find_opcode(VPU_OP_C_LOOP_END, 0u);
+  assert(start < loop_start);
+  assert(loop_start < continuation && continuation < loop_end);
+  assert(loop_end < final);
+  assert(loop_iterations(loop_start) == rows - 2u);
+#else
+  assert(count_opcode(VPU_OP_C_LOOP_START) == 0u);
+  assert(count_opcode(VPU_OP_C_LOOP_END) == 0u);
+#endif
+}
+
+static void test_segmented_reduction_schedule(void) {
+  check_segmented_reduction(VPU_OP_V_RED_SUM, 0);
+  check_segmented_reduction(VPU_OP_V_RED_MAX, 1);
+}
+
+static void test_rope_row_major_loops(void) {
+#if VPU_LOOP_BUFFER_ENTRIES >= 8 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX && \
+    VPU_VLEN >= 2
+  if (vpu_rearrange_batch_capacity() >= 2u) {
+    const size_t rows = 2u;
+    const size_t rotary_dim = (VPU_VLEN & 1u) == 0u
+        ? VPU_VLEN : VPU_VLEN - 1u;
+    const vpu_storage_t *input =
+        (const vpu_storage_t *)(uintptr_t)0x1500000u;
+    const vpu_storage_t *cosine =
+        (const vpu_storage_t *)(uintptr_t)0x1600000u;
+    const vpu_storage_t *sine =
+        (const vpu_storage_t *)(uintptr_t)0x1700000u;
+    vpu_storage_t *output =
+        (vpu_storage_t *)(uintptr_t)0x1800000u;
+
+    reset_trace();
+    assert(vpu_rope_auto(input, cosine, sine, output, rows, rotary_dim,
+                         VPU_ROPE_NEOX) == 0u);
+    assert(count_opcode(VPU_OP_C_LOOP_START) == 3u);
+    assert(count_opcode(VPU_OP_C_LOOP_END) == 3u);
+    for (size_t phase = 0u; phase < 3u; ++phase) {
+      assert(loop_iterations(find_opcode(
+                 VPU_OP_C_LOOP_START, phase)) == rows);
+    }
+    check_opcode_in_loop(VPU_OP_V_SLIDE_V, 0u, 0u);
+    check_opcode_in_loop(VPU_OP_V_SLIDE_V, 1u, 1u);
+    check_opcode_in_loop(VPU_OP_V_SUB_VF, 0u, 2u);
+    check_opcode_in_loop(VPU_OP_V_MUL_VV, 0u, 2u);
+    check_opcode_in_loop(VPU_OP_V_MUL_VV, 1u, 2u);
+    check_opcode_in_loop(VPU_OP_V_ADD_VV, 0u, 2u);
+  }
+#endif
+}
+
 static void test_resident_reduction_chunk_schedule(void) {
   const size_t capacity = vpu_stream_batch_capacity();
   const size_t remainder_rows = capacity > 1u ? capacity - 1u : 1u;
@@ -441,39 +574,48 @@ static void test_resident_reduction_chunk_schedule(void) {
   const struct vpu_tiled_plan softmax_plan =
       vpu_tiled_plan_for(VPU_TILED_KERNEL_SOFTMAX, elements);
 
-  assert(rms_plan.schedule == VPU_TILED_SCHEDULE_RESIDENT_FULL);
   assert(softmax_plan.schedule == VPU_TILED_SCHEDULE_RESIDENT_FULL);
 
-  reset_trace();
-  assert(vpu_tiled_rmsnorm_auto(
-             input, weight, output, elements, 1.0e-5f) == 0u);
-  assert(count_memory_form(VPU_OP_H_PREFETCH_V, 0u) == 0u);
-  assert(count_memory_form(VPU_OP_H_STORE_V, 0u) == 0u);
-  const struct descriptor_summary rms = check_resident_descriptors(
-      tail, 2u * pass_descriptors, pass_descriptors);
-  assert(rms.tail_loads == 2u);
-  assert(rms.tail_stores == 1u);
-  if (capacity > 1u) {
-    assert(rms.short_full_loads >= 2u);
-    assert(rms.short_full_stores >= 1u);
-  }
-  /* Pass one admits LD(run 1) before its first reduction.  After the tail and
-   * scalar fold, pass two likewise admits weight LD(run 1) before output EX. */
-  assert(find_memory_form(VPU_OP_H_PREFETCH_V, 1u, 1u) <
-         find_opcode(VPU_OP_V_MUL_VV, 0u));
-  assert(find_memory_form(VPU_OP_H_PREFETCH_V, 1u,
-                          pass_descriptors + 1u) <
-         find_opcode(VPU_OP_V_MUL_VF, 0u));
+  if (rms_plan.schedule == VPU_TILED_SCHEDULE_RESIDENT_FULL) {
+    reset_trace();
+    assert(vpu_tiled_rmsnorm_auto(
+               input, weight, output, elements, 1.0e-5f) == 0u);
+    assert(count_memory_form(VPU_OP_H_PREFETCH_V, 0u) == 0u);
+    assert(count_memory_form(VPU_OP_H_STORE_V, 0u) == 0u);
+    const struct descriptor_summary rms = check_resident_descriptors(
+        tail, 2u * pass_descriptors, pass_descriptors);
+    assert(rms.tail_loads == 2u);
+    assert(rms.tail_stores == 1u);
+    if (capacity > 1u) {
+      assert(rms.short_full_loads >= 2u);
+      assert(rms.short_full_stores >= 1u);
+    }
+    /* Pass one admits LD(run 1) before its first reduction. After the tail and
+     * scalar fold, pass two admits weight LD(run 1) before output EX. */
+    assert(find_memory_form(VPU_OP_H_PREFETCH_V, 1u, 1u) <
+           find_opcode(VPU_OP_V_MUL_VV, 0u));
+    assert(find_memory_form(VPU_OP_H_PREFETCH_V, 1u,
+                            pass_descriptors + 1u) <
+           find_opcode(VPU_OP_V_MUL_VF, 0u));
 
-  /* When the resident row does not fill all nominal input banks, RMSNorm uses
-   * the first spare one as its result ring.  This separates ST(current) reads
-   * from EX(next) input reads without reducing resident capacity. */
-  const unsigned resident_banks_used = (unsigned)(
-      (rms_plan.resident_tiles + VPU_SLOTS_PER_BANK - 1u) /
-      VPU_SLOTS_PER_BANK);
-  if (resident_banks_used < rms_plan.resident_banks) {
-    assert(contains_gp_write(VPU_RESIDENT_GP_OUTPUT,
-                             VPU_BANK_BASE(resident_banks_used)));
+    /* When the resident row does not fill all nominal input banks, RMSNorm
+     * uses the first spare one as its result ring. */
+    const unsigned resident_banks_used = (unsigned)(
+        (rms_plan.resident_tiles + VPU_SLOTS_PER_BANK - 1u) /
+        VPU_SLOTS_PER_BANK);
+    if (resident_banks_used < rms_plan.resident_banks) {
+      assert(contains_gp_write(VPU_RESIDENT_GP_OUTPUT,
+                               VPU_BANK_BASE(resident_banks_used)));
+    }
+  } else {
+    /* A compact fused ACC may not have the three whole banks required by the
+     * resident RMSNorm plan. Its role-partitioned streaming fallback remains
+     * legal and is the expected selection for a two-bank geometry. */
+    assert(rms_plan.schedule == VPU_TILED_SCHEDULE_STREAMING);
+    reset_trace();
+    assert(vpu_tiled_rmsnorm_auto(
+               input, weight, output, elements, 1.0e-5f) == 0u);
+    assert(count_opcode(VPU_OP_C_FENCE) == 1u);
   }
 
   reset_trace();
@@ -577,6 +719,58 @@ int main(void) {
   const size_t physical = vpu_stream_physical_batch_capacity();
   const size_t expected_capacity = physical < VPU_NONLINEAR_CHUNK_ROWS
       ? physical : (size_t)VPU_NONLINEAR_CHUNK_ROWS;
+  assert(vpu_logical_role_bank_for_geometry(2u, 3u) == 0u);
+  assert(vpu_logical_role_bank_for_geometry(2u, 4u) == 1u);
+  assert(vpu_logical_role_base_for_geometry(
+             2u, 65536u, 32768u, 3u) == 24576u);
+  assert(vpu_logical_role_slots_for_geometry(
+             2u, 65536u, 32768u, 128u) == 64u);
+  assert(vpu_logical_role_bank_for_geometry(8u, 7u) == 7u);
+  assert(vpu_logical_role_base_for_geometry(
+             8u, 65536u, 8192u, 7u) == 57344u);
+  assert(vpu_logical_role_slots_for_geometry(
+             8u, 65536u, 8192u, 128u) == 64u);
+  assert(vpu_stream_bank(0u, VPU_STREAM_BANK_INPUT) == 0u);
+  assert(vpu_stream_bank(0u, VPU_STREAM_BANK_OUTPUT) < VPU_VSPAD_BANKS);
+  assert(vpu_stream_bank(1u, VPU_STREAM_BANK_INPUT) < VPU_VSPAD_BANKS);
+  assert(vpu_stream_bank(1u, VPU_STREAM_BANK_OUTPUT) < VPU_VSPAD_BANKS);
+  assert(vpu_stream_bank_base(0u, VPU_STREAM_BANK_INPUT) == 0u);
+  assert(vpu_stream_bank_base(0u, VPU_STREAM_BANK_OUTPUT) <
+         vpu_stream_bank_base(1u, VPU_STREAM_BANK_INPUT));
+  assert(vpu_stream_bank_base(1u, VPU_STREAM_BANK_OUTPUT) + VPU_VLEN <=
+         VPU_VSPAD_ELEMENTS);
+  assert(vpu_stream_role_slots() >= 1u);
+#if VPU_EXTERNAL_MEMORY || VPU_VSPAD_BANKS == 8
+  assert(VPU_PING_INPUT_ADDR ==
+         vpu_stream_bank_base(0u, VPU_STREAM_BANK_INPUT));
+  assert(VPU_PING_TEMP0_ADDR ==
+         vpu_stream_bank_base(0u, VPU_STREAM_BANK_AUX));
+  assert(VPU_PING_TEMP1_ADDR ==
+         vpu_stream_bank_base(0u, VPU_STREAM_BANK_TEMP));
+  assert(VPU_PING_OUTPUT_ADDR ==
+         vpu_stream_bank_base(0u, VPU_STREAM_BANK_OUTPUT));
+  assert(VPU_PONG_INPUT_ADDR ==
+         vpu_stream_bank_base(1u, VPU_STREAM_BANK_INPUT));
+  assert(VPU_PONG_TEMP0_ADDR ==
+         vpu_stream_bank_base(1u, VPU_STREAM_BANK_AUX));
+  assert(VPU_PONG_TEMP1_ADDR ==
+         vpu_stream_bank_base(1u, VPU_STREAM_BANK_TEMP));
+  assert(VPU_PONG_OUTPUT_ADDR ==
+         vpu_stream_bank_base(1u, VPU_STREAM_BANK_OUTPUT));
+#endif
+  assert(vpu_rearrange_work_bank(0u, VPU_REARRANGE_WORK_INPUT) <
+         VPU_VSPAD_BANKS);
+  assert(vpu_rearrange_work_bank(1u, VPU_REARRANGE_WORK_INPUT) <
+         VPU_VSPAD_BANKS);
+  assert(vpu_rearrange_work_bank(1u, VPU_REARRANGE_WORK_TEMP) <
+         VPU_VSPAD_BANKS);
+#if VPU_VSPAD_BANKS == 8
+  assert(vpu_stream_bank(0u, VPU_STREAM_BANK_OUTPUT) == 3u);
+  assert(vpu_stream_bank(1u, VPU_STREAM_BANK_INPUT) == 4u);
+  assert(vpu_stream_bank(1u, VPU_STREAM_BANK_OUTPUT) == 7u);
+  assert(vpu_rearrange_work_bank(0u, VPU_REARRANGE_WORK_INPUT) == 2u);
+  assert(vpu_rearrange_work_bank(1u, VPU_REARRANGE_WORK_INPUT) == 4u);
+#endif
   assert(VPU_NONLINEAR_CHUNK_ROWS >= 1u);
   assert(vpu_stream_batch_capacity() == expected_capacity);
   assert(vpu_stream_batch_capacity() <= physical);
@@ -585,6 +779,9 @@ int main(void) {
   test_ping_pong_tail_schedule();
   test_fixed_2048_chunk_schedule();
   test_binary_elementwise_schedule();
+  test_activation_phase_loops();
+  test_segmented_reduction_schedule();
+  test_rope_row_major_loops();
   test_resident_reduction_chunk_schedule();
   test_synchronous_auto_boundaries();
   test_multi_enqueue_single_boundary();

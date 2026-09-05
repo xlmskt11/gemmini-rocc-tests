@@ -127,8 +127,14 @@ static void initialize_data(void) {
            ++accelerator) {
         const int value =
             (int)((accelerator * 5u + row * 3u + col) % 15u) - 7;
-        gemmini_input[accelerator][row][col] = (elem_t)value;
-        gemmini_output[accelerator][row][col] = (elem_t)0x55;
+        /* elem_t is the raw BF16 encoding in the fusion configurations.
+         * Casting a negative integer directly would create a NaN bit pattern
+         * (for example, -7 becomes 0xfff9) and MVOUT correctly canonicalizes
+         * it to 0x7fc0.  Encode numeric test values explicitly instead. */
+        gemmini_input[accelerator][row][col] =
+            (elem_t)vpu_float_to_bf16((float)value);
+        gemmini_output[accelerator][row][col] =
+            (elem_t)vpu_float_to_bf16(85.0f);
       }
     }
   }

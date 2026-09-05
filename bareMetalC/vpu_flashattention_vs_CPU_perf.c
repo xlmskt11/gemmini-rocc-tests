@@ -51,6 +51,24 @@
 #ifndef FA_GEMMINI_MASK
 #define FA_GEMMINI_MASK ((1u << VPU_MATRIX_PORTS) - 1u)
 #endif
+#ifndef FA_QK_PARTITION_AXIS
+#define FA_QK_PARTITION_AXIS GEMMINI_PARTITION_AXIS_M
+#endif
+#ifndef FA_PV_PARTITION_AXIS
+#define FA_PV_PARTITION_AXIS GEMMINI_PARTITION_AXIS_M
+#endif
+#ifndef FA_Q_BLOCK_ROWS
+#define FA_Q_BLOCK_ROWS 0u
+#endif
+#ifndef FA_KV_BLOCK_ROWS
+#define FA_KV_BLOCK_ROWS 0u
+#endif
+#ifndef FA_QK_TILE_K
+#define FA_QK_TILE_K 0u
+#endif
+#ifndef FA_REQUIRE_ALL_GEMMINIS
+#define FA_REQUIRE_ALL_GEMMINIS 0
+#endif
 #ifndef FA_SCORE_SCALE
 /* Nonstandard positive scale keeps the benchmark's reference path generic. */
 #define FA_SCORE_SCALE 0.15625f
@@ -65,6 +83,15 @@
 #ifndef FA_PERF_CHECK
 #define FA_PERF_CHECK 1
 #endif
+#ifndef FA_PERF_FUSION_ONLY
+#define FA_PERF_FUSION_ONLY 0
+#endif
+#ifndef FA_PERF_PHASE_TRACE
+#define FA_PERF_PHASE_TRACE 0
+#endif
+#ifndef FA_PERF_INITIALIZE_INPUTS
+#define FA_PERF_INITIALIZE_INPUTS 1
+#endif
 
 #if FA_QUERY_ROWS == 0 || FA_SEQUENCE == 0 || FA_Q_DIM == 0 || \
     FA_K_DIM == 0 || FA_V_DIM == 0
@@ -78,6 +105,21 @@
 #endif
 #if FA_PERF_CHECK != 0 && FA_PERF_CHECK != 1
 #error "FA_PERF_CHECK must be zero or one"
+#endif
+#if FA_PERF_FUSION_ONLY != 0 && FA_PERF_FUSION_ONLY != 1
+#error "FA_PERF_FUSION_ONLY must be zero or one"
+#endif
+#if FA_PERF_FUSION_ONLY && FA_PERF_CHECK
+#error "FA_PERF_FUSION_ONLY requires FA_PERF_CHECK=0"
+#endif
+#if FA_REQUIRE_ALL_GEMMINIS != 0 && FA_REQUIRE_ALL_GEMMINIS != 1
+#error "FA_REQUIRE_ALL_GEMMINIS must be zero or one"
+#endif
+#if FA_PERF_PHASE_TRACE != 0 && FA_PERF_PHASE_TRACE != 1
+#error "FA_PERF_PHASE_TRACE must be zero or one"
+#endif
+#if FA_PERF_INITIALIZE_INPUTS != 0 && FA_PERF_INITIALIZE_INPUTS != 1
+#error "FA_PERF_INITIALIZE_INPUTS must be zero or one"
 #endif
 
 static elem_t perf_queries[FA_QUERY_ROWS][FA_Q_DIM]
@@ -139,7 +181,9 @@ static void perf_initialize_inputs(void) {
           perf_encode_bf16(perf_input_value(2u, row, column));
     }
   }
+#if !FA_PERF_FUSION_ONLY
   memset(perf_cpu_output, 0, sizeof(perf_cpu_output));
+#endif
   memset(perf_fusion_output, 0, sizeof(perf_fusion_output));
   memset(perf_causal_mask_workspace, 0,
          sizeof(perf_causal_mask_workspace));
@@ -236,6 +280,39 @@ static perf_ratio_t perf_ratio_thousandths(uint64_t numerator,
 static uint64_t perf_rounded_average(uint64_t total, uint64_t count) {
   return total / count +
       ((total % count) * 2u >= count ? 1u : 0u);
+}
+
+typedef struct {
+  uint64_t q_blocks;
+  uint64_t rectangular_blocks;
+  uint64_t causal_blocks;
+  uint64_t generation_barrier_qk_jobs;
+} perf_expected_blocks_t;
+
+static uint64_t perf_ceil_div_u64(uint64_t numerator,
+                                  uint64_t denominator) {
+  return numerator / denominator + (numerator % denominator != 0u);
+}
+
+static perf_expected_blocks_t perf_expected_blocks(
+    const vpu_flashattention_config_t *config,
+    const vpu_flashattention_plan_t *plan) {
+  perf_expected_blocks_t expected = {0u, 0u, 0u, 0u};
+  for (size_t q_start = 0u; q_start < config->query_rows;) {
+    const size_t q_rows = config->query_rows - q_start < plan->q_rows
+        ? config->query_rows - q_start : plan->q_rows;
+    const size_t query_block_end = config->query_base + q_start + q_rows;
+    const size_t causal_key_end = query_block_end < config->sequence
+        ? query_block_end : config->sequence;
+    ++expected.q_blocks;
+    expected.rectangular_blocks += perf_ceil_div_u64(
+        config->sequence, plan->kv_rows);
+    const uint64_t causal_blocks = perf_ceil_div_u64(
+        causal_key_end, plan->kv_rows);
+    expected.causal_blocks += causal_blocks;
+    q_start += q_rows;
+  }
+  return expected;
 }
 
 static void perf_print_ratio(const char *name, perf_ratio_t ratio,
@@ -346,10 +423,24 @@ int main(void) {
       .value_stride = FA_V_DIM,
       .output_stride = FA_V_DIM,
       .gemmini_mask = FA_GEMMINI_MASK,
+      .qk_partition_axis = FA_QK_PARTITION_AXIS,
+      .pv_partition_axis = FA_PV_PARTITION_AXIS,
+      .q_block_rows = FA_Q_BLOCK_ROWS,
+      .kv_block_rows = FA_KV_BLOCK_ROWS,
+      .qk_tile_k = FA_QK_TILE_K,
       .causal_mask_workspace = perf_causal_mask_workspace,
       .causal_mask_workspace_elements =
           VPU_FLASHATTENTION_CAUSAL_MASK_ELEMENTS,
   };
+
+  printf("FLASH_ATTN_PERF qk_partition_axis=%u pv_partition_axis=%u\n",
+         (unsigned)config.qk_partition_axis,
+         (unsigned)config.pv_partition_axis);
+  printf("FLASH_ATTN_PERF forced_plan q_block_rows=%llu "
+         "kv_block_rows=%llu qk_tile_k=%u require_all_gemminis=%u\n",
+         (unsigned long long)config.q_block_rows,
+         (unsigned long long)config.kv_block_rows,
+         config.qk_tile_k, (unsigned)FA_REQUIRE_ALL_GEMMINIS);
 
   vpu_flashattention_plan_t plan;
   const vpu_flashattention_status_t plan_status =
@@ -360,11 +451,69 @@ int main(void) {
     return 1;
   }
 
-  perf_initialize_inputs();
+  const bool forced_plan_mismatch =
+      (config.q_block_rows != 0u && plan.q_rows != config.q_block_rows) ||
+      (config.kv_block_rows != 0u && plan.kv_rows != config.kv_block_rows) ||
+      (config.qk_tile_k != 0u && plan.qk_tiles != config.qk_tile_k);
+  if (forced_plan_mismatch) {
+    printf("FLASH_ATTN_PERF result=FAIL errors=1 "
+           "reason=forced_plan_mismatch "
+           "forced_q_block_rows=%llu plan_q_block_rows=%u "
+           "forced_kv_block_rows=%llu plan_kv_block_rows=%u "
+           "forced_qk_tile_k=%u plan_qk_tile_k=%u\n",
+           (unsigned long long)config.q_block_rows, plan.q_rows,
+           (unsigned long long)config.kv_block_rows, plan.kv_rows,
+           config.qk_tile_k, plan.qk_tiles);
+    return 1;
+  }
+
+  const perf_expected_blocks_t expected_blocks =
+      perf_expected_blocks(&config, &plan);
+  const unsigned pv_tiles =
+      (unsigned)perf_ceil_div_u64(config.value_dim, DIM);
+  const unsigned qk_effective_members =
+      (unsigned)gemmini_partition_effective_member_count(
+          config.qk_partition_axis, plan.gemmini_count,
+          plan.q_tiles, plan.kv_tiles, plan.qk_tiles);
+  const unsigned pv_effective_members =
+      (unsigned)gemmini_partition_effective_member_count(
+          config.pv_partition_axis, plan.gemmini_count,
+          plan.q_tiles, pv_tiles, plan.kv_tiles);
+  if (FA_REQUIRE_ALL_GEMMINIS &&
+      (qk_effective_members != plan.gemmini_count ||
+       pv_effective_members != plan.gemmini_count)) {
+    printf("FLASH_ATTN_PERF result=FAIL errors=1 "
+           "reason=not_all_gemmini_members_active "
+           "gemmini_count=%u qk_effective_members=%u "
+           "pv_effective_members=%u\n",
+           plan.gemmini_count, qk_effective_members,
+           pv_effective_members);
+    return 1;
+  }
+  const unsigned total_qk_tiles =
+      (unsigned)perf_ceil_div_u64(config.q_dim, DIM);
+  const unsigned qk_steps_per_job = vpu_fa_matmul_planned_steps(
+      VPU_FA_MATMUL_QK, total_qk_tiles, plan.qk_tiles);
+  const bool check_single_step_jobs =
+      qk_steps_per_job == 1u;
+  const uint64_t expected_gemmini_job_steps =
+      (uint64_t)(qk_steps_per_job + 1u) * expected_blocks.causal_blocks;
+
+  if (FA_PERF_INITIALIZE_INPUTS)
+    perf_initialize_inputs();
+#if FA_PERF_FUSION_ONLY
+  printf("FLASH_ATTN_PERF metric=target_cycles "
+         "cpu=skipped "
+         "fusion=auto_e2e_plan_flush_qk_vpu_pv_store_fence "
+         "cache_state=%s\n",
+         FA_PERF_INITIALIZE_INPUTS ? "post_input_init_no_cpu_reference"
+                                   : "zero_bss_no_input_init");
+#else
   printf("FLASH_ATTN_PERF metric=target_cycles "
          "cpu=scalar_bf16_input_fp32_fma_libm "
          "fusion=auto_e2e_plan_flush_qk_vpu_pv_store_fence "
          "cache_state=post_input_cpu_warm\n");
+#endif
   printf("FLASH_ATTN_PERF q=[%u,%u)x%u k=%ux%u v=%ux%u "
          "gemmini_mask=0x%x warmups=%u repeats=%u check=%u\n",
          (unsigned)config.query_base,
@@ -378,16 +527,34 @@ int main(void) {
          "q_block_rows=%u kv_block_rows=%u qk_depth=%u\n",
          plan.q_tiles, plan.kv_tiles, plan.qk_tiles,
          plan.q_rows, plan.kv_rows, plan.qk_depth);
+  printf("FLASH_ATTN_PERF expected_blocks q_blocks=%llu "
+         "rectangular_blocks=%llu causal_blocks=%llu "
+         "generation_barrier_qk_jobs=%llu single_step_check=%u "
+         "gemmini_job_steps=%llu\n",
+         (unsigned long long)expected_blocks.q_blocks,
+         (unsigned long long)expected_blocks.rectangular_blocks,
+         (unsigned long long)expected_blocks.causal_blocks,
+         (unsigned long long)expected_blocks.generation_barrier_qk_jobs,
+         (unsigned)check_single_step_jobs,
+         (unsigned long long)expected_gemmini_job_steps);
+  printf("FLASH_ATTN_PERF full_block_tiles "
+         "qk_I=%u qk_J=%u qk_K=%u qk_effective_members=%u "
+         "pv_I=%u pv_J=%u pv_K=%u pv_effective_members=%u\n",
+         plan.q_tiles, plan.kv_tiles, plan.qk_tiles,
+         qk_effective_members, plan.q_tiles, pv_tiles, plan.kv_tiles,
+         pv_effective_members);
 
   vpu_flashattention_result_t fusion_result;
   memset(&fusion_result, 0, sizeof(fusion_result));
 
 #if FA_PERF_WARMUPS > 0
   for (unsigned iteration = 0u; iteration < FA_PERF_WARMUPS; ++iteration) {
+#if !FA_PERF_FUSION_ONLY
     perf_cpu_causal_attention(&config, &perf_cpu_output[0][0]);
     perf_checksum_sink ^= perf_output_checksum(
         &perf_cpu_output[0][0], config.query_rows,
         config.value_dim, config.output_stride);
+#endif
     fusion_result = vpu_flashattention_auto(&config);
     if (perf_check_fusion_result("warmup", iteration, &fusion_result))
       return 1;
@@ -397,14 +564,17 @@ int main(void) {
   }
 #endif
 
+#if !FA_PERF_FUSION_ONLY
   uint64_t cpu_min_cycles = UINT64_MAX;
   uint64_t cpu_total_cycles = 0u;
+#endif
   uint64_t fusion_min_cycles = UINT64_MAX;
   uint64_t fusion_total_cycles = 0u;
   perf_vpu_counters_t last_vpu_counters;
   memset(&last_vpu_counters, 0, sizeof(last_vpu_counters));
 
   for (unsigned iteration = 0u; iteration < FA_PERF_REPEATS; ++iteration) {
+#if !FA_PERF_FUSION_ONLY
     const uint64_t cpu_start = perf_read_cycles();
     perf_cpu_causal_attention(&config, &perf_cpu_output[0][0]);
     const uint64_t cpu_cycles = perf_read_cycles() - cpu_start;
@@ -413,10 +583,17 @@ int main(void) {
     perf_checksum_sink ^= perf_output_checksum(
         &perf_cpu_output[0][0], config.query_rows,
         config.value_dim, config.output_stride);
+#if FA_PERF_PHASE_TRACE
+    printf("FLASH_ATTN_PERF phase=cpu_complete iteration=%u\n", iteration);
+#endif
+#endif
 
     const uint64_t fusion_start = perf_read_cycles();
     fusion_result = vpu_flashattention_auto(&config);
     const uint64_t fusion_cycles = perf_read_cycles() - fusion_start;
+#if FA_PERF_PHASE_TRACE
+    printf("FLASH_ATTN_PERF phase=fusion_complete iteration=%u\n", iteration);
+#endif
     if (perf_check_fusion_result("measure", iteration, &fusion_result))
       return 1;
     if (fusion_cycles < fusion_min_cycles)
@@ -430,19 +607,42 @@ int main(void) {
       &perf_fusion_output[0][0], config.query_rows,
       config.value_dim, config.output_stride);
 
-  const uint64_t cpu_average_cycles = perf_rounded_average(
-      cpu_total_cycles, FA_PERF_REPEATS);
+  const bool scheduler_counts_match =
+      fusion_result.stats.qk_jobs == expected_blocks.causal_blocks &&
+      fusion_result.stats.pv_jobs == expected_blocks.causal_blocks &&
+      fusion_result.stats.causal_blocks == expected_blocks.causal_blocks &&
+      fusion_result.stats.rectangular_blocks ==
+          expected_blocks.rectangular_blocks;
+  const bool scheduler_steps_match =
+      fusion_result.stats.gemmini_job_steps == expected_gemmini_job_steps;
+  const bool scheduler_stats_match =
+      scheduler_counts_match && scheduler_steps_match;
+
   const uint64_t fusion_average_cycles = perf_rounded_average(
       fusion_total_cycles, FA_PERF_REPEATS);
+#if !FA_PERF_FUSION_ONLY
+  const uint64_t cpu_average_cycles = perf_rounded_average(
+      cpu_total_cycles, FA_PERF_REPEATS);
   const perf_ratio_t min_speedup =
       perf_ratio_thousandths(cpu_min_cycles, fusion_min_cycles);
   const perf_ratio_t average_speedup =
       perf_ratio_thousandths(cpu_average_cycles, fusion_average_cycles);
   const perf_ratio_t cpu_cycles_per_query =
       perf_ratio_thousandths(cpu_min_cycles, config.query_rows);
+#endif
   const perf_ratio_t fusion_cycles_per_query =
       perf_ratio_thousandths(fusion_min_cycles, config.query_rows);
 
+#if FA_PERF_FUSION_ONLY
+  printf("FLASH_ATTN_PERF fusion_e2e_cycles_min=%llu "
+         "fusion_e2e_cycles_avg=%llu\n",
+         (unsigned long long)fusion_min_cycles,
+         (unsigned long long)fusion_average_cycles);
+  printf("FLASH_ATTN_PERF ");
+  perf_print_ratio("fusion_e2e_cycles_per_query_min",
+                   fusion_cycles_per_query, "");
+  printf("\n");
+#else
   printf("FLASH_ATTN_PERF cpu_cycles_min=%llu cpu_cycles_avg=%llu "
          "fusion_e2e_cycles_min=%llu fusion_e2e_cycles_avg=%llu ",
          (unsigned long long)cpu_min_cycles,
@@ -460,6 +660,7 @@ int main(void) {
   perf_print_ratio("fusion_e2e_cycles_per_query_min",
                    fusion_cycles_per_query, "");
   printf("\n");
+#endif
 
   printf("FLASH_ATTN_PERF scheduler qk_jobs=%llu pv_jobs=%llu "
          "gemmini_job_steps=%llu causal_blocks=%llu "
@@ -470,6 +671,17 @@ int main(void) {
          (unsigned long long)fusion_result.stats.causal_blocks,
          (unsigned long long)fusion_result.stats.rectangular_blocks,
          (unsigned long long)fusion_result.stats.skipped_future_blocks);
+  printf("FLASH_ATTN_PERF scheduler_validation result=%s "
+         "expected_qk_jobs=%llu expected_pv_jobs=%llu "
+         "expected_causal_blocks=%llu expected_rectangular_blocks=%llu "
+         "single_step_check=%u expected_gemmini_job_steps=%llu\n",
+         scheduler_stats_match ? "PASS" : "FAIL",
+         (unsigned long long)expected_blocks.causal_blocks,
+         (unsigned long long)expected_blocks.causal_blocks,
+         (unsigned long long)expected_blocks.causal_blocks,
+         (unsigned long long)expected_blocks.rectangular_blocks,
+         (unsigned)check_single_step_jobs,
+         (unsigned long long)expected_gemmini_job_steps);
   printf("FLASH_ATTN_PERF hwloop qk_regions=%llu qk_rows=%llu "
          "mask_regions=%llu mask_rows=%llu diagonal_vectors=%llu "
          "future_vectors=%llu normalize_regions=%llu normalize_rows=%llu\n",
@@ -496,16 +708,20 @@ int main(void) {
          (unsigned long long)last_vpu_counters.bank_conflict_stall_cycles,
          (unsigned long long)last_vpu_counters.hazard_stall_cycles);
 
+#if !FA_PERF_FUSION_ONLY
   const uint64_t cpu_checksum = perf_output_checksum(
       &perf_cpu_output[0][0], config.query_rows,
       config.value_dim, config.output_stride);
+#endif
   const uint64_t fusion_checksum = perf_output_checksum(
       &perf_fusion_output[0][0], config.query_rows,
       config.value_dim, config.output_stride);
 
-#if FA_PERF_CHECK
+#if FA_PERF_CHECK && !FA_PERF_FUSION_ONLY
   float max_abs_error;
-  const int errors = perf_check_results(&config, &max_abs_error);
+  const int numerical_errors =
+      perf_check_results(&config, &max_abs_error);
+  const int errors = numerical_errors + (scheduler_stats_match ? 0 : 1);
   printf("FLASH_ATTN_PERF result=%s errors=%d max_abs_error_bits=0x%x "
          "cpu_checksum=0x%llx fusion_checksum=0x%llx "
          "sink=0x%llx status=0x%llx\n",
@@ -517,6 +733,33 @@ int main(void) {
          (unsigned long long)fusion_result.vpu_status);
   return errors == 0 ? 0 : 1;
 #else
+  if (!scheduler_stats_match) {
+#if FA_PERF_FUSION_ONLY
+    printf("FLASH_ATTN_PERF result=FAIL errors=1 "
+           "reason=scheduler_stats_mismatch "
+           "fusion_checksum=0x%llx sink=0x%llx status=0x%llx\n",
+           (unsigned long long)fusion_checksum,
+           (unsigned long long)perf_checksum_sink,
+           (unsigned long long)fusion_result.vpu_status);
+#else
+    printf("FLASH_ATTN_PERF result=FAIL errors=1 "
+           "reason=scheduler_stats_mismatch "
+           "cpu_checksum=0x%llx fusion_checksum=0x%llx "
+           "sink=0x%llx status=0x%llx\n",
+           (unsigned long long)cpu_checksum,
+           (unsigned long long)fusion_checksum,
+           (unsigned long long)perf_checksum_sink,
+           (unsigned long long)fusion_result.vpu_status);
+#endif
+    return 1;
+  }
+#if FA_PERF_FUSION_ONLY
+  printf("FLASH_ATTN_PERF result=UNCHECKED "
+         "fusion_checksum=0x%llx sink=0x%llx status=0x%llx\n",
+         (unsigned long long)fusion_checksum,
+         (unsigned long long)perf_checksum_sink,
+         (unsigned long long)fusion_result.vpu_status);
+#else
   printf("FLASH_ATTN_PERF result=UNCHECKED "
          "cpu_checksum=0x%llx fusion_checksum=0x%llx "
          "sink=0x%llx status=0x%llx\n",
@@ -524,6 +767,7 @@ int main(void) {
          (unsigned long long)fusion_checksum,
          (unsigned long long)perf_checksum_sink,
          (unsigned long long)fusion_result.vpu_status);
+#endif
   return 0;
 #endif
 }

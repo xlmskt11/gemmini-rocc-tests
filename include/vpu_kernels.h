@@ -12,7 +12,7 @@
  * by vpu_params.h.
  */
 #ifndef VPU_NONLINEAR_CHUNK_ROWS
-#define VPU_NONLINEAR_CHUNK_ROWS 4u
+#define VPU_NONLINEAR_CHUNK_ROWS VPU_LOOP_COUNT_MAX
 #endif
 
 #if VPU_NONLINEAR_CHUNK_ROWS == 0
@@ -86,16 +86,90 @@ static inline void vpu_emit_softmax(
 
 /*
  * Software-managed streaming layout used by the multi-tile helpers below.
- * A ping or pong tile owns four banks. The meaning of AUX/TEMP depends on the
- * kernel (weight, shifted value, exponential, or activation temporary).
+ * A ping or pong tile owns four bank roles. The meaning of AUX/TEMP depends
+ * on the kernel (weight, shifted value, exponential, or activation temporary).
+ * The eight logical roles evenly partition a geometry with fewer than eight
+ * banks (the fused two-bank ACC uses four regions per bank). A geometry with
+ * at least eight banks assigns one whole bank per role. Both rules preserve
+ * the legacy 0..7 placement when VPU_VSPAD_BANKS is eight.
  *
  * These helpers deliberately emit only the fine-grained instructions above;
  * they are not new architectural/coarse-grained operations. They clobber GP
  * registers 0..12, H registers 0..2, and FP registers 0..2.
  */
-#if VPU_VSPAD_BANKS < 8
-#error "The streaming VPU kernels require at least eight Vector SRAM banks"
+#define VPU_STREAM_BUFFER_ROLES 4u
+#define VPU_STREAM_TOTAL_ROLES (2u * VPU_STREAM_BUFFER_ROLES)
+
+#if VPU_VSPAD_BANKS < VPU_STREAM_TOTAL_ROLES &&                               \
+    (VPU_STREAM_TOTAL_ROLES % VPU_VSPAD_BANKS) != 0
+#error                                                                         \
+    "The streaming VPU kernels require banks which divide eight logical roles"
 #endif
+#if VPU_VSPAD_BANKS >= VPU_STREAM_TOTAL_ROLES &&                              \
+    (VPU_VSPAD_BANKS % 2) != 0
+#error "The streaming VPU kernels require even ping/pong bank halves"
+#endif
+#if (VPU_VSPAD_ELEMENTS % (VPU_STREAM_TOTAL_ROLES * VPU_VLEN)) != 0
+#error "Each streaming bank role must contain an integral number of vectors"
+#endif
+
+enum vpu_stream_bank_role {
+  VPU_STREAM_BANK_INPUT = 0,
+  VPU_STREAM_BANK_AUX = 1,
+  VPU_STREAM_BANK_TEMP = 2,
+  VPU_STREAM_BANK_OUTPUT = 3,
+};
+
+static inline unsigned vpu_logical_role_bank_for_geometry(
+    unsigned bank_count, unsigned linear_role) {
+  if (bank_count < VPU_STREAM_TOTAL_ROLES) {
+    const unsigned roles_per_bank = VPU_STREAM_TOTAL_ROLES / bank_count;
+    return linear_role / roles_per_bank;
+  }
+  return linear_role < VPU_STREAM_BUFFER_ROLES
+             ? linear_role
+             : bank_count / 2u + linear_role - VPU_STREAM_BUFFER_ROLES;
+}
+
+static inline unsigned vpu_logical_role_base_for_geometry(
+    unsigned bank_count, unsigned total_elements,
+    unsigned elements_per_bank, unsigned linear_role) {
+  if (bank_count < VPU_STREAM_TOTAL_ROLES)
+    return linear_role * (total_elements / VPU_STREAM_TOTAL_ROLES);
+  return vpu_logical_role_bank_for_geometry(bank_count, linear_role) *
+         elements_per_bank;
+}
+
+static inline size_t vpu_logical_role_slots_for_geometry(
+    unsigned bank_count, size_t total_elements,
+    size_t elements_per_bank, size_t vector_elements) {
+  const size_t role_elements =
+      bank_count < VPU_STREAM_TOTAL_ROLES
+          ? total_elements / VPU_STREAM_TOTAL_ROLES
+          : elements_per_bank;
+  return role_elements / vector_elements;
+}
+
+static inline unsigned vpu_stream_bank(unsigned buffer,
+                                       enum vpu_stream_bank_role role) {
+  const unsigned linear_role =
+      (buffer & 1u) * VPU_STREAM_BUFFER_ROLES + (unsigned)role;
+  return vpu_logical_role_bank_for_geometry(VPU_VSPAD_BANKS, linear_role);
+}
+
+static inline unsigned vpu_stream_bank_base(
+    unsigned buffer, enum vpu_stream_bank_role role) {
+  const unsigned linear_role =
+      (buffer & 1u) * VPU_STREAM_BUFFER_ROLES + (unsigned)role;
+  return vpu_logical_role_base_for_geometry(
+      VPU_VSPAD_BANKS, VPU_VSPAD_ELEMENTS, VPU_ELEMENTS_PER_BANK,
+      linear_role);
+}
+
+static inline size_t vpu_stream_role_slots(void) {
+  return vpu_logical_role_slots_for_geometry(
+      VPU_VSPAD_BANKS, VPU_VSPAD_ELEMENTS, VPU_ELEMENTS_PER_BANK, VPU_VLEN);
+}
 
 #if VPU_VLEN > VPU_ADDI_INT_IMM_MAX
 #error "The auto kernels require VLEN to fit the S_ADDI_INT immediate"
@@ -347,20 +421,21 @@ static inline unsigned vpu_stream_rows_gp(unsigned buffer) {
   return buffer ? VPU_STREAM_GP_PONG_ROWS : VPU_STREAM_GP_PING_ROWS;
 }
 
-/* Physical rows available to one bank-local 2-D descriptor.  Rearrangement
- * kernels use this capacity because their large row counts already provide a
- * steady ping/pong pipeline and their gather/slide bodies dominate runtime. */
+/* Physical rows available to one role-local 2-D descriptor. A role is one
+ * complete bank in the standalone eight-bank geometry and one bank region in
+ * compact fused geometries. Rearrangement kernels use this capacity because
+ * their large row counts already provide a steady ping/pong pipeline. */
 static inline size_t vpu_stream_physical_batch_capacity(void) {
-  const size_t dma_capacity = VPU_SLOTS_PER_BANK < VPU_DMA_MAX_ROWS
-      ? VPU_SLOTS_PER_BANK : VPU_DMA_MAX_ROWS;
+  const size_t role_slots = vpu_stream_role_slots();
+  const size_t dma_capacity = role_slots < VPU_DMA_MAX_ROWS
+      ? role_slots : VPU_DMA_MAX_ROWS;
   return dma_capacity < VPU_LOOP_COUNT_MAX
       ? dma_capacity : VPU_LOOP_COUNT_MAX;
 }
 
-/* Nonlinear kernels deliberately use a smaller dependency/completion unit than
- * the physical bank.  A long 2-D load retires only after its final SRAM row and
- * exposes one conservative write range to the reservation station; limiting
- * it here lets LD(chunk n+1), EX(chunk n), and ST(chunk n-1) overlap. */
+/* Use as much of one role-local bank as the generated loop/DMA limits permit.
+ * The optional override remains useful when a configuration intentionally
+ * trades a shorter dependency/completion unit for finer LD/EX/ST overlap. */
 static inline size_t vpu_stream_batch_capacity(void) {
   const size_t physical = vpu_stream_physical_batch_capacity();
   return physical < VPU_NONLINEAR_CHUNK_ROWS
@@ -390,14 +465,22 @@ static inline size_t vpu_stream_tile_elements(size_t elements, size_t tile) {
 }
 
 static inline void vpu_stream_configure_spad(void) {
-  vpu_write_gp(VPU_STREAM_GP_PING_INPUT, VPU_BANK_BASE(0));
-  vpu_write_gp(VPU_STREAM_GP_PING_AUX, VPU_BANK_BASE(1));
-  vpu_write_gp(VPU_STREAM_GP_PING_TEMP, VPU_BANK_BASE(2));
-  vpu_write_gp(VPU_STREAM_GP_PING_OUTPUT, VPU_BANK_BASE(3));
-  vpu_write_gp(VPU_STREAM_GP_PONG_INPUT, VPU_BANK_BASE(4));
-  vpu_write_gp(VPU_STREAM_GP_PONG_AUX, VPU_BANK_BASE(5));
-  vpu_write_gp(VPU_STREAM_GP_PONG_TEMP, VPU_BANK_BASE(6));
-  vpu_write_gp(VPU_STREAM_GP_PONG_OUTPUT, VPU_BANK_BASE(7));
+  vpu_write_gp(VPU_STREAM_GP_PING_INPUT,
+               vpu_stream_bank_base(0u, VPU_STREAM_BANK_INPUT));
+  vpu_write_gp(VPU_STREAM_GP_PING_AUX,
+               vpu_stream_bank_base(0u, VPU_STREAM_BANK_AUX));
+  vpu_write_gp(VPU_STREAM_GP_PING_TEMP,
+               vpu_stream_bank_base(0u, VPU_STREAM_BANK_TEMP));
+  vpu_write_gp(VPU_STREAM_GP_PING_OUTPUT,
+               vpu_stream_bank_base(0u, VPU_STREAM_BANK_OUTPUT));
+  vpu_write_gp(VPU_STREAM_GP_PONG_INPUT,
+               vpu_stream_bank_base(1u, VPU_STREAM_BANK_INPUT));
+  vpu_write_gp(VPU_STREAM_GP_PONG_AUX,
+               vpu_stream_bank_base(1u, VPU_STREAM_BANK_AUX));
+  vpu_write_gp(VPU_STREAM_GP_PONG_TEMP,
+               vpu_stream_bank_base(1u, VPU_STREAM_BANK_TEMP));
+  vpu_write_gp(VPU_STREAM_GP_PONG_OUTPUT,
+               vpu_stream_bank_base(1u, VPU_STREAM_BANK_OUTPUT));
 }
 
 /*
@@ -469,13 +552,13 @@ static inline void vpu_stream_prefetch_input(size_t elements, size_t tile) {
  */
 static inline void vpu_stream_reset_batch_addresses(unsigned buffer) {
   vpu_write_gp(vpu_stream_input_gp(buffer),
-               VPU_BANK_BASE(buffer ? 4u : 0u));
+               vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT));
   vpu_write_gp(vpu_stream_aux_gp(buffer),
-               VPU_BANK_BASE(buffer ? 5u : 1u));
+               vpu_stream_bank_base(buffer, VPU_STREAM_BANK_AUX));
   vpu_write_gp(vpu_stream_temp_gp(buffer),
-               VPU_BANK_BASE(buffer ? 6u : 2u));
+               vpu_stream_bank_base(buffer, VPU_STREAM_BANK_TEMP));
   vpu_write_gp(vpu_stream_output_gp(buffer),
-               VPU_BANK_BASE(buffer ? 7u : 3u));
+               vpu_stream_bank_base(buffer, VPU_STREAM_BANK_OUTPUT));
 }
 
 static inline void vpu_stream_prepare_full_batch(
@@ -504,7 +587,7 @@ static inline void vpu_stream_store_full_batch(
   /* Execute address induction leaves output_gp one-past the batch.  Restore
    * the descriptor base explicitly; descriptors snapshot it at admission. */
   vpu_write_gp(vpu_stream_output_gp(buffer),
-               VPU_BANK_BASE(buffer ? 7u : 3u));
+               vpu_stream_bank_base(buffer, VPU_STREAM_BANK_OUTPUT));
   vpu_write_gp(vpu_stream_offset_gp(buffer),
                (uint32_t)(first_tile * (size_t)VPU_VLEN));
   vpu_write_gp(vpu_stream_rows_gp(buffer), (uint32_t)rows);
@@ -583,35 +666,125 @@ static inline void vpu_tiled_store_run(
                    VPU_STREAM_H_OUTPUT, VPU_RESIDENT_GP_ROWS);
 }
 
+static inline void vpu_tiled_emit_reduction_command(
+    unsigned fp_destination, unsigned input_gp, int maximum,
+    enum vpu_reduction_mode mode) {
+  if (maximum) {
+    switch (mode) {
+      case VPU_REDUCTION_START:
+        vpu_v_red_max_start(fp_destination, input_gp);
+        break;
+      case VPU_REDUCTION_CONTINUE:
+        vpu_v_red_max_continue(fp_destination, input_gp);
+        break;
+      case VPU_REDUCTION_FINAL:
+        vpu_v_red_max_final(fp_destination, input_gp);
+        break;
+      case VPU_REDUCTION_SINGLE:
+      default:
+        vpu_v_red_max(fp_destination, input_gp);
+        break;
+    }
+  } else {
+    switch (mode) {
+      case VPU_REDUCTION_START:
+        vpu_v_red_sum_start(fp_destination, input_gp);
+        break;
+      case VPU_REDUCTION_CONTINUE:
+        vpu_v_red_sum_continue(fp_destination, input_gp);
+        break;
+      case VPU_REDUCTION_FINAL:
+        vpu_v_red_sum_final(fp_destination, input_gp);
+        break;
+      case VPU_REDUCTION_SINGLE:
+      default:
+        vpu_v_red_sum(fp_destination, input_gp);
+        break;
+    }
+  }
+}
+
+/* Reduce one contiguous, already-materialized vector run without folding
+ * through scalar state after every VLEN row. START samples the scalar seed,
+ * CONTINUE retains the partial in the reduction fabric, and only FINAL writes
+ * the FP destination. Keep the chain inside this run: the next RMS/softmax
+ * run may need the same FMA fabric to materialize its input before reducing. */
+static inline void vpu_tiled_emit_reduction_run(
+    unsigned fp_destination, unsigned input_address, size_t rows,
+    int maximum) {
+  if (rows == 0u)
+    return;
+
+  vpu_write_gp(VPU_RESIDENT_GP_INPUT, input_address);
+  if (rows == 1u) {
+    vpu_tiled_emit_reduction_command(
+        fp_destination, VPU_RESIDENT_GP_INPUT, maximum,
+        VPU_REDUCTION_SINGLE);
+    return;
+  }
+
+  vpu_tiled_emit_reduction_command(
+      fp_destination, VPU_RESIDENT_GP_INPUT, maximum,
+      VPU_REDUCTION_START);
+  vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
+                 VPU_RESIDENT_GP_INPUT, VPU_VLEN);
+
+  const size_t continue_rows = rows - 2u;
+  if (continue_rows != 0u) {
+#if VPU_LOOP_BUFFER_ENTRIES >= 4 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+    if (continue_rows > 1u) {
+      vpu_loop_start(VPU_RESIDENT_GP_LOOP, (uint32_t)continue_rows);
+      vpu_tiled_emit_reduction_command(
+          fp_destination, VPU_RESIDENT_GP_INPUT, maximum,
+          VPU_REDUCTION_CONTINUE);
+      vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
+                     VPU_RESIDENT_GP_INPUT, VPU_VLEN);
+      vpu_loop_end(VPU_RESIDENT_GP_LOOP);
+    } else
+#endif
+    {
+      vpu_tiled_emit_reduction_command(
+          fp_destination, VPU_RESIDENT_GP_INPUT, maximum,
+          VPU_REDUCTION_CONTINUE);
+      vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
+                     VPU_RESIDENT_GP_INPUT, VPU_VLEN);
+    }
+  }
+
+  vpu_tiled_emit_reduction_command(
+      fp_destination, VPU_RESIDENT_GP_INPUT, maximum,
+      VPU_REDUCTION_FINAL);
+}
+
 static inline void vpu_tiled_emit_rms_reduce_run(
     unsigned input_address, unsigned scratch_address, size_t rows) {
   vpu_write_gp(VPU_RESIDENT_GP_INPUT, input_address);
   vpu_write_gp(VPU_RESIDENT_GP_SCRATCH, scratch_address);
-#if VPU_LOOP_BUFFER_ENTRIES >= 6 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+#if VPU_LOOP_BUFFER_ENTRIES >= 5 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
   if (rows > 1u) {
     vpu_loop_start(VPU_RESIDENT_GP_LOOP, (uint32_t)rows);
     vpu_v_mul_vv(VPU_RESIDENT_GP_SCRATCH, VPU_RESIDENT_GP_INPUT,
                  VPU_RESIDENT_GP_INPUT);
-    vpu_v_red_sum(VPU_STREAM_FP_ACCUM_OR_MAX,
-                  VPU_RESIDENT_GP_SCRATCH);
     vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
                    VPU_RESIDENT_GP_INPUT, VPU_VLEN);
     vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
                    VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
     vpu_loop_end(VPU_RESIDENT_GP_LOOP);
-    return;
-  }
+  } else
 #endif
-  for (size_t row = 0; row < rows; ++row) {
-    vpu_v_mul_vv(VPU_RESIDENT_GP_SCRATCH, VPU_RESIDENT_GP_INPUT,
-                 VPU_RESIDENT_GP_INPUT);
-    vpu_v_red_sum(VPU_STREAM_FP_ACCUM_OR_MAX,
-                  VPU_RESIDENT_GP_SCRATCH);
-    vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
-                   VPU_RESIDENT_GP_INPUT, VPU_VLEN);
-    vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
-                   VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
+  {
+    for (size_t row = 0; row < rows; ++row) {
+      vpu_v_mul_vv(VPU_RESIDENT_GP_SCRATCH, VPU_RESIDENT_GP_INPUT,
+                   VPU_RESIDENT_GP_INPUT);
+      vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
+                     VPU_RESIDENT_GP_INPUT, VPU_VLEN);
+      vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
+                     VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
+    }
   }
+
+  vpu_tiled_emit_reduction_run(
+      VPU_STREAM_FP_ACCUM_OR_MAX, scratch_address, rows, 0);
 }
 
 static inline void vpu_tiled_emit_rms_output_run(
@@ -637,43 +810,30 @@ static inline void vpu_tiled_emit_rms_output_run(
     vpu_s_addi_int(VPU_RESIDENT_GP_OUTPUT,
                    VPU_RESIDENT_GP_OUTPUT, VPU_VLEN);
     vpu_loop_end(VPU_RESIDENT_GP_LOOP);
-    return;
-  }
+  } else
 #endif
-  for (size_t row = 0; row < rows; ++row) {
-    vpu_v_mul_vf(VPU_RESIDENT_GP_SCRATCH, VPU_RESIDENT_GP_INPUT,
-                 VPU_STREAM_FP_ACCUM_OR_MAX);
-    vpu_v_mul_vv(VPU_RESIDENT_GP_OUTPUT, VPU_RESIDENT_GP_SCRATCH,
-                 VPU_RESIDENT_GP_AUX);
-    vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
-                   VPU_RESIDENT_GP_INPUT, VPU_VLEN);
-    vpu_s_addi_int(VPU_RESIDENT_GP_AUX,
-                   VPU_RESIDENT_GP_AUX, VPU_VLEN);
-    vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
-                   VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
-    vpu_s_addi_int(VPU_RESIDENT_GP_OUTPUT,
-                   VPU_RESIDENT_GP_OUTPUT, VPU_VLEN);
+  {
+    for (size_t row = 0; row < rows; ++row) {
+      vpu_v_mul_vf(VPU_RESIDENT_GP_SCRATCH, VPU_RESIDENT_GP_INPUT,
+                   VPU_STREAM_FP_ACCUM_OR_MAX);
+      vpu_v_mul_vv(VPU_RESIDENT_GP_OUTPUT, VPU_RESIDENT_GP_SCRATCH,
+                   VPU_RESIDENT_GP_AUX);
+      vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
+                     VPU_RESIDENT_GP_INPUT, VPU_VLEN);
+      vpu_s_addi_int(VPU_RESIDENT_GP_AUX,
+                     VPU_RESIDENT_GP_AUX, VPU_VLEN);
+      vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
+                     VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
+      vpu_s_addi_int(VPU_RESIDENT_GP_OUTPUT,
+                     VPU_RESIDENT_GP_OUTPUT, VPU_VLEN);
+    }
   }
 }
 
 static inline void vpu_tiled_emit_red_max_run(
     unsigned input_address, size_t rows) {
-  vpu_write_gp(VPU_RESIDENT_GP_INPUT, input_address);
-#if VPU_LOOP_BUFFER_ENTRIES >= 4 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
-  if (rows > 1u) {
-    vpu_loop_start(VPU_RESIDENT_GP_LOOP, (uint32_t)rows);
-    vpu_v_red_max(VPU_STREAM_FP_ACCUM_OR_MAX, VPU_RESIDENT_GP_INPUT);
-    vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
-                   VPU_RESIDENT_GP_INPUT, VPU_VLEN);
-    vpu_loop_end(VPU_RESIDENT_GP_LOOP);
-    return;
-  }
-#endif
-  for (size_t row = 0; row < rows; ++row) {
-    vpu_v_red_max(VPU_STREAM_FP_ACCUM_OR_MAX, VPU_RESIDENT_GP_INPUT);
-    vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
-                   VPU_RESIDENT_GP_INPUT, VPU_VLEN);
-  }
+  vpu_tiled_emit_reduction_run(
+      VPU_STREAM_FP_ACCUM_OR_MAX, input_address, rows, 1);
 }
 
 static inline void vpu_tiled_emit_exp_sum_run(
@@ -681,38 +841,54 @@ static inline void vpu_tiled_emit_exp_sum_run(
     unsigned exponential_address, size_t rows) {
   vpu_write_gp(VPU_RESIDENT_GP_INPUT, input_address);
   vpu_write_gp(VPU_RESIDENT_GP_SCRATCH, scratch_address);
-  vpu_write_gp(VPU_RESIDENT_GP_OUTPUT, exponential_address);
-#if VPU_LOOP_BUFFER_ENTRIES >= 8 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+#if VPU_LOOP_BUFFER_ENTRIES >= 5 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
   if (rows > 1u) {
     vpu_loop_start(VPU_RESIDENT_GP_LOOP, (uint32_t)rows);
     vpu_v_sub_vf(VPU_RESIDENT_GP_SCRATCH, VPU_RESIDENT_GP_INPUT,
                  VPU_STREAM_FP_ACCUM_OR_MAX, false);
-    vpu_v_exp_v(VPU_RESIDENT_GP_OUTPUT, VPU_RESIDENT_GP_SCRATCH);
-    vpu_v_red_sum(VPU_STREAM_FP_CONSTANT_OR_SUM,
-                  VPU_RESIDENT_GP_OUTPUT);
     vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
                    VPU_RESIDENT_GP_INPUT, VPU_VLEN);
+    vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
+                   VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
+    vpu_loop_end(VPU_RESIDENT_GP_LOOP);
+  } else
+#endif
+  {
+    for (size_t row = 0; row < rows; ++row) {
+      vpu_v_sub_vf(VPU_RESIDENT_GP_SCRATCH, VPU_RESIDENT_GP_INPUT,
+                   VPU_STREAM_FP_ACCUM_OR_MAX, false);
+      vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
+                     VPU_RESIDENT_GP_INPUT, VPU_VLEN);
+      vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
+                     VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
+    }
+  }
+
+  vpu_write_gp(VPU_RESIDENT_GP_SCRATCH, scratch_address);
+  vpu_write_gp(VPU_RESIDENT_GP_OUTPUT, exponential_address);
+#if VPU_LOOP_BUFFER_ENTRIES >= 5 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+  if (rows > 1u) {
+    vpu_loop_start(VPU_RESIDENT_GP_LOOP, (uint32_t)rows);
+    vpu_v_exp_v(VPU_RESIDENT_GP_OUTPUT, VPU_RESIDENT_GP_SCRATCH);
     vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
                    VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
     vpu_s_addi_int(VPU_RESIDENT_GP_OUTPUT,
                    VPU_RESIDENT_GP_OUTPUT, VPU_VLEN);
     vpu_loop_end(VPU_RESIDENT_GP_LOOP);
-    return;
-  }
+  } else
 #endif
-  for (size_t row = 0; row < rows; ++row) {
-    vpu_v_sub_vf(VPU_RESIDENT_GP_SCRATCH, VPU_RESIDENT_GP_INPUT,
-                 VPU_STREAM_FP_ACCUM_OR_MAX, false);
-    vpu_v_exp_v(VPU_RESIDENT_GP_OUTPUT, VPU_RESIDENT_GP_SCRATCH);
-    vpu_v_red_sum(VPU_STREAM_FP_CONSTANT_OR_SUM,
-                  VPU_RESIDENT_GP_OUTPUT);
-    vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
-                   VPU_RESIDENT_GP_INPUT, VPU_VLEN);
-    vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
-                   VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
-    vpu_s_addi_int(VPU_RESIDENT_GP_OUTPUT,
-                   VPU_RESIDENT_GP_OUTPUT, VPU_VLEN);
+  {
+    for (size_t row = 0; row < rows; ++row) {
+      vpu_v_exp_v(VPU_RESIDENT_GP_OUTPUT, VPU_RESIDENT_GP_SCRATCH);
+      vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
+                     VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
+      vpu_s_addi_int(VPU_RESIDENT_GP_OUTPUT,
+                     VPU_RESIDENT_GP_OUTPUT, VPU_VLEN);
+    }
   }
+
+  vpu_tiled_emit_reduction_run(
+      VPU_STREAM_FP_CONSTANT_OR_SUM, exponential_address, rows, 0);
 }
 
 static inline void vpu_tiled_emit_softmax_scale_run(
@@ -747,37 +923,75 @@ static inline void vpu_tiled_emit_softmax_recompute_run(
     unsigned output_address, size_t rows) {
   vpu_write_gp(VPU_RESIDENT_GP_INPUT, input_address);
   vpu_write_gp(VPU_RESIDENT_GP_SCRATCH, scratch_address);
-  vpu_write_gp(VPU_RESIDENT_GP_OUTPUT, output_address);
-#if VPU_LOOP_BUFFER_ENTRIES >= 8 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+#if VPU_LOOP_BUFFER_ENTRIES >= 5 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
   if (rows > 1u) {
     vpu_loop_start(VPU_RESIDENT_GP_LOOP, (uint32_t)rows);
     vpu_v_sub_vf(VPU_RESIDENT_GP_SCRATCH, VPU_RESIDENT_GP_INPUT,
                  VPU_STREAM_FP_ACCUM_OR_MAX, false);
-    vpu_v_exp_v(VPU_RESIDENT_GP_INPUT, VPU_RESIDENT_GP_SCRATCH);
-    vpu_v_mul_vf(VPU_RESIDENT_GP_OUTPUT, VPU_RESIDENT_GP_INPUT,
-                 VPU_STREAM_FP_CONSTANT_OR_SUM);
     vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
                    VPU_RESIDENT_GP_INPUT, VPU_VLEN);
     vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
                    VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
+    vpu_loop_end(VPU_RESIDENT_GP_LOOP);
+  } else
+#endif
+  {
+    for (size_t row = 0; row < rows; ++row) {
+      vpu_v_sub_vf(VPU_RESIDENT_GP_SCRATCH, VPU_RESIDENT_GP_INPUT,
+                   VPU_STREAM_FP_ACCUM_OR_MAX, false);
+      vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
+                     VPU_RESIDENT_GP_INPUT, VPU_VLEN);
+      vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
+                     VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
+    }
+  }
+
+  vpu_write_gp(VPU_RESIDENT_GP_INPUT, input_address);
+  vpu_write_gp(VPU_RESIDENT_GP_SCRATCH, scratch_address);
+#if VPU_LOOP_BUFFER_ENTRIES >= 5 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+  if (rows > 1u) {
+    vpu_loop_start(VPU_RESIDENT_GP_LOOP, (uint32_t)rows);
+    vpu_v_exp_v(VPU_RESIDENT_GP_INPUT, VPU_RESIDENT_GP_SCRATCH);
+    vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
+                   VPU_RESIDENT_GP_INPUT, VPU_VLEN);
+    vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
+                   VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
+    vpu_loop_end(VPU_RESIDENT_GP_LOOP);
+  } else
+#endif
+  {
+    for (size_t row = 0; row < rows; ++row) {
+      vpu_v_exp_v(VPU_RESIDENT_GP_INPUT, VPU_RESIDENT_GP_SCRATCH);
+      vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
+                     VPU_RESIDENT_GP_INPUT, VPU_VLEN);
+      vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
+                     VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
+    }
+  }
+
+  vpu_write_gp(VPU_RESIDENT_GP_INPUT, input_address);
+  vpu_write_gp(VPU_RESIDENT_GP_OUTPUT, output_address);
+#if VPU_LOOP_BUFFER_ENTRIES >= 5 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+  if (rows > 1u) {
+    vpu_loop_start(VPU_RESIDENT_GP_LOOP, (uint32_t)rows);
+    vpu_v_mul_vf(VPU_RESIDENT_GP_OUTPUT, VPU_RESIDENT_GP_INPUT,
+                 VPU_STREAM_FP_CONSTANT_OR_SUM);
+    vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
+                   VPU_RESIDENT_GP_INPUT, VPU_VLEN);
     vpu_s_addi_int(VPU_RESIDENT_GP_OUTPUT,
                    VPU_RESIDENT_GP_OUTPUT, VPU_VLEN);
     vpu_loop_end(VPU_RESIDENT_GP_LOOP);
-    return;
-  }
+  } else
 #endif
-  for (size_t row = 0; row < rows; ++row) {
-    vpu_v_sub_vf(VPU_RESIDENT_GP_SCRATCH, VPU_RESIDENT_GP_INPUT,
-                 VPU_STREAM_FP_ACCUM_OR_MAX, false);
-    vpu_v_exp_v(VPU_RESIDENT_GP_INPUT, VPU_RESIDENT_GP_SCRATCH);
-    vpu_v_mul_vf(VPU_RESIDENT_GP_OUTPUT, VPU_RESIDENT_GP_INPUT,
-                 VPU_STREAM_FP_CONSTANT_OR_SUM);
-    vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
-                   VPU_RESIDENT_GP_INPUT, VPU_VLEN);
-    vpu_s_addi_int(VPU_RESIDENT_GP_SCRATCH,
-                   VPU_RESIDENT_GP_SCRATCH, VPU_VLEN);
-    vpu_s_addi_int(VPU_RESIDENT_GP_OUTPUT,
-                   VPU_RESIDENT_GP_OUTPUT, VPU_VLEN);
+  {
+    for (size_t row = 0; row < rows; ++row) {
+      vpu_v_mul_vf(VPU_RESIDENT_GP_OUTPUT, VPU_RESIDENT_GP_INPUT,
+                   VPU_STREAM_FP_CONSTANT_OR_SUM);
+      vpu_s_addi_int(VPU_RESIDENT_GP_INPUT,
+                     VPU_RESIDENT_GP_INPUT, VPU_VLEN);
+      vpu_s_addi_int(VPU_RESIDENT_GP_OUTPUT,
+                     VPU_RESIDENT_GP_OUTPUT, VPU_VLEN);
+    }
   }
 }
 
@@ -1033,7 +1247,9 @@ static inline uint64_t vpu_tiled_rmsnorm_streaming_impl(
 
   if (full_batches != 0) {
     const size_t rows = full_tiles < capacity ? full_tiles : capacity;
-    vpu_tiled_prefetch_run(VPU_RESIDENT_GP_INPUT, VPU_BANK_BASE(0),
+    vpu_tiled_prefetch_run(
+        VPU_RESIDENT_GP_INPUT,
+        vpu_stream_bank_base(0u, VPU_STREAM_BANK_INPUT),
                            VPU_STREAM_H_INPUT, 0, rows, VPU_VLEN);
   }
   for (size_t batch = 0; batch < full_batches; ++batch) {
@@ -1047,17 +1263,21 @@ static inline uint64_t vpu_tiled_rmsnorm_streaming_impl(
       const size_t next_rows = next_remaining < capacity
           ? next_remaining : capacity;
       vpu_tiled_prefetch_run(
-          VPU_RESIDENT_GP_INPUT, VPU_BANK_BASE(buffer ? 0u : 4u),
+          VPU_RESIDENT_GP_INPUT,
+          vpu_stream_bank_base(buffer ^ 1u, VPU_STREAM_BANK_INPUT),
           VPU_STREAM_H_INPUT, next_first, next_rows, VPU_VLEN);
     }
     vpu_set_vl(VPU_VLEN);
-    vpu_tiled_emit_rms_reduce_run(VPU_BANK_BASE(buffer ? 4u : 0u),
-                                  VPU_BANK_BASE(buffer ? 6u : 2u), rows);
+    vpu_tiled_emit_rms_reduce_run(
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT),
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_TEMP), rows);
   }
   if (tail != 0) {
     const unsigned buffer = (unsigned)(full_batches & 1u);
-    const unsigned input_address = VPU_BANK_BASE(buffer ? 4u : 0u);
-    const unsigned scratch_address = VPU_BANK_BASE(buffer ? 6u : 2u);
+    const unsigned input_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT);
+    const unsigned scratch_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_TEMP);
     vpu_tiled_prefetch_run(VPU_RESIDENT_GP_INPUT, input_address,
                            VPU_STREAM_H_INPUT, full_tiles, 1, tail);
     vpu_tiled_emit_rms_reduce_run(input_address, scratch_address, 1);
@@ -1072,9 +1292,13 @@ static inline uint64_t vpu_tiled_rmsnorm_streaming_impl(
 
   if (full_batches != 0) {
     const size_t rows = full_tiles < capacity ? full_tiles : capacity;
-    vpu_tiled_prefetch_run(VPU_RESIDENT_GP_INPUT, VPU_BANK_BASE(0),
+    vpu_tiled_prefetch_run(
+        VPU_RESIDENT_GP_INPUT,
+        vpu_stream_bank_base(0u, VPU_STREAM_BANK_INPUT),
                            VPU_STREAM_H_INPUT, 0, rows, VPU_VLEN);
-    vpu_tiled_prefetch_run(VPU_RESIDENT_GP_AUX, VPU_BANK_BASE(1),
+    vpu_tiled_prefetch_run(
+        VPU_RESIDENT_GP_AUX,
+        vpu_stream_bank_base(0u, VPU_STREAM_BANK_AUX),
                            VPU_STREAM_H_AUX, 0, rows, VPU_VLEN);
   }
   for (size_t batch = 0; batch < full_batches; ++batch) {
@@ -1088,16 +1312,22 @@ static inline uint64_t vpu_tiled_rmsnorm_streaming_impl(
       const size_t next_rows = next_remaining < capacity
           ? next_remaining : capacity;
       vpu_tiled_prefetch_run(
-          VPU_RESIDENT_GP_INPUT, VPU_BANK_BASE(buffer ? 0u : 4u),
+          VPU_RESIDENT_GP_INPUT,
+          vpu_stream_bank_base(buffer ^ 1u, VPU_STREAM_BANK_INPUT),
           VPU_STREAM_H_INPUT, next_first, next_rows, VPU_VLEN);
       vpu_tiled_prefetch_run(
-          VPU_RESIDENT_GP_AUX, VPU_BANK_BASE(buffer ? 1u : 5u),
+          VPU_RESIDENT_GP_AUX,
+          vpu_stream_bank_base(buffer ^ 1u, VPU_STREAM_BANK_AUX),
           VPU_STREAM_H_AUX, next_first, next_rows, VPU_VLEN);
     }
-    const unsigned input_address = VPU_BANK_BASE(buffer ? 4u : 0u);
-    const unsigned weight_address = VPU_BANK_BASE(buffer ? 5u : 1u);
-    const unsigned scratch_address = VPU_BANK_BASE(buffer ? 6u : 2u);
-    const unsigned output_address = VPU_BANK_BASE(buffer ? 7u : 3u);
+    const unsigned input_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT);
+    const unsigned weight_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_AUX);
+    const unsigned scratch_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_TEMP);
+    const unsigned output_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_OUTPUT);
     vpu_set_vl(VPU_VLEN);
     vpu_tiled_emit_rms_output_run(input_address, weight_address,
                                   scratch_address, output_address, rows);
@@ -1106,10 +1336,14 @@ static inline uint64_t vpu_tiled_rmsnorm_streaming_impl(
   }
   if (tail != 0) {
     const unsigned buffer = (unsigned)(full_batches & 1u);
-    const unsigned input_address = VPU_BANK_BASE(buffer ? 4u : 0u);
-    const unsigned weight_address = VPU_BANK_BASE(buffer ? 5u : 1u);
-    const unsigned scratch_address = VPU_BANK_BASE(buffer ? 6u : 2u);
-    const unsigned output_address = VPU_BANK_BASE(buffer ? 7u : 3u);
+    const unsigned input_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT);
+    const unsigned weight_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_AUX);
+    const unsigned scratch_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_TEMP);
+    const unsigned output_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_OUTPUT);
     vpu_tiled_prefetch_run(VPU_RESIDENT_GP_INPUT, input_address,
                            VPU_STREAM_H_INPUT, full_tiles, 1, tail);
     vpu_tiled_prefetch_run(VPU_RESIDENT_GP_AUX, weight_address,
@@ -1304,54 +1538,257 @@ static inline void vpu_stream_advance_binary_row(unsigned buffer) {
                  vpu_stream_output_gp(buffer), VPU_VLEN);
 }
 
-static inline void vpu_stream_emit_activation_batch(
-    enum vpu_stream_activation activation, unsigned buffer, size_t rows) {
-  vpu_stream_reset_batch_addresses(buffer);
-#if VPU_LOOP_BUFFER_ENTRIES >= 6
-  if (rows > 1u && vpu_stream_activation_is_binary(activation)) {
-    vpu_loop_start(VPU_STREAM_GP_LOOP, (uint32_t)rows);
-    vpu_stream_emit_activation_row(activation, buffer);
-    vpu_stream_advance_binary_row(buffer);
-    vpu_loop_end(VPU_STREAM_GP_LOOP);
-    return;
+enum vpu_stream_activation_phase_role {
+  VPU_STREAM_PHASE_INPUT = 1u << VPU_STREAM_BANK_INPUT,
+  VPU_STREAM_PHASE_AUX = 1u << VPU_STREAM_BANK_AUX,
+  VPU_STREAM_PHASE_TEMP = 1u << VPU_STREAM_BANK_TEMP,
+  VPU_STREAM_PHASE_OUTPUT = 1u << VPU_STREAM_BANK_OUTPUT,
+};
+
+static inline unsigned vpu_stream_activation_phase_count(
+    enum vpu_stream_activation activation) {
+  switch (activation) {
+    case VPU_STREAM_ACT_ADD:
+    case VPU_STREAM_ACT_MUL:
+    case VPU_STREAM_ACT_RELU:
+      return 1u;
+    case VPU_STREAM_ACT_SIGMOID:
+      return 4u;
+    case VPU_STREAM_ACT_SILU:
+    case VPU_STREAM_ACT_TANH:
+    case VPU_STREAM_ACT_GELU:
+    case VPU_STREAM_ACT_SWIGLU:
+      return 5u;
+    default:
+      /* Match the legacy row emitter's default-to-SiLU behavior. */
+      return 5u;
   }
-#endif
-#if VPU_LOOP_BUFFER_ENTRIES >= 5
-  if (rows > 1u && activation == VPU_STREAM_ACT_RELU) {
-    vpu_loop_start(VPU_STREAM_GP_LOOP, (uint32_t)rows);
-    vpu_stream_emit_activation_row(activation, buffer);
-    /* ReLU touches only input and output. Avoid two dead GP operations per
-     * row so the replay frontend can feed useful work more often. */
+}
+
+static inline unsigned vpu_stream_activation_phase_roles(
+    enum vpu_stream_activation activation, unsigned phase) {
+  switch (activation) {
+    case VPU_STREAM_ACT_ADD:
+    case VPU_STREAM_ACT_MUL:
+      return VPU_STREAM_PHASE_INPUT | VPU_STREAM_PHASE_AUX |
+             VPU_STREAM_PHASE_OUTPUT;
+    case VPU_STREAM_ACT_RELU:
+      return VPU_STREAM_PHASE_INPUT | VPU_STREAM_PHASE_OUTPUT;
+    case VPU_STREAM_ACT_SIGMOID:
+      switch (phase) {
+        case 0u: return VPU_STREAM_PHASE_INPUT | VPU_STREAM_PHASE_AUX;
+        case 1u: return VPU_STREAM_PHASE_AUX | VPU_STREAM_PHASE_TEMP;
+        case 2u: return VPU_STREAM_PHASE_TEMP | VPU_STREAM_PHASE_AUX;
+        default: return VPU_STREAM_PHASE_AUX | VPU_STREAM_PHASE_OUTPUT;
+      }
+    case VPU_STREAM_ACT_TANH:
+      switch (phase) {
+        case 0u: return VPU_STREAM_PHASE_INPUT | VPU_STREAM_PHASE_AUX |
+                        VPU_STREAM_PHASE_TEMP;
+        case 1u: return VPU_STREAM_PHASE_TEMP | VPU_STREAM_PHASE_OUTPUT;
+        case 2u: return VPU_STREAM_PHASE_OUTPUT | VPU_STREAM_PHASE_TEMP;
+        case 3u: return VPU_STREAM_PHASE_TEMP | VPU_STREAM_PHASE_OUTPUT;
+        default: return VPU_STREAM_PHASE_OUTPUT;
+      }
+    case VPU_STREAM_ACT_GELU:
+      switch (phase) {
+        case 0u: return VPU_STREAM_PHASE_INPUT | VPU_STREAM_PHASE_AUX |
+                        VPU_STREAM_PHASE_TEMP;
+        case 1u: return VPU_STREAM_PHASE_TEMP | VPU_STREAM_PHASE_OUTPUT;
+        case 2u: return VPU_STREAM_PHASE_OUTPUT | VPU_STREAM_PHASE_AUX;
+        case 3u: return VPU_STREAM_PHASE_AUX | VPU_STREAM_PHASE_OUTPUT;
+        default: return VPU_STREAM_PHASE_INPUT | VPU_STREAM_PHASE_OUTPUT;
+      }
+    case VPU_STREAM_ACT_SWIGLU:
+      switch (phase) {
+        case 0u: return VPU_STREAM_PHASE_INPUT | VPU_STREAM_PHASE_TEMP;
+        case 1u: return VPU_STREAM_PHASE_TEMP | VPU_STREAM_PHASE_OUTPUT;
+        case 2u: return VPU_STREAM_PHASE_OUTPUT | VPU_STREAM_PHASE_TEMP;
+        case 3u: return VPU_STREAM_PHASE_TEMP | VPU_STREAM_PHASE_OUTPUT;
+        default: return VPU_STREAM_PHASE_INPUT | VPU_STREAM_PHASE_OUTPUT |
+                        VPU_STREAM_PHASE_TEMP | VPU_STREAM_PHASE_AUX;
+      }
+    case VPU_STREAM_ACT_SILU:
+    default:
+      switch (phase) {
+        case 0u: return VPU_STREAM_PHASE_INPUT | VPU_STREAM_PHASE_AUX;
+        case 1u: return VPU_STREAM_PHASE_AUX | VPU_STREAM_PHASE_TEMP;
+        case 2u: return VPU_STREAM_PHASE_TEMP | VPU_STREAM_PHASE_AUX;
+        case 3u: return VPU_STREAM_PHASE_AUX | VPU_STREAM_PHASE_TEMP;
+        default: return VPU_STREAM_PHASE_INPUT | VPU_STREAM_PHASE_TEMP |
+                        VPU_STREAM_PHASE_OUTPUT;
+      }
+  }
+}
+
+static inline void vpu_stream_reset_activation_phase(
+    unsigned buffer, unsigned roles) {
+  if ((roles & VPU_STREAM_PHASE_INPUT) != 0u)
+    vpu_write_gp(vpu_stream_input_gp(buffer),
+                 vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT));
+  if ((roles & VPU_STREAM_PHASE_AUX) != 0u)
+    vpu_write_gp(vpu_stream_aux_gp(buffer),
+                 vpu_stream_bank_base(buffer, VPU_STREAM_BANK_AUX));
+  if ((roles & VPU_STREAM_PHASE_TEMP) != 0u)
+    vpu_write_gp(vpu_stream_temp_gp(buffer),
+                 vpu_stream_bank_base(buffer, VPU_STREAM_BANK_TEMP));
+  if ((roles & VPU_STREAM_PHASE_OUTPUT) != 0u)
+    vpu_write_gp(vpu_stream_output_gp(buffer),
+                 vpu_stream_bank_base(buffer, VPU_STREAM_BANK_OUTPUT));
+}
+
+static inline void vpu_stream_advance_activation_phase(
+    unsigned buffer, unsigned roles) {
+  if ((roles & VPU_STREAM_PHASE_INPUT) != 0u)
     vpu_s_addi_int(vpu_stream_input_gp(buffer),
                    vpu_stream_input_gp(buffer), VPU_VLEN);
+  if ((roles & VPU_STREAM_PHASE_AUX) != 0u)
+    vpu_s_addi_int(vpu_stream_aux_gp(buffer),
+                   vpu_stream_aux_gp(buffer), VPU_VLEN);
+  if ((roles & VPU_STREAM_PHASE_TEMP) != 0u)
+    vpu_s_addi_int(vpu_stream_temp_gp(buffer),
+                   vpu_stream_temp_gp(buffer), VPU_VLEN);
+  if ((roles & VPU_STREAM_PHASE_OUTPUT) != 0u)
     vpu_s_addi_int(vpu_stream_output_gp(buffer),
                    vpu_stream_output_gp(buffer), VPU_VLEN);
-    vpu_loop_end(VPU_STREAM_GP_LOOP);
-    return;
+}
+
+/* Emit one same-fabric phase for one vector row. A phase may contain adjacent
+ * operations that share the base FMA fabric. Keeping it separate from address
+ * induction lets a batch replay SUB->SUB, EXP->EXP, RECI->RECI, and so on,
+ * instead of draining and changing fabrics after every row. */
+static inline void vpu_stream_emit_activation_phase_row(
+    enum vpu_stream_activation activation, unsigned phase,
+    unsigned buffer) {
+  const unsigned input_gp = vpu_stream_input_gp(buffer);
+  const unsigned aux_gp = vpu_stream_aux_gp(buffer);
+  const unsigned temp_gp = vpu_stream_temp_gp(buffer);
+  const unsigned output_gp = vpu_stream_output_gp(buffer);
+
+  switch (activation) {
+    case VPU_STREAM_ACT_ADD:
+      vpu_v_add_vv(output_gp, input_gp, aux_gp);
+      break;
+    case VPU_STREAM_ACT_MUL:
+      vpu_v_mul_vv(output_gp, input_gp, aux_gp);
+      break;
+    case VPU_STREAM_ACT_RELU:
+      vpu_v_max_vf(output_gp, input_gp, VPU_STREAM_FP_ACCUM_OR_MAX);
+      break;
+    case VPU_STREAM_ACT_SIGMOID:
+      switch (phase) {
+        case 0u:
+          vpu_v_sub_vf(aux_gp, input_gp, VPU_STREAM_FP_ACCUM_OR_MAX, true);
+          break;
+        case 1u: vpu_v_exp_v(temp_gp, aux_gp); break;
+        case 2u:
+          vpu_v_add_vf(aux_gp, temp_gp, VPU_STREAM_FP_CONSTANT_OR_SUM);
+          break;
+        default: vpu_v_reci_v(output_gp, aux_gp); break;
+      }
+      break;
+    case VPU_STREAM_ACT_TANH:
+      switch (phase) {
+        case 0u:
+          vpu_v_mul_vf(aux_gp, input_gp, VPU_STREAM_FP_EPSILON);
+          vpu_v_sub_vf(temp_gp, aux_gp, VPU_STREAM_FP_ACCUM_OR_MAX, true);
+          break;
+        case 1u: vpu_v_exp_v(output_gp, temp_gp); break;
+        case 2u:
+          vpu_v_add_vf(temp_gp, output_gp,
+                       VPU_STREAM_FP_CONSTANT_OR_SUM);
+          break;
+        case 3u: vpu_v_reci_v(output_gp, temp_gp); break;
+        default:
+          vpu_v_mul_vf(output_gp, output_gp, VPU_STREAM_FP_EPSILON);
+          vpu_v_sub_vf(output_gp, output_gp,
+                       VPU_STREAM_FP_CONSTANT_OR_SUM, false);
+          break;
+      }
+      break;
+    case VPU_STREAM_ACT_GELU:
+      switch (phase) {
+        case 0u:
+          vpu_v_mul_vf(aux_gp, input_gp, VPU_STREAM_FP_EPSILON);
+          vpu_v_sub_vf(temp_gp, aux_gp, VPU_STREAM_FP_ACCUM_OR_MAX, true);
+          break;
+        case 1u: vpu_v_exp_v(output_gp, temp_gp); break;
+        case 2u:
+          vpu_v_add_vf(aux_gp, output_gp,
+                       VPU_STREAM_FP_CONSTANT_OR_SUM);
+          break;
+        case 3u: vpu_v_reci_v(output_gp, aux_gp); break;
+        default: vpu_v_mul_vv(output_gp, input_gp, output_gp); break;
+      }
+      break;
+    case VPU_STREAM_ACT_SWIGLU:
+      switch (phase) {
+        case 0u:
+          vpu_v_sub_vf(temp_gp, input_gp, VPU_STREAM_FP_ACCUM_OR_MAX, true);
+          break;
+        case 1u: vpu_v_exp_v(output_gp, temp_gp); break;
+        case 2u:
+          vpu_v_add_vf(temp_gp, output_gp,
+                       VPU_STREAM_FP_CONSTANT_OR_SUM);
+          break;
+        case 3u: vpu_v_reci_v(output_gp, temp_gp); break;
+        default:
+          vpu_v_mul_vv(temp_gp, input_gp, output_gp);
+          vpu_v_mul_vv(output_gp, temp_gp, aux_gp);
+          break;
+      }
+      break;
+    case VPU_STREAM_ACT_SILU:
+    default:
+      switch (phase) {
+        case 0u:
+          vpu_v_sub_vf(aux_gp, input_gp, VPU_STREAM_FP_ACCUM_OR_MAX, true);
+          break;
+        case 1u: vpu_v_exp_v(temp_gp, aux_gp); break;
+        case 2u:
+          vpu_v_add_vf(aux_gp, temp_gp, VPU_STREAM_FP_CONSTANT_OR_SUM);
+          break;
+        case 3u: vpu_v_reci_v(temp_gp, aux_gp); break;
+        default: vpu_v_mul_vv(output_gp, input_gp, temp_gp); break;
+      }
+      break;
   }
-#endif
-#if VPU_LOOP_BUFFER_ENTRIES >= 13
-  if (rows > 1u) {
-    vpu_loop_start(VPU_STREAM_GP_LOOP, (uint32_t)rows);
+}
+
+static inline void vpu_stream_emit_activation_batch(
+    enum vpu_stream_activation activation, unsigned buffer, size_t rows) {
+  if (rows == 0u)
+    return;
+  if (rows == 1u) {
+    vpu_stream_reset_batch_addresses(buffer);
     vpu_stream_emit_activation_row(activation, buffer);
-    vpu_stream_advance_activation_row(buffer);
-    vpu_loop_end(VPU_STREAM_GP_LOOP);
     return;
   }
-#endif
+
+#if VPU_LOOP_BUFFER_ENTRIES >= 8 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+  const unsigned phases = vpu_stream_activation_phase_count(activation);
+  for (unsigned phase = 0u; phase < phases; ++phase) {
+    const unsigned roles =
+        vpu_stream_activation_phase_roles(activation, phase);
+    vpu_stream_reset_activation_phase(buffer, roles);
+    vpu_loop_start(VPU_STREAM_GP_LOOP, (uint32_t)rows);
+    vpu_stream_emit_activation_phase_row(activation, phase, buffer);
+    vpu_stream_advance_activation_phase(buffer, roles);
+    vpu_loop_end(VPU_STREAM_GP_LOOP);
+  }
+#else
+  vpu_stream_reset_batch_addresses(buffer);
   for (size_t row = 0; row < rows; ++row) {
     vpu_stream_emit_activation_row(activation, buffer);
-    if (activation == VPU_STREAM_ACT_RELU) {
-      vpu_s_addi_int(vpu_stream_input_gp(buffer),
-                     vpu_stream_input_gp(buffer), VPU_VLEN);
-      vpu_s_addi_int(vpu_stream_output_gp(buffer),
-                     vpu_stream_output_gp(buffer), VPU_VLEN);
-    } else if (vpu_stream_activation_is_binary(activation)) {
+    if (activation == VPU_STREAM_ACT_RELU)
+      vpu_stream_advance_activation_phase(
+          buffer, VPU_STREAM_PHASE_INPUT | VPU_STREAM_PHASE_OUTPUT);
+    else if (vpu_stream_activation_is_binary(activation))
       vpu_stream_advance_binary_row(buffer);
-    } else {
+    else
       vpu_stream_advance_activation_row(buffer);
-    }
   }
+#endif
 }
 
 static inline uint64_t vpu_stream_activation_impl(
@@ -1375,9 +1812,12 @@ static inline uint64_t vpu_stream_activation_impl(
 
   if (!vpu_stream_activation_is_binary(activation)) {
     vpu_write_fp(VPU_STREAM_FP_ACCUM_OR_MAX, 0.0f);
-    vpu_write_fp(VPU_STREAM_FP_CONSTANT_OR_SUM, 1.0f);
-    vpu_write_fp(VPU_STREAM_FP_EPSILON,
-                 activation == VPU_STREAM_ACT_GELU ? 1.702f : 2.0f);
+    if (activation != VPU_STREAM_ACT_RELU)
+      vpu_write_fp(VPU_STREAM_FP_CONSTANT_OR_SUM, 1.0f);
+    if (activation == VPU_STREAM_ACT_GELU ||
+        activation == VPU_STREAM_ACT_TANH)
+      vpu_write_fp(VPU_STREAM_FP_EPSILON,
+                   activation == VPU_STREAM_ACT_GELU ? 1.702f : 2.0f);
   }
 
   const size_t full_tiles = elements / VPU_VLEN;
@@ -1426,7 +1866,7 @@ static inline uint64_t vpu_stream_activation_impl(
     }
     vpu_stream_emit_activation_row(activation, buffer);
     vpu_write_gp(vpu_stream_output_gp(buffer),
-                 VPU_BANK_BASE(buffer ? 7u : 3u));
+                 vpu_stream_bank_base(buffer, VPU_STREAM_BANK_OUTPUT));
     vpu_h_store_v(vpu_stream_output_gp(buffer),
                   vpu_stream_offset_gp(buffer), VPU_STREAM_H_OUTPUT);
   }
@@ -1534,7 +1974,9 @@ static inline uint64_t vpu_tiled_softmax_streaming_impl(
   vpu_write_fp_bits(VPU_STREAM_FP_ACCUM_OR_MAX, 0xff800000u);
   if (full_batches != 0) {
     const size_t rows = full_tiles < capacity ? full_tiles : capacity;
-    vpu_tiled_prefetch_run(VPU_RESIDENT_GP_INPUT, VPU_BANK_BASE(0),
+    vpu_tiled_prefetch_run(
+        VPU_RESIDENT_GP_INPUT,
+        vpu_stream_bank_base(0u, VPU_STREAM_BANK_INPUT),
                            VPU_STREAM_H_INPUT, 0, rows, VPU_VLEN);
   }
   for (size_t batch = 0; batch < full_batches; ++batch) {
@@ -1548,15 +1990,18 @@ static inline uint64_t vpu_tiled_softmax_streaming_impl(
       const size_t next_rows = next_remaining < capacity
           ? next_remaining : capacity;
       vpu_tiled_prefetch_run(
-          VPU_RESIDENT_GP_INPUT, VPU_BANK_BASE(buffer ? 0u : 4u),
+          VPU_RESIDENT_GP_INPUT,
+          vpu_stream_bank_base(buffer ^ 1u, VPU_STREAM_BANK_INPUT),
           VPU_STREAM_H_INPUT, next_first, next_rows, VPU_VLEN);
     }
     vpu_set_vl(VPU_VLEN);
-    vpu_tiled_emit_red_max_run(VPU_BANK_BASE(buffer ? 4u : 0u), rows);
+    vpu_tiled_emit_red_max_run(
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT), rows);
   }
   if (tail != 0) {
     const unsigned buffer = (unsigned)(full_batches & 1u);
-    const unsigned input_address = VPU_BANK_BASE(buffer ? 4u : 0u);
+    const unsigned input_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT);
     vpu_tiled_prefetch_run(VPU_RESIDENT_GP_INPUT, input_address,
                            VPU_STREAM_H_INPUT, full_tiles, 1, tail);
     vpu_tiled_emit_red_max_run(input_address, 1);
@@ -1565,7 +2010,9 @@ static inline uint64_t vpu_tiled_softmax_streaming_impl(
   vpu_write_fp(VPU_STREAM_FP_CONSTANT_OR_SUM, 0.0f);
   if (full_batches != 0) {
     const size_t rows = full_tiles < capacity ? full_tiles : capacity;
-    vpu_tiled_prefetch_run(VPU_RESIDENT_GP_INPUT, VPU_BANK_BASE(0),
+    vpu_tiled_prefetch_run(
+        VPU_RESIDENT_GP_INPUT,
+        vpu_stream_bank_base(0u, VPU_STREAM_BANK_INPUT),
                            VPU_STREAM_H_INPUT, 0, rows, VPU_VLEN);
   }
   for (size_t batch = 0; batch < full_batches; ++batch) {
@@ -1579,32 +2026,41 @@ static inline uint64_t vpu_tiled_softmax_streaming_impl(
       const size_t next_rows = next_remaining < capacity
           ? next_remaining : capacity;
       vpu_tiled_prefetch_run(
-          VPU_RESIDENT_GP_INPUT, VPU_BANK_BASE(buffer ? 0u : 4u),
+          VPU_RESIDENT_GP_INPUT,
+          vpu_stream_bank_base(buffer ^ 1u, VPU_STREAM_BANK_INPUT),
           VPU_STREAM_H_INPUT, next_first, next_rows, VPU_VLEN);
     }
-    const unsigned input_address = VPU_BANK_BASE(buffer ? 4u : 0u);
-    const unsigned scratch_address = VPU_BANK_BASE(buffer ? 5u : 1u);
-    const unsigned exp_address = VPU_BANK_BASE(buffer ? 6u : 2u);
+    const unsigned input_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT);
+    const unsigned scratch_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_AUX);
+    const unsigned exp_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_TEMP);
     vpu_set_vl(VPU_VLEN);
-    vpu_tiled_emit_exp_sum_run(input_address, scratch_address,
-                               exp_address, rows);
+    vpu_tiled_emit_exp_sum_run(
+        input_address, scratch_address, exp_address, rows);
   }
   if (tail != 0) {
     const unsigned buffer = (unsigned)(full_batches & 1u);
-    const unsigned input_address = VPU_BANK_BASE(buffer ? 4u : 0u);
-    const unsigned scratch_address = VPU_BANK_BASE(buffer ? 5u : 1u);
-    const unsigned exp_address = VPU_BANK_BASE(buffer ? 6u : 2u);
+    const unsigned input_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT);
+    const unsigned scratch_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_AUX);
+    const unsigned exp_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_TEMP);
     vpu_tiled_prefetch_run(VPU_RESIDENT_GP_INPUT, input_address,
                            VPU_STREAM_H_INPUT, full_tiles, 1, tail);
-    vpu_tiled_emit_exp_sum_run(input_address, scratch_address,
-                               exp_address, 1);
+    vpu_tiled_emit_exp_sum_run(
+        input_address, scratch_address, exp_address, 1);
   }
   vpu_s_reci(VPU_STREAM_FP_CONSTANT_OR_SUM,
              VPU_STREAM_FP_CONSTANT_OR_SUM);
 
   if (full_batches != 0) {
     const size_t rows = full_tiles < capacity ? full_tiles : capacity;
-    vpu_tiled_prefetch_run(VPU_RESIDENT_GP_INPUT, VPU_BANK_BASE(0),
+    vpu_tiled_prefetch_run(
+        VPU_RESIDENT_GP_INPUT,
+        vpu_stream_bank_base(0u, VPU_STREAM_BANK_INPUT),
                            VPU_STREAM_H_INPUT, 0, rows, VPU_VLEN);
   }
   for (size_t batch = 0; batch < full_batches; ++batch) {
@@ -1618,12 +2074,16 @@ static inline uint64_t vpu_tiled_softmax_streaming_impl(
       const size_t next_rows = next_remaining < capacity
           ? next_remaining : capacity;
       vpu_tiled_prefetch_run(
-          VPU_RESIDENT_GP_INPUT, VPU_BANK_BASE(buffer ? 0u : 4u),
+          VPU_RESIDENT_GP_INPUT,
+          vpu_stream_bank_base(buffer ^ 1u, VPU_STREAM_BANK_INPUT),
           VPU_STREAM_H_INPUT, next_first, next_rows, VPU_VLEN);
     }
-    const unsigned input_address = VPU_BANK_BASE(buffer ? 4u : 0u);
-    const unsigned scratch_address = VPU_BANK_BASE(buffer ? 5u : 1u);
-    const unsigned output_address = VPU_BANK_BASE(buffer ? 7u : 3u);
+    const unsigned input_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT);
+    const unsigned scratch_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_AUX);
+    const unsigned output_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_OUTPUT);
     vpu_set_vl(VPU_VLEN);
     vpu_tiled_emit_softmax_recompute_run(
         input_address, scratch_address, output_address, rows);
@@ -1632,9 +2092,12 @@ static inline uint64_t vpu_tiled_softmax_streaming_impl(
   }
   if (tail != 0) {
     const unsigned buffer = (unsigned)(full_batches & 1u);
-    const unsigned input_address = VPU_BANK_BASE(buffer ? 4u : 0u);
-    const unsigned scratch_address = VPU_BANK_BASE(buffer ? 5u : 1u);
-    const unsigned output_address = VPU_BANK_BASE(buffer ? 7u : 3u);
+    const unsigned input_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_INPUT);
+    const unsigned scratch_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_AUX);
+    const unsigned output_address =
+        vpu_stream_bank_base(buffer, VPU_STREAM_BANK_OUTPUT);
     vpu_tiled_prefetch_run(VPU_RESIDENT_GP_INPUT, input_address,
                            VPU_STREAM_H_INPUT, full_tiles, 1, tail);
     vpu_tiled_emit_softmax_recompute_run(
@@ -1764,8 +2227,8 @@ static inline uint64_t vpu_tiled_softmax_resident_impl(
     const unsigned scratch_address =
         vpu_tiled_stream_address(shifted_output_bank, tile);
     vpu_set_vl(VPU_VLEN);
-    vpu_tiled_emit_exp_sum_run(input_address, scratch_address,
-                               input_address, rows);
+    vpu_tiled_emit_exp_sum_run(
+        input_address, scratch_address, input_address, rows);
     tile += rows;
   }
   if (tile < full_tiles) {
@@ -1791,8 +2254,8 @@ static inline uint64_t vpu_tiled_softmax_resident_impl(
           VPU_STREAM_H_INPUT, next_tile, next_rows, VPU_VLEN);
     }
     vpu_set_vl(VPU_VLEN);
-    vpu_tiled_emit_exp_sum_run(input_address, scratch_address,
-                               input_address, rows);
+    vpu_tiled_emit_exp_sum_run(
+        input_address, scratch_address, input_address, rows);
     tile = next_tile;
   }
   if (tail != 0) {
@@ -1807,8 +2270,8 @@ static inline uint64_t vpu_tiled_softmax_resident_impl(
                              VPU_STREAM_H_INPUT, tile, 1, tail);
     }
     vpu_set_vl(tail);
-    vpu_tiled_emit_exp_sum_run(input_address, scratch_address,
-                               input_address, 1);
+    vpu_tiled_emit_exp_sum_run(
+        input_address, scratch_address, input_address, 1);
   }
   vpu_s_reci(VPU_STREAM_FP_CONSTANT_OR_SUM,
              VPU_STREAM_FP_CONSTANT_OR_SUM);
@@ -1978,6 +2441,41 @@ enum vpu_rearrange_kernel_register {
   VPU_REARRANGE_FP_ZERO = 0,
 };
 
+enum vpu_rearrange_bank_role {
+  VPU_REARRANGE_BANK_TABLE0 = 0,
+  VPU_REARRANGE_BANK_TABLE1 = 1,
+  VPU_REARRANGE_TABLE_BANKS = 2,
+  VPU_REARRANGE_WORK_INPUT = 0,
+  VPU_REARRANGE_WORK_TEMP = 1,
+};
+
+static inline unsigned vpu_rearrange_table_base(
+    enum vpu_rearrange_bank_role table) {
+  return vpu_logical_role_base_for_geometry(
+      VPU_VSPAD_BANKS, VPU_VSPAD_ELEMENTS, VPU_ELEMENTS_PER_BANK,
+      (unsigned)table);
+}
+
+static inline unsigned vpu_rearrange_work_bank(
+    unsigned buffer, enum vpu_rearrange_bank_role role) {
+  const unsigned linear_role =
+      (buffer ? (unsigned)VPU_STREAM_BUFFER_ROLES
+              : (unsigned)VPU_REARRANGE_TABLE_BANKS) +
+      (unsigned)role;
+  return vpu_logical_role_bank_for_geometry(VPU_VSPAD_BANKS, linear_role);
+}
+
+static inline unsigned vpu_rearrange_work_base(
+    unsigned buffer, enum vpu_rearrange_bank_role role) {
+  const unsigned linear_role =
+      (buffer ? (unsigned)VPU_STREAM_BUFFER_ROLES
+              : (unsigned)VPU_REARRANGE_TABLE_BANKS) +
+      (unsigned)role;
+  return vpu_logical_role_base_for_geometry(
+      VPU_VSPAD_BANKS, VPU_VSPAD_ELEMENTS, VPU_ELEMENTS_PER_BANK,
+      linear_role);
+}
+
 static inline unsigned vpu_rearrange_input_gp(unsigned buffer) {
   return buffer ? VPU_REARRANGE_GP_PONG_INPUT
                 : VPU_REARRANGE_GP_PING_INPUT;
@@ -1999,7 +2497,7 @@ static inline unsigned vpu_rearrange_rows_gp(unsigned buffer) {
 }
 
 static inline unsigned vpu_rearrange_input_base(unsigned buffer) {
-  return VPU_BANK_BASE(buffer ? 4u : 2u);
+  return vpu_rearrange_work_base(buffer, VPU_REARRANGE_WORK_INPUT);
 }
 
 static inline size_t vpu_rearrange_batch_capacity(void) {
@@ -2014,12 +2512,18 @@ static inline size_t vpu_rearrange_batch_rows(size_t rows, size_t batch) {
 }
 
 static inline void vpu_rearrange_configure_spad(void) {
-  vpu_write_gp(VPU_REARRANGE_GP_TABLE0, VPU_BANK_BASE(0));
-  vpu_write_gp(VPU_REARRANGE_GP_TABLE1, VPU_BANK_BASE(1));
-  vpu_write_gp(VPU_REARRANGE_GP_PING_INPUT, VPU_BANK_BASE(2));
-  vpu_write_gp(VPU_REARRANGE_GP_PING_TEMP, VPU_BANK_BASE(3));
-  vpu_write_gp(VPU_REARRANGE_GP_PONG_INPUT, VPU_BANK_BASE(4));
-  vpu_write_gp(VPU_REARRANGE_GP_PONG_TEMP, VPU_BANK_BASE(5));
+  vpu_write_gp(VPU_REARRANGE_GP_TABLE0,
+               vpu_rearrange_table_base(VPU_REARRANGE_BANK_TABLE0));
+  vpu_write_gp(VPU_REARRANGE_GP_TABLE1,
+               vpu_rearrange_table_base(VPU_REARRANGE_BANK_TABLE1));
+  vpu_write_gp(VPU_REARRANGE_GP_PING_INPUT,
+               vpu_rearrange_work_base(0u, VPU_REARRANGE_WORK_INPUT));
+  vpu_write_gp(VPU_REARRANGE_GP_PING_TEMP,
+               vpu_rearrange_work_base(0u, VPU_REARRANGE_WORK_TEMP));
+  vpu_write_gp(VPU_REARRANGE_GP_PONG_INPUT,
+               vpu_rearrange_work_base(1u, VPU_REARRANGE_WORK_INPUT));
+  vpu_write_gp(VPU_REARRANGE_GP_PONG_TEMP,
+               vpu_rearrange_work_base(1u, VPU_REARRANGE_WORK_TEMP));
   vpu_write_gp(VPU_REARRANGE_GP_TABLE_OFFSET, 0);
 }
 
@@ -2142,26 +2646,46 @@ static inline uint64_t vpu_rope_impl(
     }
 
     const unsigned input_base = vpu_rearrange_input_base(buffer);
-    const unsigned temp_base = VPU_BANK_BASE(buffer ? 5u : 3u);
+    const unsigned temp_base =
+        vpu_rearrange_work_base(buffer, VPU_REARRANGE_WORK_TEMP);
     vpu_write_gp(input_gp, input_base);
     vpu_write_gp(temp_gp, temp_base);
-#if VPU_LOOP_BUFFER_ENTRIES >= (2 * VPU_VMASK_CHUNKS + 10) && \
-    VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
+#if VPU_LOOP_BUFFER_ENTRIES >= 8 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX
     if (batch_rows > 1u) {
+      /* Rearrangement phase 1: install the mask once, then replay every
+       * left-half slide. */
+      vpu_write_vmask(first_mask);
+      vpu_write_gp(input_gp, input_base);
+      vpu_write_gp(temp_gp, temp_base);
       vpu_loop_start(VPU_REARRANGE_GP_TABLE_OFFSET,
                      (uint32_t)batch_rows);
-      /* Build rotate_half(x) in temp without a gather. Masked slide writes
-       * preserve the other half; negating while the first mask is still
-       * active avoids another architectural-mask transition. */
-      vpu_write_vmask(first_mask);
       vpu_v_slide_v_masked(temp_gp, input_gp, VPU_REARRANGE_GP_SHIFT,
                            VPU_SLIDE_LEFT);
-      vpu_v_sub_vf_masked(temp_gp, temp_gp, VPU_REARRANGE_FP_ZERO, true);
+      vpu_s_addi_int(input_gp, input_gp, VPU_VLEN);
+      vpu_s_addi_int(temp_gp, temp_gp, VPU_VLEN);
+      vpu_loop_end(VPU_REARRANGE_GP_TABLE_OFFSET);
+
+      /* Rearrangement phase 2 stays on the same fabric. The masked right
+       * slide preserves the first half produced above. */
       vpu_write_vmask(second_mask);
+      vpu_write_gp(input_gp, input_base);
+      vpu_write_gp(temp_gp, temp_base);
+      vpu_loop_start(VPU_REARRANGE_GP_TABLE_OFFSET,
+                     (uint32_t)batch_rows);
       vpu_v_slide_v_masked(temp_gp, input_gp, VPU_REARRANGE_GP_SHIFT,
                            VPU_SLIDE_RIGHT);
-      /* These arithmetic commands are unmasked, so the second-half mask may
-       * stay installed until the next row. */
+      vpu_s_addi_int(input_gp, input_gp, VPU_VLEN);
+      vpu_s_addi_int(temp_gp, temp_gp, VPU_VLEN);
+      vpu_loop_end(VPU_REARRANGE_GP_TABLE_OFFSET);
+
+      /* The remaining masked negate and three arithmetic operations all use
+       * the base elementwise fabric, so keep them in one row-major replay. */
+      vpu_write_vmask(first_mask);
+      vpu_write_gp(input_gp, input_base);
+      vpu_write_gp(temp_gp, temp_base);
+      vpu_loop_start(VPU_REARRANGE_GP_TABLE_OFFSET,
+                     (uint32_t)batch_rows);
+      vpu_v_sub_vf_masked(temp_gp, temp_gp, VPU_REARRANGE_FP_ZERO, true);
       vpu_v_mul_vv(temp_gp, temp_gp, VPU_REARRANGE_GP_TABLE1);
       vpu_v_mul_vv(input_gp, input_gp, VPU_REARRANGE_GP_TABLE0);
       vpu_v_add_vv(input_gp, input_gp, temp_gp);
@@ -2262,7 +2786,8 @@ static inline uint64_t vpu_permute_auto(
           vpu_rearrange_batch_rows(groups, batch + 1u), group_elements);
     }
     const unsigned input_base = vpu_rearrange_input_base(buffer);
-    const unsigned output_base = VPU_BANK_BASE(buffer ? 5u : 3u);
+    const unsigned output_base =
+        vpu_rearrange_work_base(buffer, VPU_REARRANGE_WORK_TEMP);
     vpu_write_gp(input_gp, input_base);
     vpu_write_gp(output_gp, output_base);
 #if VPU_LOOP_BUFFER_ENTRIES >= 5 && VPU_VLEN <= VPU_ADDI_INT_IMM_MAX

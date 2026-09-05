@@ -23,13 +23,16 @@
 #define VPU_RECIPROCAL_FMAS_PER_LANE 4u
 #define VPU_RECIPROCAL_LATENCY 13u
 #define VPU_VSPAD_KIB 256u
-#define VPU_VSPAD_BANKS 8u
+#define VPU_VSPAD_BANKS 4u
 #define VPU_VSPAD_SUBBANKS 4u
-#define VPU_MATRIX_PORTS 1u
-#define VPU_MATRIX_ROW_ELEMENTS 32u
-#define VPU_MATRIX_WORDS_PER_ROW 2u
+#define VPU_MATRIX_PORTS 4u
+#define VPU_MATRIX_ROW_ELEMENTS 8u
+#define VPU_MATRIX_WORDS_PER_ROW 1u
+#define VPU_EXTERNAL_MEMORY 1u
+#define VPU_MEMORY_ROW_ELEMENTS 8u
+#define VPU_MEMORY_ROWS_PER_WORD 2u
 #define VPU_SHARED_DEPS 1u
-#define VPU_DMA_MAX_ROWS 64u
+#define VPU_DMA_MAX_ROWS 128u
 #define VPU_STORAGE_KIND VPU_STORAGE_FP32
 #define VPU_COMPUTE_KIND VPU_STORAGE_FP32
 #define VPU_DMA_BUS_BITS 256u
@@ -51,13 +54,23 @@
 #define VPU_FMA_PIPE_DEPTH 4u
 #define VPU_FP_STATE_ENTRIES 256u
 #define VPU_FP_STATE_BANKS 4u
-#define VPU_LOOP_BUFFER_ENTRIES 64u
-#define VPU_LOOP_STACK_DEPTH 4u
-#define VPU_GROUP_ID_BITS 3u
-#define VPU_GROUP_ID_SHIFT 32u
-#define VPU_GROUPED_SHIFT 35u
-#define VPU_GROUP_LAST_SHIFT 36u
-#define VPU_GROUPED_COMMANDS 1u
+#define VPU_LOOP_BUFFER_ENTRIES 48u
+#define VPU_LOOP_STACK_DEPTH 2u
+#define VPU_EVENT_ID_BITS 3u
+#define VPU_EVENT_WAIT_ID_SHIFT 32u
+#define VPU_EVENT_WAIT_VALID_SHIFT 35u
+#define VPU_EVENT_STAGE_LAST_SHIFT 36u
+#define VPU_EVENT_PRODUCE_ID_SHIFT 37u
+#define VPU_EVENT_PRODUCE_VALID_SHIFT 40u
+#define VPU_EVENT_PRODUCE_SEAL_SHIFT 41u
+#define VPU_EVENT_COMMANDS 1u
+
+/* Source compatibility for software predating the event-stage transport. */
+#define VPU_GROUP_ID_BITS VPU_EVENT_ID_BITS
+#define VPU_GROUP_ID_SHIFT VPU_EVENT_WAIT_ID_SHIFT
+#define VPU_GROUPED_SHIFT VPU_EVENT_WAIT_VALID_SHIFT
+#define VPU_GROUP_LAST_SHIFT VPU_EVENT_STAGE_LAST_SHIFT
+#define VPU_GROUPED_COMMANDS VPU_EVENT_COMMANDS
 
 #if VPU_STORAGE_KIND == VPU_STORAGE_FP32
 #define VPU_STORAGE_BITS 32u
@@ -74,12 +87,23 @@
 #define VPU_VECTOR_BYTES (VPU_VLEN * VPU_STORAGE_BYTES)
 #define VPU_SLOTS_PER_BANK (VPU_ELEMENTS_PER_BANK / VPU_VLEN)
 
-/* VSRAM addresses are element addresses, not byte addresses. */
+/* Vector-memory addresses are elements; fusion addresses name shared ACC. */
 #define VPU_BANK_BASE(bank_) ((unsigned)(bank_) * VPU_ELEMENTS_PER_BANK)
 #define VPU_SLOT_ADDR(bank_, slot_)                                      \
   (VPU_BANK_BASE(bank_) + (unsigned)(slot_) * VPU_VLEN)
 
 /* Recommended software-managed double-buffer layout. */
+#if VPU_EXTERNAL_MEMORY
+/* Eight logical roles evenly subdivide the shared ACC capacity. */
+#define VPU_PING_INPUT_ADDR ((0u * VPU_VSPAD_ELEMENTS) / 8u)
+#define VPU_PING_TEMP0_ADDR ((1u * VPU_VSPAD_ELEMENTS) / 8u)
+#define VPU_PING_TEMP1_ADDR ((2u * VPU_VSPAD_ELEMENTS) / 8u)
+#define VPU_PING_OUTPUT_ADDR ((3u * VPU_VSPAD_ELEMENTS) / 8u)
+#define VPU_PONG_INPUT_ADDR ((4u * VPU_VSPAD_ELEMENTS) / 8u)
+#define VPU_PONG_TEMP0_ADDR ((5u * VPU_VSPAD_ELEMENTS) / 8u)
+#define VPU_PONG_TEMP1_ADDR ((6u * VPU_VSPAD_ELEMENTS) / 8u)
+#define VPU_PONG_OUTPUT_ADDR ((7u * VPU_VSPAD_ELEMENTS) / 8u)
+#else
 #define VPU_PING_INPUT_ADDR VPU_BANK_BASE(0u)
 #define VPU_PING_TEMP0_ADDR VPU_BANK_BASE(1u)
 #define VPU_PING_TEMP1_ADDR VPU_BANK_BASE(2u)
@@ -88,6 +112,7 @@
 #define VPU_PONG_TEMP0_ADDR VPU_BANK_BASE(5u)
 #define VPU_PONG_TEMP1_ADDR VPU_BANK_BASE(6u)
 #define VPU_PONG_OUTPUT_ADDR VPU_BANK_BASE(7u)
+#endif
 
 #if VPU_COMPUTE_KIND != VPU_STORAGE_FP32
 #error "VPU v1 compute type must be FP32"
@@ -135,8 +160,14 @@
 #error "VPU slot geometry must cover each bank exactly"
 #endif
 
-#if VPU_VSPAD_BANKS < 8
+#if !VPU_EXTERNAL_MEMORY && VPU_VSPAD_BANKS < 8
 #error "The public ping/pong VSRAM layout requires at least eight banks"
+#endif
+
+#if VPU_EXTERNAL_MEMORY && \
+    (((VPU_VSPAD_ELEMENTS % 8u) != 0u) || \
+     (((VPU_VSPAD_ELEMENTS / 8u) % VPU_NLANES) != 0u))
+#error "The unified accumulator needs eight lane-aligned software regions"
 #endif
 
 #if VPU_FMA_PIPE_DEPTH != 4
@@ -147,8 +178,8 @@
 #error "Shared Gemmini/VPU dependencies require grouped commands"
 #endif
 
-#if VPU_MATRIX_PORTS && VPU_STORAGE_KIND != VPU_STORAGE_FP32
-#error "The v1 Gemmini matrix bridge requires FP32 VPU storage"
+#if VPU_EXTERNAL_MEMORY && VPU_STORAGE_KIND != VPU_STORAGE_FP32
+#error "The unified accumulator interface requires FP32 VPU storage"
 #endif
 
 #endif  // GEMMINI_ROCC_TESTS_INCLUDE_VPU_PARAMS_H_

@@ -17,6 +17,8 @@ tests = \
 	two_baremetal \
 	static_tiled_conv_test \
 	static_tiled_matmul_test \
+	partition_axis_smoke \
+	partition_axis_perf \
 	static_tiled_matmul_2group_test \
 	static_tiled_matmul_transpose_test \
 	static_tiled_matmul_test_profile \
@@ -46,8 +48,9 @@ vpu_perf_tests_baremetal = $(vpu_perf_tests:=-baremetal)
 
 # This program targets the BF16-Gemmini/FP32-VPU fusion configuration.  Keep
 # it separate from the standalone VPU list: neither Spike nor the legacy
-# INT8+VPU configurations model the shared VSRAM matrix ports/group gate.
-fusion_vpu_tests = vpu_flashattention
+# Fusion configurations use the shared accumulator and grouped command gate.
+fusion_vpu_tests = vpu_flashattention vpu_flashattention_virgo \
+	vpu_k_partition_cto_smoke
 fusion_vpu_tests_baremetal = $(fusion_vpu_tests:=-baremetal)
 fusion_vpu_perf_tests = vpu_flashattention_vs_CPU_perf
 fusion_vpu_perf_tests_baremetal = $(fusion_vpu_perf_tests:=-baremetal)
@@ -85,13 +88,13 @@ else
 endif
 
 BENCH_COMMON = $(abs_top_srcdir)/riscv-tests/benchmarks/common
-GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h $(abs_top_srcdir)/include/gemmini_testutils_all.h $(abs_top_srcdir)/include/gemmini_all.h $(abs_top_srcdir)/include/gemmini_tiling.h
+GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h $(abs_top_srcdir)/include/gemmini_testutils_all.h $(abs_top_srcdir)/include/gemmini_all.h $(abs_top_srcdir)/include/gemmini_tiling.h $(abs_top_srcdir)/include/gemmini_matmul_job.h
 # Workload dimensions and benchmark options belong to their C source/header.
 # Keep this Makefile limited to build flags, targets, and dependencies.
 VPU_PARAMS_HEADER = $(abs_top_srcdir)/include/vpu_params.h
 VPU_HEADERS = $(abs_top_srcdir)/include/vpu.h $(VPU_PARAMS_HEADER) $(abs_top_srcdir)/include/vpu_kernels.h $(abs_top_srcdir)/include/vpu_testutils.h
 VPU_PERF_HEADERS = $(VPU_HEADERS) $(abs_top_srcdir)/bareMetalC/vpu_vs_cpu_perf_common.h
-FUSION_VPU_HEADERS = $(VPU_HEADERS) $(abs_top_srcdir)/include/vpu_flashattention_kernel.h $(abs_top_srcdir)/include/gemmini_page_packed.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_tiling.h
+FUSION_VPU_HEADERS = $(VPU_HEADERS) $(abs_top_srcdir)/include/vpu_flashattention_kernel.h $(abs_top_srcdir)/include/gemmini_page_packed.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_tiling.h $(abs_top_srcdir)/include/gemmini_matmul_job.h
 
 CFLAGS := $(CFLAGS) \
 	-DPREALLOCATE=1 \
@@ -128,7 +131,7 @@ CFLAGS_BAREMETAL := \
 
 # A single generated vpu_params.h describes the most recently elaborated VPU.
 # Only add fusion-only programs to the default build when that header says the
-# matrix bridge/grouped dependency hardware is present.
+# external shared-ACC/grouped dependency hardware is present.
 FUSION_VPU_ACTIVE := $(shell \
 	grep -q '^\#define VPU_GROUPED_COMMANDS 1u' $(VPU_PARAMS_HEADER) 2>/dev/null && \
 	grep -q '^\#define VPU_SHARED_DEPS 1u' $(VPU_PARAMS_HEADER) 2>/dev/null && \

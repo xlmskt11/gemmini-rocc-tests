@@ -94,10 +94,12 @@ static void initialize_vectors(void) {
 }
 
 static void configure_architectural_addresses(void) {
-  vpu_write_gp(GP_SRC, VPU_BANK_BASE(0));
-  vpu_write_gp(GP_RHS, VPU_BANK_BASE(1));
-  vpu_write_gp(GP_DST, VPU_BANK_BASE(2));
-  vpu_write_gp(GP_INDEX, VPU_BANK_BASE(3));
+  /* These public role regions remain banks 0..3 for standalone VSRAM, but
+   * subdivide the shared ACC when fusion exposes fewer physical banks. */
+  vpu_write_gp(GP_SRC, VPU_PING_INPUT_ADDR);
+  vpu_write_gp(GP_RHS, VPU_PING_TEMP0_ADDR);
+  vpu_write_gp(GP_DST, VPU_PING_TEMP1_ADDR);
+  vpu_write_gp(GP_INDEX, VPU_PING_OUTPUT_ADDR);
   vpu_write_gp(GP_OFFSET, 0);
   vpu_write_h(H_SRC, (uintptr_t)&source[1]);
   vpu_write_h(H_RHS, (uintptr_t)&rhs[1]);

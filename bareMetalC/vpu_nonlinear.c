@@ -1524,49 +1524,77 @@ static int planner_expect(const char *name, struct vpu_tiled_plan plan,
 /* Exercise capacity transitions without simulating the corresponding rows. */
 static int test_tiled_planner(void) {
   const size_t slots = VPU_SLOTS_PER_BANK;
-  const size_t rms_full_tiles =
-      ((size_t)VPU_VSPAD_BANKS - 2u) * slots;
-  const size_t rms_partial_tiles =
-      ((size_t)VPU_VSPAD_BANKS - 3u) * slots;
-  const size_t softmax_full_tiles =
-      ((size_t)VPU_VSPAD_BANKS - 1u) * slots;
-  const size_t softmax_partial_tiles =
-      ((size_t)VPU_VSPAD_BANKS - 2u) * slots;
+  /* A compact shared ACC can have only the workspace banks required by a
+   * kernel. Avoid unsigned underflow and expect its documented streaming
+   * fallback instead of manufacturing a zero-capacity resident schedule. */
+  const size_t rms_full_tiles = VPU_VSPAD_BANKS > 2u
+      ? ((size_t)VPU_VSPAD_BANKS - 2u) * slots : 0u;
+  const size_t rms_partial_tiles = VPU_VSPAD_BANKS > 3u
+      ? ((size_t)VPU_VSPAD_BANKS - 3u) * slots : 0u;
+  const size_t softmax_full_tiles = VPU_VSPAD_BANKS > 1u
+      ? ((size_t)VPU_VSPAD_BANKS - 1u) * slots : 0u;
+  const size_t softmax_partial_tiles = VPU_VSPAD_BANKS > 2u
+      ? ((size_t)VPU_VSPAD_BANKS - 2u) * slots : 0u;
+  const size_t rms_full_probe = rms_full_tiles != 0 ? rms_full_tiles : 1u;
+  const size_t rms_overflow_probe =
+      rms_full_tiles != 0 ? rms_full_tiles + 1u : 1u;
+  const size_t softmax_full_probe =
+      softmax_full_tiles != 0 ? softmax_full_tiles : 1u;
+  const size_t softmax_overflow_probe =
+      softmax_full_tiles != 0 ? softmax_full_tiles + 1u : 1u;
 
   struct vpu_tiled_plan plan = vpu_tiled_plan_for(
-      VPU_TILED_KERNEL_RMSNORM, rms_full_tiles * VPU_VLEN);
+      VPU_TILED_KERNEL_RMSNORM, rms_full_probe * VPU_VLEN);
   if (planner_expect("rmsnorm-full", plan,
-                     VPU_TILED_SCHEDULE_RESIDENT_FULL,
-                     rms_full_tiles, rms_full_tiles,
-                     VPU_VSPAD_BANKS - 2u, 2u)) {
+                     rms_full_tiles != 0
+                         ? VPU_TILED_SCHEDULE_RESIDENT_FULL
+                         : VPU_TILED_SCHEDULE_STREAMING,
+                     rms_full_probe,
+                     rms_full_tiles != 0 ? rms_full_tiles : 0u,
+                     rms_full_tiles != 0 ? VPU_VSPAD_BANKS - 2u : 0u,
+                     rms_full_tiles != 0 ? 2u : VPU_VSPAD_BANKS)) {
     return 1;
   }
 
   plan = vpu_tiled_plan_for(
-      VPU_TILED_KERNEL_RMSNORM, (rms_full_tiles + 1u) * VPU_VLEN);
+      VPU_TILED_KERNEL_RMSNORM, rms_overflow_probe * VPU_VLEN);
   if (planner_expect("rmsnorm-partial", plan,
-                     VPU_TILED_SCHEDULE_RESIDENT_PARTIAL,
-                     rms_full_tiles + 1u, rms_partial_tiles,
-                     VPU_VSPAD_BANKS - 3u, 3u)) {
+                     rms_partial_tiles != 0
+                         ? VPU_TILED_SCHEDULE_RESIDENT_PARTIAL
+                         : VPU_TILED_SCHEDULE_STREAMING,
+                     rms_overflow_probe,
+                     rms_partial_tiles,
+                     rms_partial_tiles != 0 ? VPU_VSPAD_BANKS - 3u : 0u,
+                     rms_partial_tiles != 0 ? 3u : VPU_VSPAD_BANKS)) {
     return 1;
   }
 
   plan = vpu_tiled_plan_for(
-      VPU_TILED_KERNEL_SOFTMAX, softmax_full_tiles * VPU_VLEN);
+      VPU_TILED_KERNEL_SOFTMAX, softmax_full_probe * VPU_VLEN);
   if (planner_expect("softmax-full", plan,
-                     VPU_TILED_SCHEDULE_RESIDENT_FULL,
-                     softmax_full_tiles, softmax_full_tiles,
-                     VPU_VSPAD_BANKS - 1u, 1u)) {
+                     softmax_full_tiles != 0
+                         ? VPU_TILED_SCHEDULE_RESIDENT_FULL
+                         : VPU_TILED_SCHEDULE_STREAMING,
+                     softmax_full_probe,
+                     softmax_full_tiles != 0 ? softmax_full_tiles : 0u,
+                     softmax_full_tiles != 0 ? VPU_VSPAD_BANKS - 1u : 0u,
+                     softmax_full_tiles != 0 ? 1u : VPU_VSPAD_BANKS)) {
     return 1;
   }
 
   plan = vpu_tiled_plan_for(
       VPU_TILED_KERNEL_SOFTMAX,
-      (softmax_full_tiles + 1u) * VPU_VLEN);
+      softmax_overflow_probe * VPU_VLEN);
   if (planner_expect("softmax-partial", plan,
-                     VPU_TILED_SCHEDULE_RESIDENT_PARTIAL,
-                     softmax_full_tiles + 1u, softmax_partial_tiles,
-                     VPU_VSPAD_BANKS - 2u, 2u)) {
+                     softmax_partial_tiles != 0
+                         ? VPU_TILED_SCHEDULE_RESIDENT_PARTIAL
+                         : VPU_TILED_SCHEDULE_STREAMING,
+                     softmax_overflow_probe,
+                     softmax_partial_tiles,
+                     softmax_partial_tiles != 0
+                         ? VPU_VSPAD_BANKS - 2u : 0u,
+                     softmax_partial_tiles != 0
+                         ? 2u : VPU_VSPAD_BANKS)) {
     return 1;
   }
 
